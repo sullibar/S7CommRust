@@ -125,6 +125,8 @@ All notable changes to this project are documented here. The format is based on
   failing the whole response; `STRING` / `WSTRING` decoding clamps the actual length to the
   maximum length.
 - s7tool no longer panics on a malformed `S7_REAL_PLC_KEY`.
+- Requires rustls 0.23.45 or later, which fixes RUSTSEC-2026-0285 (TLS 1.3 handshake messages
+  accepted across encryption-level boundaries).
 
 ## [0.1.0] - 2026-07-05
 
