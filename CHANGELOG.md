@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Symbol paths can now be written exactly as TIA Portal shows them
+  ([#1](https://github.com/sullibar/S7CommRust/issues/1)). Previously any quoted path, such
+  as `"Data_block_1".toto` or the PLC tag `"Flag"`, failed with "not found":
+  - names may be double-quoted, which is required when they contain `.`, `[` or `]`:
+    `"Data block.1"."value.1"`. Browsed `VarInfo::name`s quote such levels so they round-trip
+    through `resolve_symbol`;
+  - array-DB elements resolve with TIA's `"Array DB"[2]` syntax.
+- Array indices one past the upper bound are now rejected. Previously, on a multi-dimensional
+  array they wrapped into the next row (`arr[0,3]` of `Array[0..1, 0..2]` read `arr[1,0]`),
+  and on a 1-D array the PLC rejected them with an opaque error code.
+
 ## [0.1.0] - 2026-07-05
 
 First public release — a Rust port of

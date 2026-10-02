@@ -432,10 +432,12 @@ fn print_values(conn: &mut Connection, vars: &[VarInfo], strip: Option<&str>) {
         }
     };
     for (var, val) in vars.iter().zip(values) {
+        // The DB level is double-quoted in `VarInfo::name` when the DB name contains a `.`.
         let disp = match strip {
             Some(p) => var
                 .name
                 .strip_prefix(p)
+                .or_else(|| var.name.strip_prefix(&format!("\"{p}\"")))
                 .and_then(|s| s.strip_prefix('.'))
                 .unwrap_or(&var.name),
             None => &var.name,
