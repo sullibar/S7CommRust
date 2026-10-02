@@ -17,12 +17,11 @@
 //! both sides derive a **session key**. Every PDU after `CreateObject` then carries an
 //! HMAC-SHA256 **integrity digest** keyed by that session key.
 //!
-//! The key agreement is public-key-**family** specific. This module targets the **PLCSIM**
-//! family (the `03:` key family our test rig reports), whose path is implemented in readable
-//! integer arithmetic — it avoids the large decompiled elliptic-curve code that the real
-//! S7-1200/1500 hardware families (`00:`/`01:`) require.
+//! The key agreement is public-key-**family** specific: the **PLCSIM** family (`03:`, what
+//! PLCSIM Advanced reports; [`session`]) and the real S7-1200/1500 hardware families
+//! (`00:`/`01:`; `realplc` with the x-only ECDH + PRESENT-80 seed in `family0`).
 //!
-//! Implemented so far (the `digest` seam is public; the rest are internal):
+//! The pieces (the `digest` seam is public; the rest are internal):
 //! - [`digest`] — the per-PDU integrity digest (HMAC-SHA256), validated against HarpoS7's
 //!   golden vectors.
 //! - `fingerprint` — the `f()` challenge fingerprint feeding the session-key derivation.

@@ -37,9 +37,9 @@ unsafe_code = "forbid"
 # TLS. MUST expose export_keying_material (RFC 5705) for legitimation. The `ring`
 # backend is used for build reliability across platforms; aws-lc-rs works too.
 # (`rustls::pki_types` re-exports the pki-types crate, so no direct dep on it.)
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 # zlib C backend only (no miniz_oxide): needed for the preset-dictionary blobs, and it keeps
-# the dep tree small + the MSRV low.
+# the dep tree small.
 flate2 = { version = "1", default-features = false, features = ["zlib"] }
 sha2 = "0.10"             # legitimation key derivation (sha256)
 sha1 = "0.10"             # legacy legitimation-payload password hash
@@ -53,4 +53,3 @@ log = "0.4"
 [dev-dependencies]
 hex-literal = "0.4"       # golden byte-vector fixtures
 env_logger = "0.11"       # examples logging
-getrandom = "0.2"         # CSPRNG for the legacy_connect example's ephemeral keys

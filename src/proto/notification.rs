@@ -47,13 +47,9 @@ impl Notification {
 /// Parse a Notification telegram (a framed PDU whose opcode is `0x33`).
 pub fn parse_notification(buf: &[u8]) -> Result<Notification> {
     let h = pdu::parse_header(buf)?;
-    // Bound the cursor to the declared payload length so the trailing `72 ver 00 00` frame trailer
-    // is excluded — otherwise the optional-alarm-block peek below would mistake it for data.
-    let end = if h.data_len > 0 {
-        (h.body_offset + h.data_len as usize).min(buf.len())
-    } else {
-        buf.len()
-    };
+    // Exclude the trailing `72 ver 00 00` frame trailer — otherwise the optional-alarm-block peek
+    // below would mistake it for data.
+    let end = h.body_end(buf);
     let mut cur = Cursor::new(&buf[h.body_offset..end]);
 
     let op = p::decode_u8(&mut cur)?;

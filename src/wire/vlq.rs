@@ -21,7 +21,10 @@ use crate::error::{Error, Result};
 #[inline]
 fn read_u8<R: Read>(r: &mut R) -> Result<u8> {
     let mut b = [0u8; 1];
-    r.read_exact(&mut b)?;
+    r.read_exact(&mut b).map_err(|e| match e.kind() {
+        std::io::ErrorKind::UnexpectedEof => Error::Vlq("truncated VLQ".into()),
+        _ => Error::Io(e),
+    })?;
     Ok(b[0])
 }
 
@@ -170,9 +173,8 @@ pub fn encode_u64<W: Write>(w: &mut W, value: u64) -> Result<usize> {
         b[8] = 0x80;
     }
 
-    for i in (0..length).rev() {
-        w.write_all(&b[i..i + 1])?;
-    }
+    b[..length].reverse();
+    w.write_all(&b[..length])?;
     Ok(length)
 }
 
@@ -199,9 +201,8 @@ pub fn encode_i32<W: Write>(w: &mut W, value: i32) -> Result<usize> {
         }
     }
 
-    for i in (0..length).rev() {
-        w.write_all(&b[i..i + 1])?;
-    }
+    b[..length].reverse();
+    w.write_all(&b[..length])?;
     Ok(length)
 }
 
@@ -244,16 +245,9 @@ pub fn encode_i64<W: Write>(w: &mut W, value: i64) -> Result<usize> {
         b[8] = if value >= 0 { 0x80 } else { 0xff };
     }
 
-    for i in (0..length).rev() {
-        w.write_all(&b[i..i + 1])?;
-    }
+    b[..length].reverse();
+    w.write_all(&b[..length])?;
     Ok(length)
-}
-
-// Keep `Error::Vlq` reachable for future strict-length validation without warnings.
-#[allow(dead_code)]
-fn _vlq_error_marker() -> Error {
-    Error::Vlq(String::new())
 }
 
 #[cfg(test)]

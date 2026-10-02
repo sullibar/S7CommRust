@@ -134,6 +134,23 @@ mod tests {
     }
 
     #[test]
+    fn every_dictionary_id_is_its_adler32() {
+        // A stream names its dictionary by Adler-32, so a wrong id makes that dictionary
+        // unreachable (upstream's NWT_90000001 constant has exactly that typo).
+        fn adler32(data: &[u8]) -> u32 {
+            let (mut a, mut b) = (1u32, 0u32);
+            for &x in data {
+                a = (a + u32::from(x)) % 65521;
+                b = (b + a) % 65521;
+            }
+            (b << 16) | a
+        }
+        for d in dict::PRESET_DICTIONARIES {
+            assert_eq!(d.adler, adler32(d.bytes), "dictionary {}", d.name);
+        }
+    }
+
+    #[test]
     fn preset_dictionary_roundtrip() {
         let d = dict::PRESET_DICTIONARIES
             .iter()

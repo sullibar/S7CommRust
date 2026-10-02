@@ -18,8 +18,10 @@ non-TLS "integrity-protected" scheme, so one API reaches both current and legacy
 >   (Explore) → read/write symbolic tags by name → subscriptions → alarms → legitimation.
 >   Validated end-to-end against a **PLCSIM Advanced V2.9** instance; legitimation is proven
 >   both ways (correct password accepted, wrong password denied).
-> - **Legacy path** (`connect_legacy`): the non-TLS scheme for older firmware. Authentication
->   and browsing are validated on a **physical S7-1200/1500**.
+> - **Legacy path**: the non-TLS scheme for older firmware. `connect_legacy` (the PLCSIM key
+>   family) is validated end-to-end against a **PLCSIM Advanced FW V2.8** instance.
+>   `connect_real_plc` (physical S7-1200/1500 on older firmware) is validated offline against
+>   golden vectors but has **not yet been tested on hardware**.
 >
 > Known gaps: alarm *reception* is unit-tested but not yet confirmed against a program with
 > firing alarms; a few upstream-unimplemented value types (`Variant`, `S7String`) remain
@@ -56,16 +58,22 @@ fn main() -> s7commplus::Result<()> {
 
 ### What you can do
 
-- **Connect** — `connect` (TLS) or `connect_legacy` (older firmware).
+- **Connect** — `connect` (TLS), or `connect_legacy` / `connect_real_plc` (older firmware).
+  The PLC's per-request item limit is read at connect, and larger reads and writes are split
+  to fit (`max_tags_per_read` / `max_tags_per_write`). `close` ends the session cleanly.
 - **Browse** — `datablock_list`, `explore`, `type_info`, `resolve_symbol`, and `resolve_var`
   (which adds the tag's softdatatype, to interpret its value).
 - **Read / write by name** — `read_tag` / `write_tag`, batched `read_tags` / `write_tags`,
   and the string helpers `read_string` / `write_string` and `read_wstring` / `write_wstring`.
 - **Subscribe** — `subscribe` / `subscribe_with` for cyclic value pushes, then
-  `next_notification`; a finite credit limit is auto-refreshed for you.
+  `next_notification` (per subscription) or `next_any_notification` (one loop for all); a
+  finite credit limit is auto-refreshed for you. `delete_subscription` frees it on the PLC.
 - **Alarms** — `subscribe_alarms`, then read `Notification::alarms()`; `Alarm::message()`
   formats localized alarm text with substituted associated values.
 - **Authenticate** — `legitimate(user, password)` against a password-protected program.
+- **Recover** — after a failed request the connection is *poisoned* (`is_poisoned`; the error
+  reports `is_connection_lost`): call `reconnect`, or enable `set_auto_reconnect` to retry reads
+  transparently. A notification poll that times out (`Error::is_timeout`) can simply be retried.
 
 Values flow through the `value::PValue` enum, which models the ~90 PLC datatypes.
 
@@ -85,8 +93,9 @@ cargo run -p s7tool -- --ip 192.168.0.1 browse
 cargo run -p s7tool -- --ip 192.168.0.1 read Data_block_1.toto Data_block_1.titi
 cargo run -p s7tool -- --ip 192.168.0.1 write Data_block_1.titi 456
 
-# Older, non-TLS firmware: add --legacy.
+# Older, non-TLS firmware: --legacy for PLCSIM, --real-plc for a physical S7-1200/1500.
 cargo run -p s7tool -- --ip 192.168.0.1 --legacy browse
+cargo run -p s7tool -- --ip 192.168.0.1 --real-plc browse
 ```
 
 `write` infers the tag's type by reading its current value first, so `write DB.x 1` does the
@@ -113,7 +122,8 @@ cargo clippy --all-targets
 
 The `examples/` directory contains runnable probes (`read`, `write`, `browse`, `mq`,
 `legitimate`, `legacy_read`, …) that expect a reachable PLC; point them at one with
-`S7_PLC_IP=<addr>`. Set `SSLKEYLOGFILE=<path>` to dump TLS secrets for Wireshark analysis.
+`S7_PLC_IP=<addr>`. Set `SSLKEYLOGFILE=<path>` to dump TLS secrets for Wireshark analysis — the
+driver honours it whenever it is set, so don't leave it set in production.
 
 For a bulk dump of every tag and its live value to a spreadsheet, use the `export_csv`
 example:

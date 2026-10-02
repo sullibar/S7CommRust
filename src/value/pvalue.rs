@@ -33,6 +33,11 @@ use crate::error::{Error, Result};
 use crate::value::datatype::{flags, tag as dt};
 use crate::wire::{primitives as p, vlq};
 
+/// Deepest `Struct` nesting [`PValue::deserialize`] accepts. Real values nest a few levels; the
+/// limit keeps a corrupt or hostile telegram from overflowing the stack (which would abort the
+/// process rather than return an error).
+pub const MAX_VALUE_NESTING: usize = 32;
+
 /// A single S7CommPlus value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PValue {
@@ -142,6 +147,21 @@ fn struct_is_packed(id: u32) -> bool {
 /// before the raw member bytes. For a single struct both are equal; for an array of packed
 /// structs they are the element stride and the total byte length.
 const PACKED_STRUCT_COUNT2_PRESENT: u32 = 1 << 10;
+
+/// An array element is written as a bare payload, so it must be a scalar of the array's declared
+/// element type: an `Int` in a `DInt` array would encode bytes that decode as something else.
+fn check_element(element_type: u8, item: &PValue) -> Result<()> {
+    let nested = matches!(
+        item,
+        PValue::Array { .. } | PValue::SparseArray { .. } | PValue::USIntArray(_)
+    );
+    if nested || item.datatype() != element_type {
+        return Err(Error::protocol(format!(
+            "array element {item:?} does not match element type 0x{element_type:02x}"
+        )));
+    }
+    Ok(())
+}
 
 /// Payload of an array of packed structs — the inverse of
 /// `PValue::deserialize_packed_struct_array`: one header taken from the first element, the
@@ -394,17 +414,36 @@ impl PValue {
                 items,
                 ..
             } => serialize_packed_struct_array(w, items),
-            PValue::Array { items, .. } => {
+            PValue::Array {
+                element_type,
+                flags: array_flags,
+                items,
+            } => {
+                if array_flags & flags::ANY_ARRAY == 0 || array_flags & flags::SPARSE_ARRAY != 0 {
+                    return Err(Error::protocol(format!(
+                        "PValue::Array needs the ARRAY or ADDRESS_ARRAY flag (got 0x{array_flags:02x})"
+                    )));
+                }
                 let mut n = 0;
                 n += vlq::encode_u32(w, items.len() as u32)?;
                 for item in items {
+                    check_element(*element_type, item)?;
                     n += item.serialize_payload(w)?;
                 }
                 Ok(n)
             }
-            PValue::SparseArray { entries, .. } => {
+            PValue::SparseArray {
+                element_type,
+                entries,
+            } => {
                 let mut n = 0;
                 for (key, value) in entries {
+                    if *key == 0 {
+                        return Err(Error::protocol(
+                            "sparse array key 0 is reserved for the terminator",
+                        ));
+                    }
+                    check_element(*element_type, value)?;
                     n += vlq::encode_u32(w, *key)?;
                     n += value.serialize_payload(w)?;
                 }
@@ -415,13 +454,25 @@ impl PValue {
     }
 
     /// Deserialize a full value (flags + datatype + payload).
+    ///
+    /// Nested `Struct`s deeper than [`MAX_VALUE_NESTING`] are rejected, so a corrupt or hostile
+    /// telegram cannot overflow the stack.
     pub fn deserialize<R: Read>(r: &mut R) -> Result<PValue> {
+        Self::deserialize_at(r, 0)
+    }
+
+    fn deserialize_at<R: Read>(r: &mut R, depth: usize) -> Result<PValue> {
+        if depth > MAX_VALUE_NESTING {
+            return Err(Error::protocol(format!(
+                "value nesting deeper than {MAX_VALUE_NESTING} levels"
+            )));
+        }
         let flags = p::decode_u8(r)?;
         let datatype = p::decode_u8(r)?;
         if flags & flags::ANY_ARRAY != 0 {
-            return Self::deserialize_array(r, flags, datatype);
+            return Self::deserialize_array(r, flags, datatype, depth);
         }
-        Self::deserialize_payload(r, datatype)
+        Self::deserialize_payload(r, datatype, depth)
     }
 
     /// Deserialize an array value. Regular and address arrays are a VLQ element count
@@ -430,14 +481,19 @@ impl PValue {
     /// `Struct` arrays have their own layout (see `deserialize_packed_struct_array`). The
     /// remaining variable-length element types (`WString`/`Variant`/`S7String`) use an
     /// address-array layout we don't decode yet and error clearly rather than desync.
-    fn deserialize_array<R: Read>(r: &mut R, flags: u8, datatype: u8) -> Result<PValue> {
+    fn deserialize_array<R: Read>(
+        r: &mut R,
+        flags: u8,
+        datatype: u8,
+        depth: usize,
+    ) -> Result<PValue> {
         if flags & flags::SPARSE_ARRAY != 0 {
             // Sparse array: (VLQ key, value) entries terminated by a zero key. The value
             // payload is the same as a scalar of `datatype` (Blob/UDInt/DInt/WString).
             let mut entries = Vec::new();
             let mut key = vlq::decode_u32(r)?;
             while key != 0 {
-                let value = Self::deserialize_payload(r, datatype)?;
+                let value = Self::deserialize_payload(r, datatype, depth)?;
                 entries.push((key, value));
                 key = vlq::decode_u32(r)?;
             }
@@ -461,9 +517,15 @@ impl PValue {
             let data = crate::wire::primitives::decode_octets(r, count)?;
             return Ok(PValue::USIntArray(data));
         }
-        let mut items = Vec::with_capacity(count);
+        if datatype == dt::NULL && count > 0 {
+            // Null elements occupy no bytes, so the count would be the only bound on the loop.
+            return Err(Error::protocol("array of Null elements not supported"));
+        }
+        // Every other element consumes input, so a bogus count fails at the end of the telegram;
+        // only the pre-allocation needs a cap.
+        let mut items = Vec::with_capacity(count.min(1024));
         for _ in 0..count {
-            items.push(Self::deserialize_payload(r, datatype)?);
+            items.push(Self::deserialize_payload(r, datatype, depth)?);
         }
         Ok(PValue::Array {
             element_type: datatype,
@@ -514,7 +576,7 @@ impl PValue {
         })
     }
 
-    fn deserialize_payload<R: Read>(r: &mut R, datatype: u8) -> Result<PValue> {
+    fn deserialize_payload<R: Read>(r: &mut R, datatype: u8, depth: usize) -> Result<PValue> {
         Ok(match datatype {
             dt::NULL => PValue::Null,
             dt::BOOL => PValue::Bool(p::decode_u8(r)? != 0),
@@ -545,11 +607,11 @@ impl PValue {
             dt::WSTRING => {
                 let len = vlq::decode_u32(r)? as usize;
                 let bytes = crate::wire::primitives::decode_octets(r, len)?;
-                let s = String::from_utf8(bytes)
-                    .map_err(|e| Error::protocol(format!("invalid UTF-8 in WString: {e}")))?;
-                PValue::WString(s)
+                // Lossy, like the reference (`Encoding.UTF8.GetString`): one bad byte in a name
+                // must not fail a whole Explore or read.
+                PValue::WString(String::from_utf8_lossy(&bytes).into_owned())
             }
-            dt::STRUCT => Self::deserialize_struct(r)?,
+            dt::STRUCT => Self::deserialize_struct(r, depth)?,
             other => {
                 return Err(Error::protocol(format!(
                     "unsupported or not-yet-implemented PValue datatype 0x{other:02x}"
@@ -561,7 +623,7 @@ impl PValue {
     /// Deserialize a `Struct` payload (the struct id has datatype `0x17`). Mirrors
     /// `ValueStruct.Deserialize`: a fixed-width id, then — for the non-packed form —
     /// `(VLQ key, value)` members terminated by a zero key.
-    fn deserialize_struct<R: Read>(r: &mut R) -> Result<PValue> {
+    fn deserialize_struct<R: Read>(r: &mut R, depth: usize) -> Result<PValue> {
         let id = p::decode_u32(r)?;
         if struct_is_packed(id) {
             // Packed (optimized) struct: fixed u64 interface timestamp, VLQ transport flags,
@@ -584,7 +646,7 @@ impl PValue {
         let mut elements = Vec::new();
         let mut key = vlq::decode_u32(r)?;
         while key != 0 {
-            let value = PValue::deserialize(r)?;
+            let value = PValue::deserialize_at(r, depth + 1)?;
             elements.push((key, value));
             key = vlq::decode_u32(r)?;
         }
@@ -989,5 +1051,43 @@ mod tests {
         let mut wire = udt_array_wire();
         wire[17] = 0x1f; // total 31: not a multiple of the 16-byte stride
         assert!(PValue::deserialize(&mut Cursor::new(&wire)).is_err());
+    }
+
+    #[test]
+    fn array_elements_must_match_the_element_type() {
+        // An Int in a DInt array used to serialize as `10 08 01 00 05`, which decodes as DInt(0)
+        // plus a stray byte — a malformed (or wrong-valued) write.
+        let bad = PValue::Array {
+            element_type: dt::DINT,
+            flags: flags::ARRAY,
+            items: vec![PValue::Int(5)],
+        };
+        assert!(bad.serialize(&mut Vec::new()).is_err());
+        let no_shape = PValue::Array {
+            element_type: dt::DINT,
+            flags: 0,
+            items: vec![PValue::DInt(5)],
+        };
+        assert!(no_shape.serialize(&mut Vec::new()).is_err());
+        let sparse_zero_key = PValue::SparseArray {
+            element_type: dt::UDINT,
+            entries: vec![(0, PValue::UDInt(1))],
+        };
+        assert!(sparse_zero_key.serialize(&mut Vec::new()).is_err());
+        roundtrip(PValue::Array {
+            element_type: dt::DINT,
+            flags: flags::ARRAY,
+            items: vec![PValue::DInt(5), PValue::DInt(-70_000)],
+        });
+    }
+
+    #[test]
+    fn wstring_with_invalid_utf8_decodes_lossily() {
+        // Like the reference: one bad byte in a name must not fail a whole Explore.
+        let wire = [0x00, dt::WSTRING, 0x03, b'a', 0xff, b'b'];
+        assert_eq!(
+            PValue::deserialize(&mut Cursor::new(&wire)).unwrap(),
+            PValue::WString("a\u{fffd}b".into())
+        );
     }
 }

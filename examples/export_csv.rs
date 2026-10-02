@@ -2,9 +2,8 @@
 // Copyright (C) 2026 s7commplus-rs contributors
 //
 // Browse every DB/FB and M/Q/I tag on a CPU, read each live value, and write the whole list to
-// a CSV file (UTF-8 with a BOM, so spreadsheet apps render non-ASCII names correctly). A
-// headless replacement for the old Slint GUI: the same connect -> browse -> read -> CSV
-// pipeline, with no GUI dependency.
+// a CSV file (UTF-8 with a BOM, so spreadsheet apps render non-ASCII names correctly): the
+// connect -> browse -> read -> CSV pipeline, with no GUI dependency.
 //
 //   S7_PLC_IP=192.168.0.1 cargo run --example export_csv
 //   S7_PLC_IP=192.168.0.1 cargo run --example export_csv -- tags.csv

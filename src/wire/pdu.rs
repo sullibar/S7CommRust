@@ -85,6 +85,17 @@ pub mod ids {
     /// Attribute id: the server-session version Struct (echoed back during session setup).
     pub const SERVER_SESSION_VERSION: u32 = 306;
 
+    // Communication resources (`CommRessources.ReadMax` in the reference).
+    /// The root object: the access area of the PLC's system limits.
+    pub const OBJECT_ROOT: u32 = 201;
+    /// Access sub-area of the PLC's system limits (read with LID [`TAGS_PER_READ_REQUEST_MAX`]
+    /// and [`TAGS_PER_WRITE_REQUEST_MAX`]).
+    pub const SYSTEM_LIMITS: u32 = 1037;
+    /// System-limits LID: most items one GetMultiVariables may carry.
+    pub const TAGS_PER_READ_REQUEST_MAX: u32 = 1000;
+    /// System-limits LID: most items one SetMultiVariables may carry.
+    pub const TAGS_PER_WRITE_REQUEST_MAX: u32 = 1001;
+
     // Object-qualifier ids (appended to Get/SetMultiVariables requests).
     /// Object-qualifier attribute id.
     pub const OBJECT_QUALIFIER: u32 = 1256;
@@ -114,13 +125,14 @@ pub mod ids {
     pub const LID_LEGITIMATION_PAYLOAD_PASSWORD: u32 = 40403;
 }
 
-/// Wrap a single-chunk PDU body in the S7CommPlus header + trailer.
+/// Wrap a PDU body in the S7CommPlus header + trailer, as one chunk.
 ///
-/// This is correct for PDUs that fit in one chunk (the only kind the bootstrap emits).
-/// Multi-chunk fragmentation (one header per chunk, trailer on the last) is a later
-/// concern handled when large requests are introduced.
+/// Requests that are too large for one chunk are split afterwards with [`split_framed_pdu`].
+/// Received telegrams reassembled from several chunks are re-wrapped here too and can exceed the
+/// `u16` length field; it then saturates at `u16::MAX`, and readers find the end of the body from
+/// the trailer instead (see [`PduHeader::body_end`]).
 pub fn frame_single_pdu(proto_version: u8, body: &[u8]) -> Vec<u8> {
-    let len = body.len() as u16;
+    let len = u16::try_from(body.len()).unwrap_or(u16::MAX);
     let mut out = Vec::with_capacity(body.len() + 8);
     // header
     out.push(PROTOCOL_ID);
@@ -141,10 +153,16 @@ pub fn frame_single_pdu(proto_version: u8, body: &[u8]) -> Vec<u8> {
 /// the connection request. A larger frame makes the PLC drop the connection.
 pub const MAX_CHUNK_PAYLOAD: usize = 979;
 
+/// Largest telegram the receive paths reassemble. Real responses (even an Explore of a large
+/// program's type info) are far smaller; the cap keeps a misbehaving peer from growing the
+/// reassembly buffer without bound.
+pub const MAX_TELEGRAM_LEN: usize = 64 * 1024 * 1024;
+
 /// Split a [`frame_single_pdu`]-framed telegram into chunks of at most `max_payload` bytes,
 /// each with its own header and the trailer only on the last. Each chunk is meant to be sent
 /// as a separate TLS record. A telegram that already fits is returned unchanged.
 pub fn split_framed_pdu(framed: &[u8], max_payload: usize) -> Vec<Vec<u8>> {
+    let max_payload = max_payload.max(1);
     if framed.len() < 8 || framed.len() - 8 <= max_payload {
         return vec![framed.to_vec()];
     }
@@ -175,6 +193,22 @@ pub struct PduHeader {
     pub data_len: u16,
     /// Offset into the original buffer where the PDU body begins.
     pub body_offset: usize,
+}
+
+impl PduHeader {
+    /// End (exclusive) of the PDU body within `buf`, excluding the `72 ver 00 00` trailer. The
+    /// trailer is authoritative when present, since a telegram reassembled from several chunks
+    /// can be longer than the `u16` [`data_len`](Self::data_len) field can say.
+    pub fn body_end(&self, buf: &[u8]) -> usize {
+        let n = buf.len();
+        if n >= self.body_offset + 4 && buf[n - 4..] == [PROTOCOL_ID, self.protocol_version, 0, 0] {
+            n - 4
+        } else if self.data_len > 0 {
+            (self.body_offset + self.data_len as usize).min(n)
+        } else {
+            n
+        }
+    }
 }
 
 /// Parse the leading S7CommPlus header from a received telegram.

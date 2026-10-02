@@ -32,7 +32,7 @@ pub enum Error {
     #[error("protocol error: {0}")]
     Protocol(String),
 
-    /// A VLQ value did not terminate within its maximum byte length.
+    /// A VLQ value in a received telegram was malformed or cut off.
     #[error("malformed VLQ: {0}")]
     Vlq(String),
 
@@ -61,8 +61,20 @@ impl Error {
         Error::Closed(msg.into())
     }
 
-    /// Whether this error is a plain socket read/write timeout (no data yet). The connection
-    /// stays usable — retry the operation. Distinct from a real disconnect.
+    /// Map an I/O error raised while decoding an in-memory telegram. Running out of input there
+    /// means the telegram is malformed or truncated — not that the connection was lost.
+    pub(crate) fn decode(e: io::Error) -> Self {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            Error::protocol("telegram truncated: unexpected end of data")
+        } else {
+            Error::Io(e)
+        }
+    }
+
+    /// Whether this error is a plain socket read timeout: nothing (more) arrived in time, and the
+    /// connection stays usable — retry the operation. Only waiting for a notification
+    /// (`Connection::next_notification`) returns this; a request whose response does not arrive
+    /// in time poisons the connection and fails with [`Error::Closed`] instead.
     pub fn is_timeout(&self) -> bool {
         matches!(
             self,
@@ -73,11 +85,14 @@ impl Error {
         )
     }
 
-    /// Whether this error means the connection is no longer usable and must be reconnected.
-    /// A bare timeout is *not* a lost connection (see [`Error::is_timeout`]).
+    /// Whether this error means the connection is no longer usable and must be reconnected:
+    /// a socket or TLS failure, a malformed TPKT/COTP/chunk frame (the byte stream is out of
+    /// step), or a poisoned connection. A bare timeout is *not* a lost connection (see
+    /// [`Error::is_timeout`]), and neither is a PLC refusing a request or a response that fails
+    /// to decode.
     pub fn is_connection_lost(&self) -> bool {
         match self {
-            Error::Closed(_) | Error::Tls(_) => true,
+            Error::Closed(_) | Error::Tls(_) | Error::Framing(_) => true,
             Error::Io(_) => !self.is_timeout(),
             _ => false,
         }

@@ -18,9 +18,16 @@
 //!   (`use_context = 0` → [`None`], *not* `Some(&[])`), 32 bytes — the linchpin for
 //!   legitimation. One wrong byte means silent auth failure.
 //!
-//! The PLC presents a self-signed certificate, so an accept-all verifier is used. This is
-//! intentional and matches upstream: the security boundary here is the exported secret,
-//! not certificate trust.
+//! The PLC presents a self-signed certificate, and an accept-all verifier is used, as upstream
+//! does. That leaves the connection open to an **active** man-in-the-middle: it can terminate
+//! TLS on both sides, so it knows both exported secrets and can read (and replay) the
+//! legitimation payload — the plaintext password for a user login, or the SHA-1 of the
+//! password, which is all the PLC checks, for a legacy one. The secret only binds legitimation
+//! to *a* TLS session, not to the PLC. (TIA Portal, by contrast, has the user trust the PLC's
+//! certificate.) Use it on networks you trust.
+//!
+//! The client also honours `SSLKEYLOGFILE` whenever it is set, writing the session keys there
+//! for Wireshark — leave it unset in production.
 
 use std::io::{Cursor, Read, Write};
 use std::sync::Arc;
@@ -115,6 +122,20 @@ impl TlsChannel {
     /// Encrypt and send `plaintext` (a S7CommPlus telegram) over the channel.
     pub fn send(&mut self, tcp: &mut IsoTcp, plaintext: &[u8]) -> Result<()> {
         self.conn.writer().write_all(plaintext)?;
+        while self.conn.wants_write() {
+            let mut out = Vec::new();
+            self.conn.write_tls(&mut out)?;
+            if out.is_empty() {
+                break;
+            }
+            tcp.send_iso_packet(&out)?;
+        }
+        Ok(())
+    }
+
+    /// Send the TLS `close_notify` alert, ending the TLS session cleanly.
+    pub fn close(&mut self, tcp: &mut IsoTcp) -> Result<()> {
+        self.conn.send_close_notify();
         while self.conn.wants_write() {
             let mut out = Vec::new();
             self.conn.write_tls(&mut out)?;

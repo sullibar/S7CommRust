@@ -38,7 +38,7 @@ pub use get_var_substreamed::{
     build_get_var_substreamed_request, parse_get_var_substreamed_response,
     GetVarSubstreamedResponse,
 };
-pub use header::{RequestHeader, ResponseHeader};
+pub use header::{return_value_is_ok, RequestHeader, ResponseHeader};
 pub use init_ssl::{
     build_init_ssl_request, init_ssl_request_default, parse_init_ssl_response, InitSslResponse,
 };

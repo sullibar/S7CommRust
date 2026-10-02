@@ -412,13 +412,17 @@ fn apply_format(v: &AssociatedValue, spec: &str) -> String {
                 AssociatedValue::Int(n) => *n as f64,
                 other => return other.to_string(),
             };
-            // Honor a `.N` precision if present (e.g. "6.2f" -> precision 2).
+            // Honor a `.N` precision if present (e.g. "6.2f" -> precision 2). The text comes from
+            // the PLC; clamp it, since a precision past u16::MAX makes `format!` panic.
             match spec.rsplit_once('.').and_then(|(_, p)| {
                 p.trim_end_matches(|c: char| c.is_ascii_alphabetic())
                     .parse::<usize>()
                     .ok()
             }) {
-                Some(prec) => format!("{n:.prec$}"),
+                Some(prec) => {
+                    let prec = prec.min(32);
+                    format!("{n:.prec$}")
+                }
                 None => format!("{n}"),
             }
         }
@@ -551,5 +555,14 @@ mod tests {
         let mut obj = PObject::new(0, 0, 0);
         obj.add_attribute(DAI_CPU_ALARM_ID, PValue::LWord(1));
         assert!(Alarm::from_object(&obj).is_err());
+    }
+
+    #[test]
+    fn huge_precision_in_alarm_text_is_clamped() {
+        // The format spec comes from the PLC's alarm text; a precision past u16::MAX made
+        // `format!` panic.
+        let s = apply_format(&AssociatedValue::Real(1.5), "1.65536f");
+        assert!(s.starts_with("1.5"));
+        assert_eq!(apply_format(&AssociatedValue::Real(1.5), ".2f"), "1.50");
     }
 }

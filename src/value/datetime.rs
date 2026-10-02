@@ -297,13 +297,16 @@ impl S7TimeOfDay {
 pub fn format(softdatatype: u8, v: &PValue) -> Option<String> {
     match softdatatype {
         sdt::DATE => Some(S7DateTime::from_date_days(v.as_u64()? as u16).to_string()),
-        sdt::TIME_OF_DAY => {
-            Some(S7TimeOfDay::from_day_nanos(v.as_u64()? as i64 * 1_000_000).to_string())
-        }
+        // Both the softdatatype and the value come from the PLC, so a 64-bit value can arrive where a
+        // 32-bit one is expected: overflow means "not a valid time", not a panic.
+        sdt::TIME_OF_DAY => Some(
+            S7TimeOfDay::from_day_nanos(i64::try_from(v.as_u64()?).ok()?.checked_mul(1_000_000)?)
+                .to_string(),
+        ),
         sdt::LTOD => Some(S7TimeOfDay::from_day_nanos(v.as_i64()?).to_string()),
         sdt::TIME => Some(
             S7Duration {
-                nanos: v.as_i64()? * 1_000_000,
+                nanos: v.as_i64()?.checked_mul(1_000_000)?,
             }
             .to_string(),
         ),

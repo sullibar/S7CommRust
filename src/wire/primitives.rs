@@ -15,12 +15,12 @@
 
 use std::io::{Read, Write};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 #[inline]
 fn read_n<const N: usize, R: Read>(r: &mut R) -> Result<[u8; N]> {
     let mut buf = [0u8; N];
-    r.read_exact(&mut buf)?;
+    r.read_exact(&mut buf).map_err(Error::decode)?;
     Ok(buf)
 }
 
@@ -160,9 +160,21 @@ pub fn encode_octets<W: Write>(w: &mut W, value: &[u8]) -> Result<usize> {
 }
 
 /// Read `length` raw bytes (`DecodeOctets`).
+///
+/// The buffer grows as bytes actually arrive, so a bogus length from the wire fails at the end
+/// of the input instead of allocating it up front.
 pub fn decode_octets<R: Read>(r: &mut R, length: usize) -> Result<Vec<u8>> {
-    let mut value = vec![0u8; length];
-    r.read_exact(&mut value)?;
+    let mut value = Vec::with_capacity(length.min(4096));
+    r.by_ref()
+        .take(length as u64)
+        .read_to_end(&mut value)
+        .map_err(Error::decode)?;
+    if value.len() != length {
+        return Err(Error::protocol(format!(
+            "telegram truncated: wanted {length} bytes, got {}",
+            value.len()
+        )));
+    }
     Ok(value)
 }
 

@@ -140,6 +140,10 @@ pub fn encode_object_qualifier<W: Write>(w: &mut W) -> Result<usize> {
     Ok(n)
 }
 
+/// Deepest object nesting the decoder accepts. Explore trees nest a handful of levels; the limit
+/// keeps a corrupt or hostile telegram from overflowing the stack.
+pub const MAX_OBJECT_NESTING: usize = 32;
+
 /// Decode a list of objects (`S7p.DecodeObjectList`): consume consecutive objects while
 /// the next tag is `element_id::START_OF_OBJECT`; stop at anything else (or end of buf).
 pub fn decode_object_list(cur: &mut Cursor<&[u8]>) -> Result<Vec<PObject>> {
@@ -163,13 +167,18 @@ pub fn decode_object(cur: &mut Cursor<&[u8]>) -> Result<PObject> {
             "decode_object: expected StartOfObject (0xa1), got 0x{tag:02x}"
         )));
     }
-    decode_object_after_tag(cur)
+    decode_object_after_tag(cur, 0)
 }
 
 /// Decode an object's header and body, assuming the `StartOfObject` tag was already read
 /// (mirrors the body of `S7p.DecodeObject`). Nested child objects recurse; the object ends
-/// at [`element_id::TERMINATING_OBJECT`].
-fn decode_object_after_tag(cur: &mut Cursor<&[u8]>) -> Result<PObject> {
+/// at [`element_id::TERMINATING_OBJECT`]. Nesting deeper than [`MAX_OBJECT_NESTING`] is rejected.
+fn decode_object_after_tag(cur: &mut Cursor<&[u8]>, depth: usize) -> Result<PObject> {
+    if depth > MAX_OBJECT_NESTING {
+        return Err(Error::protocol(format!(
+            "object nesting deeper than {MAX_OBJECT_NESTING} levels"
+        )));
+    }
     let relation_id = p::decode_u32(cur)?; // fixed-width
     let class_id = vlq::decode_u32(cur)?;
     let class_flags = vlq::decode_u32(cur)?;
@@ -186,7 +195,7 @@ fn decode_object_after_tag(cur: &mut Cursor<&[u8]>) -> Result<PObject> {
         let tag = p::decode_u8(cur)?;
         match tag {
             element_id::START_OF_OBJECT => {
-                let child = decode_object_after_tag(cur)?;
+                let child = decode_object_after_tag(cur, depth + 1)?;
                 obj.objects.push(child);
             }
             element_id::TERMINATING_OBJECT => break,
