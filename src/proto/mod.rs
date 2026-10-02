@@ -42,7 +42,7 @@ pub use header::{return_value_is_ok, RequestHeader, ResponseHeader};
 pub use init_ssl::{
     build_init_ssl_request, init_ssl_request_default, parse_init_ssl_response, InitSslResponse,
 };
-pub use item_address::ItemAddress;
+pub use item_address::{Area, ItemAddress};
 pub use notification::{parse_notification, Notification};
 pub use object::decode_object_list;
 pub use object::PObject;

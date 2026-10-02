@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use s7commplus::value::datatype::softdatatype as sdt;
 use s7commplus::value::{datetime, strings, PValue};
-use s7commplus::{Connection, Error, Result, SubscriptionItem, VarInfo};
+use s7commplus::{Alarm, Area, Connection, CpuState, Error, Result, SubscriptionItem, VarInfo};
 
 const PROMPT: &str = "s7> ";
 
@@ -395,6 +395,49 @@ fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
             let polls: usize = cmd.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
             alarms_demo(conn, polls)
         }
+        "pending" => {
+            let alarms = conn.active_alarms()?;
+            println!("{} pending alarm(s)", alarms.len());
+            alarms.iter().for_each(print_alarm);
+            Ok(())
+        }
+        "state" => {
+            match conn.cpu_state()? {
+                CpuState::Run => println!("RUN"),
+                CpuState::Stop => println!("STOP"),
+                CpuState::Other(code) => println!("operating state code {code}"),
+            }
+            Ok(())
+        }
+        "rawread" => {
+            let (Some(area), Some(start), Some(len), 4) = (
+                cmd.get(1).and_then(|s| parse_area(s)),
+                cmd.get(2).and_then(|s| s.parse().ok()),
+                cmd.get(3).and_then(|s| s.parse().ok()),
+                cmd.len(),
+            ) else {
+                println!("usage: rawread <DB<n>|I|Q|M> <start> <len>");
+                return Ok(());
+            };
+            println!("{}", hex(&conn.read_area(area, start, len)?));
+            Ok(())
+        }
+        "rawwrite" => {
+            let (Some(area), Some(start), Some(data), 4) = (
+                cmd.get(1).and_then(|s| parse_area(s)),
+                cmd.get(2).and_then(|s| s.parse().ok()),
+                cmd.get(3)
+                    .and_then(|s| parse_hex(s).ok())
+                    .filter(|d| !d.is_empty()),
+                cmd.len(),
+            ) else {
+                println!("usage: rawwrite <DB<n>|I|Q|M> <start> <hex bytes, e.g. 01ff>");
+                return Ok(());
+            };
+            conn.write_area(area, start, &data)?;
+            println!("wrote {} byte(s)", data.len());
+            Ok(())
+        }
         other => {
             println!("unknown command '{other}' — type 'help'");
             Ok(())
@@ -588,33 +631,8 @@ fn alarms_demo(conn: &mut Connection, polls: usize) -> Result<()> {
                 if alarms.is_empty() {
                     println!("  poll #{i}: notification, no alarm objects");
                 }
-                for a in &alarms {
-                    total += 1;
-                    let name = if a.type_name.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" [{}]", a.type_name)
-                    };
-                    println!(
-                        "  ALARM {:?} id=0x{:016x} domain={} msgtype={} seq={} @ {}{name}",
-                        a.state,
-                        a.cpu_alarm_id,
-                        a.alarm_domain,
-                        a.message_type,
-                        a.sequence_counter,
-                        a.timestamp
-                    );
-                    // Render the message text (prefer en-US = 1033, else the first language sent).
-                    let text = a
-                        .message(1033)
-                        .or_else(|| a.texts.first().and_then(|t| a.message(t.language_id)));
-                    if let Some(msg) = text.filter(|m| !m.is_empty()) {
-                        println!("      text: {msg}");
-                    }
-                    for (i, v) in a.associated_values.iter().enumerate() {
-                        println!("      SD_{} = {v}", i + 1);
-                    }
-                }
+                total += alarms.len();
+                alarms.iter().for_each(print_alarm);
             }
             Err(e) if e.is_timeout() => println!("  poll #{i}: (no alarm within timeout)"),
             Err(e) => return Err(e),
@@ -622,6 +640,29 @@ fn alarms_demo(conn: &mut Connection, polls: usize) -> Result<()> {
     }
     println!("done: {total} alarm event(s) received.");
     Ok(())
+}
+
+/// Print one alarm event: its state and ids, its message text, and its associated values.
+fn print_alarm(a: &Alarm) {
+    let name = if a.type_name.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", a.type_name)
+    };
+    println!(
+        "  ALARM {:?} id=0x{:016x} domain={} msgtype={} seq={} @ {}{name}",
+        a.state, a.cpu_alarm_id, a.alarm_domain, a.message_type, a.sequence_counter, a.timestamp
+    );
+    // Render the message text (prefer en-US = 1033, else the first language sent).
+    let text = a
+        .message(1033)
+        .or_else(|| a.texts.first().and_then(|t| a.message(t.language_id)));
+    if let Some(msg) = text.filter(|m| !m.is_empty()) {
+        println!("      text: {msg}");
+    }
+    for (i, v) in a.associated_values.iter().enumerate() {
+        println!("      SD_{} = {v}", i + 1);
+    }
 }
 
 /// Read and print one tag by symbol name, interpreted via its softdatatype.
@@ -708,6 +749,25 @@ fn parse_uint(s: &str) -> Option<u64> {
 }
 
 /// Parse a boolean from common spellings.
+/// Parse a raw-access area: `DB<n>`, `I`, `Q` or `M` (any case).
+fn parse_area(s: &str) -> Option<Area> {
+    match s.to_ascii_uppercase().as_str() {
+        "I" => Some(Area::Inputs),
+        "Q" => Some(Area::Outputs),
+        "M" => Some(Area::Memory),
+        db => db.strip_prefix("DB")?.parse().ok().map(Area::Db),
+    }
+}
+
+/// Format bytes as space-separated hex.
+fn hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn parse_bool(s: &str) -> Option<bool> {
     match s.to_ascii_lowercase().as_str() {
         "1" | "true" | "t" | "on" | "yes" | "y" => Some(true),
@@ -892,6 +952,11 @@ fn help_body() -> &'static str {
      \x20   xidents <relid>     decompress a DB's identity/comment XML (attr 2449/2546)\n\
      \x20   sub [n] [ms] [k] [c]  subscribe to n tags; print k notifications every ms (opt credit c)\n\
      \x20   alarms [polls]      subscribe to program/system alarms and poll for events\n\
+     \x20   pending             list the alarms pending now (no subscription needed)\n\
+     \x20   state               show the CPU operating state (RUN/STOP)\n\
+     \x20   rawread <area> <start> <len>   read bytes at a byte offset of area DB<n>, I, Q or M\n\
+     \x20                       (DB<n> must be a standard, not optimized, data block)\n\
+     \x20   rawwrite <area> <start> <hex>  write bytes at a byte offset (e.g. rawwrite M 10 01ff)\n\
      \x20   help                show this help\n\
      \x20   quit                exit (interactive mode)\n"
 }
@@ -899,6 +964,18 @@ fn help_body() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_access_arguments_parse() {
+        assert_eq!(parse_area("db5"), Some(Area::Db(5)));
+        assert_eq!(parse_area("M"), Some(Area::Memory));
+        assert_eq!(parse_area("i"), Some(Area::Inputs));
+        assert_eq!(parse_area("Q"), Some(Area::Outputs));
+        assert_eq!(parse_area("DB"), None);
+        assert_eq!(parse_area("DB70000"), None);
+        assert_eq!(parse_area("X"), None);
+        assert_eq!(hex(&[0, 0xab]), "00 ab");
+    }
 
     #[test]
     fn split_line_keeps_quoted_names_whole() {
