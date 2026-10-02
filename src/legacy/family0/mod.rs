@@ -30,9 +30,16 @@ pub mod auth;
 pub mod blob;
 pub mod checksum;
 pub mod cipher;
+pub mod curve;
+#[cfg(test)] // the original monolith chain, kept as the differential-test reference
 pub mod data;
+#[cfg(test)]
 pub mod field;
+#[cfg(test)]
 pub mod monolith;
+pub mod present;
 pub mod seed;
+#[cfg(test)]
 pub mod transform7;
+#[cfg(test)]
 pub mod transforms;

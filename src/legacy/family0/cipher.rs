@@ -9,7 +9,7 @@
 //! that encrypts `challenge[2..18]` and `key2`, sealed with a LUT/`ChecksumTransform` MAC.
 //!
 //! This is **not** standard CTR (and differs from the PLCSIM `HarpoAesCtr`): each block is
-//! `AES-ECB(iv) ⊕ plaintext` with the IV advanced by [`super::field::rotate_left31`] between
+//! `AES-ECB(iv) ⊕ plaintext` with the IV advanced by [`advance_counter`] (HarpoS7's `RotateLeft31`) between
 //! blocks, and a running checksum folded through [`super::checksum::checksum`] and finally
 //! length-bound and AES-encrypted under a separate key.
 //!
@@ -18,7 +18,7 @@
 //! layer; this module takes them as inputs so it can be validated independently against the
 //! blob tail of the `AuthenticateRealPlc` golden vector.
 
-use super::{checksum, field};
+use super::checksum;
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::Aes128;
@@ -87,7 +87,7 @@ pub fn encrypt_body(
     dst[off..off + 16].copy_from_slice(&ct);
     off += 16;
     encrypted_bytes += 16;
-    field::rotate_left31(&mut iv_state);
+    advance_counter(&mut iv_state);
     update_checksum(&mut cs, &ct, lut);
 
     // Region E: encrypt full 16-byte blocks of key2 (one block for 24-byte key2).
@@ -99,7 +99,7 @@ pub fn encrypt_body(
         dst[off..off + 16].copy_from_slice(&ct);
         off += 16;
         encrypted_bytes += 16;
-        field::rotate_left31(&mut iv_state);
+        advance_counter(&mut iv_state);
         update_checksum(&mut cs, &ct, lut);
     }
 
@@ -130,9 +130,34 @@ pub fn encrypt_body(
     off
 }
 
+/// Advance the counter block: multiply the little-endian 128-bit value by `x` in GCM's
+/// bit-reflected field (HarpoS7 calls this `BigIntOperations.RotateLeft31`).
+fn advance_counter(iv: &mut [u8; 16]) {
+    let v = u128::from_le_bytes(*iv);
+    *iv = ((v >> 1) ^ if v & 1 == 1 { 0xE1 << 120 } else { 0 }).to_le_bytes();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advance_counter_matches_harpos7_rotate_left31() {
+        let mut state = 0x0123_4567_89AB_CDEFu64;
+        for _ in 0..1000 {
+            let mut iv = [0u8; 16];
+            for b in iv.iter_mut() {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *b = (state >> 56) as u8;
+            }
+            let mut old = iv;
+            crate::legacy::family0::field::rotate_left31(&mut old);
+            advance_counter(&mut iv);
+            assert_eq!(iv, old);
+        }
+    }
     use crate::legacy::family0::checksum::{generate_lut, LUT_LEN};
     use hex_literal::hex;
 
