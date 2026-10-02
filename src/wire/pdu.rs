@@ -136,6 +136,36 @@ pub fn frame_single_pdu(proto_version: u8, body: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Largest payload per chunk when sending over TLS. It matches the chunks the PLC itself sends,
+/// which keeps every TLS record inside one COTP frame of the 1024-byte TPDU size negotiated in
+/// the connection request. A larger frame makes the PLC drop the connection.
+pub const MAX_CHUNK_PAYLOAD: usize = 979;
+
+/// Split a [`frame_single_pdu`]-framed telegram into chunks of at most `max_payload` bytes,
+/// each with its own header and the trailer only on the last. Each chunk is meant to be sent
+/// as a separate TLS record. A telegram that already fits is returned unchanged.
+pub fn split_framed_pdu(framed: &[u8], max_payload: usize) -> Vec<Vec<u8>> {
+    if framed.len() < 8 || framed.len() - 8 <= max_payload {
+        return vec![framed.to_vec()];
+    }
+    let version = framed[1];
+    let body = &framed[4..framed.len() - 4];
+    let mut chunks: Vec<Vec<u8>> = body
+        .chunks(max_payload)
+        .map(|part| {
+            let mut chunk = Vec::with_capacity(part.len() + 8);
+            chunk.extend_from_slice(&[PROTOCOL_ID, version]);
+            chunk.extend_from_slice(&(part.len() as u16).to_be_bytes());
+            chunk.extend_from_slice(part);
+            chunk
+        })
+        .collect();
+    if let Some(last) = chunks.last_mut() {
+        last.extend_from_slice(&framed[framed.len() - 4..]);
+    }
+    chunks
+}
+
 /// A parsed S7CommPlus PDU header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PduHeader {
@@ -178,6 +208,36 @@ pub fn parse_header(buf: &[u8]) -> crate::Result<PduHeader> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_framed_pdu_keeps_small_telegrams_whole() {
+        let framed = frame_single_pdu(protocol_version::V2, &[1, 2, 3]);
+        assert_eq!(split_framed_pdu(&framed, 3), vec![framed.clone()]);
+    }
+
+    #[test]
+    fn split_framed_pdu_chunks_with_trailer_on_last() {
+        let body: Vec<u8> = (0..10).collect();
+        let framed = frame_single_pdu(protocol_version::V2, &body);
+        let chunks = split_framed_pdu(&framed, 4);
+        assert_eq!(
+            chunks,
+            vec![
+                vec![0x72, 0x02, 0x00, 0x04, 0, 1, 2, 3],
+                vec![0x72, 0x02, 0x00, 0x04, 4, 5, 6, 7],
+                vec![0x72, 0x02, 0x00, 0x02, 8, 9, 0x72, 0x02, 0x00, 0x00],
+            ]
+        );
+        // Reassembled the way the receive path does, the body is unchanged.
+        let rejoined: Vec<u8> = chunks
+            .iter()
+            .flat_map(|c| {
+                let len = u16::from_be_bytes([c[2], c[3]]) as usize;
+                c[4..4 + len].to_vec()
+            })
+            .collect();
+        assert_eq!(rejoined, body);
+    }
 
     #[test]
     fn frame_single_pdu_layout() {

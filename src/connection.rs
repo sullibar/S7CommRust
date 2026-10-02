@@ -863,11 +863,21 @@ impl Connection {
             let v3 = crate::legacy::session::frame_v3(&key, framed)?;
             self.tcp.send_iso_packet(&v3)
         } else {
-            self.tls
-                .as_mut()
-                .ok_or_else(|| Error::protocol("no TLS channel on a non-legacy connection"))?
-                .send(&mut self.tcp, framed)
+            self.send_tls(framed)
         }
+    }
+
+    /// Send a framed telegram over TLS, split into chunks that each fit one COTP frame (see
+    /// [`pdu::MAX_CHUNK_PAYLOAD`]), every chunk in its own TLS record.
+    fn send_tls(&mut self, framed: &[u8]) -> Result<()> {
+        let tls = self
+            .tls
+            .as_mut()
+            .ok_or_else(|| Error::protocol("no TLS channel on a non-legacy connection"))?;
+        for chunk in pdu::split_framed_pdu(framed, pdu::MAX_CHUNK_PAYLOAD) {
+            tls.send(&mut self.tcp, &chunk)?;
+        }
+        Ok(())
     }
 
     /// Read a single object attribute via GetVarSubstreamed.
@@ -1775,10 +1785,7 @@ impl Connection {
             let v3 = crate::legacy::session::frame_v3(&key, framed_request)?;
             self.tcp.send_iso_packet(&v3)?;
         } else {
-            self.tls
-                .as_mut()
-                .ok_or_else(|| Error::protocol("no TLS channel on a non-legacy connection"))?
-                .send(&mut self.tcp, framed_request)?;
+            self.send_tls(framed_request)?;
         }
         self.recv_response()
     }

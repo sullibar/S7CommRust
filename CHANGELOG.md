@@ -29,6 +29,10 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- Requests larger than about 1 KB no longer make the PLC drop the connection (e.g. a
+  subscription to more than ~50 tags). They were sent as one TLS record, exceeding the
+  1024-byte COTP TPDU size negotiated with the PLC; they are now split into S7CommPlus chunks
+  of the size the PLC itself uses, one TLS record each.
 - Symbol paths can now be written exactly as TIA Portal shows them
   ([#1](https://github.com/sullibar/S7CommRust/issues/1)). Previously any quoted path, such
   as `"Data_block_1".toto` or the PLC tag `"Flag"`, failed with "not found":
