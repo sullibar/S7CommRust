@@ -151,10 +151,6 @@ pub enum RealPlcOutcome {
     /// The PLC's family was detected but it advertised no key-id fingerprint we could match, and
     /// no key was passed. The caller can retry with each bundled key for `family`.
     KeyNotBundled { family: PublicKeyFamily },
-    /// This session's challenge cannot be fingerprinted (a HarpoS7 limitation affecting ~1/6 of
-    /// challenges), so the session key can't be derived. The caller should reconnect for a fresh
-    /// challenge and try again.
-    RetryChallenge,
 }
 
 /// Perform the legacy handshake for a real S7-1200/1500 on an already COTP-connected socket:
@@ -200,13 +196,6 @@ pub fn real_plc_handshake(
             None => return Ok(RealPlcOutcome::KeyNotBundled { family }),
         },
     };
-
-    // The session key is derived through the HarpoS7 challenge fingerprint, which can't handle
-    // ~1/6 of challenges. If this one is unusable, ask the caller to reconnect for a fresh one.
-    if !crate::legacy::fingerprint::is_challenge_fingerprintable(&challenge) {
-        log::debug!("real-PLC: challenge not fingerprintable; requesting reconnect");
-        return Ok(RealPlcOutcome::RetryChallenge);
-    }
 
     let mut blob = [0u8; REALPLC_BLOB_LEN];
     let mut session_key = [0u8; 24];
