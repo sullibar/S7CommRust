@@ -16,6 +16,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -131,6 +132,9 @@ const MAX_QUEUED_NOTIFICATIONS: usize = 4096;
 /// Length of a legacy real-PLC public key (the bundled keys and [`Connection::connect_real_plc_with_key`]).
 const REAL_PLC_PUBLIC_KEY_LEN: usize = 40;
 
+/// A resolved symbol: its address and the leaf member's type-info element (none for a bare DB).
+type ResolvedSymbol = (ItemAddress, Option<crate::proto::VartypeElement>);
+
 /// Default per-operation socket timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -157,9 +161,12 @@ pub struct Connection {
     /// Whether requests carry an integrity id (enabled after the session exists).
     with_integrity: bool,
     /// Cache of type-info objects by relation id (populated lazily during browsing).
-    type_info_cache: HashMap<u32, PObject>,
+    type_info_cache: HashMap<u32, Arc<PObject>>,
     /// Cached data-block list (lazily populated by [`Connection::datablock_list`]).
-    db_list: Option<Vec<DataBlock>>,
+    db_list: Option<Arc<[DataBlock]>>,
+    /// Resolved symbols, so a repeated [`Connection::read_tag`] / `write_tag` of the same name
+    /// skips the walk through the type info.
+    symbol_cache: HashMap<String, ResolvedSymbol>,
     /// Set once a request/response fails partway through. A poisoned connection has an
     /// unknown sequence/integrity-id state relative to the PLC, so every subsequent
     /// [`Connection::request_response`] short-circuits with [`Error::Closed`].
@@ -239,6 +246,7 @@ impl Connection {
             with_integrity: false,
             type_info_cache: HashMap::new(),
             db_list: None,
+            symbol_cache: HashMap::new(),
             poisoned: false,
             reconnect_target: ReconnectTarget::Tls { addrs, timeout },
             auto_reconnect: false,
@@ -410,6 +418,7 @@ impl Connection {
             with_integrity: true,
             type_info_cache: HashMap::new(),
             db_list: None,
+            symbol_cache: HashMap::new(),
             poisoned: false,
             reconnect_target,
             auto_reconnect: false,
@@ -1238,30 +1247,32 @@ impl Connection {
     }
 
     /// Fetch (and cache) the type-info object for `ti_relid` — an Explore of the type, whose
-    /// `VartypeList`/`VarnameList` describe its members.
+    /// `VartypeList`/`VarnameList` describe its members. Every type object an Explore returns is
+    /// cached under its own relid, without its nested objects (they are cached under theirs).
     pub fn type_info(&mut self, ti_relid: u32) -> Result<PObject> {
+        Ok(PObject::clone(&*self.cached_type_info(ti_relid)?))
+    }
+
+    /// [`Connection::type_info`] without the copy: the cache shares each type object, so the
+    /// browse walk and symbol resolution don't deep-clone a member list per lookup.
+    fn cached_type_info(&mut self, ti_relid: u32) -> Result<Arc<PObject>> {
         if let Some(obj) = self.type_info_cache.get(&ti_relid) {
-            return Ok(obj.clone());
+            return Ok(Arc::clone(obj));
         }
         let resp = self.explore(ti_relid, 1, 0, &[])?;
-        // Flatten and cache every returned object that carries a vartype list, keyed by its
-        // own relid.
-        let mut with_types: Vec<PObject> = Vec::new();
-        let mut stack = resp.objects;
-        while let Some(obj) = stack.pop() {
-            stack.extend(obj.objects.iter().cloned());
-            if obj.vartype_list.is_some() {
-                self.type_info_cache.insert(obj.relation_id, obj.clone());
-                with_types.push(obj);
-            }
+        let mut first = None;
+        for obj in type_objects(resp.objects) {
+            let obj = Arc::new(obj);
+            first.get_or_insert_with(|| Arc::clone(&obj));
+            self.type_info_cache.insert(obj.relation_id, obj);
         }
         if let Some(obj) = self.type_info_cache.get(&ti_relid) {
-            return Ok(obj.clone());
+            return Ok(Arc::clone(obj));
         }
         // The explored id isn't always the type object's own relid (e.g. controller areas);
         // fall back to the first object that carries type info.
-        if let Some(obj) = with_types.into_iter().next() {
-            self.type_info_cache.insert(ti_relid, obj.clone());
+        if let Some(obj) = first {
+            self.type_info_cache.insert(ti_relid, Arc::clone(&obj));
             return Ok(obj);
         }
         Err(Error::protocol(format!(
@@ -1270,10 +1281,24 @@ impl Connection {
         )))
     }
 
+    /// Forget the cached data-block list, type info and resolved symbols, so the next lookup
+    /// asks the PLC again — e.g. after a program download changed the blocks. (A reconnect
+    /// starts with empty caches anyway.)
+    pub fn clear_caches(&mut self) {
+        self.type_info_cache.clear();
+        self.db_list = None;
+        self.symbol_cache.clear();
+    }
+
     /// Discover (and cache) the data blocks: name, relid, number, and type-info relid.
     pub fn datablock_list(&mut self) -> Result<Vec<DataBlock>> {
+        Ok(self.data_blocks()?.to_vec())
+    }
+
+    /// [`Connection::datablock_list`], shared rather than copied.
+    fn data_blocks(&mut self) -> Result<Arc<[DataBlock]>> {
         if let Some(list) = &self.db_list {
-            return Ok(list.clone());
+            return Ok(Arc::clone(list));
         }
         // DB objects only appear in the Explore when the browse attributes are requested.
         let resp = self.explore(PLC_PROGRAM_RID, 1, 0, &BROWSE_ATTRS)?;
@@ -1298,22 +1323,29 @@ impl Connection {
                 }
             }
         }
-        // Reading LID=1 of a DB returns its type-info relid.
-        for db in &mut dbs {
-            let addr = ItemAddress {
+        // Reading LID 1 of a DB returns its type-info relid: one batched read for all of them
+        // (it used to be a round trip per DB).
+        let addrs: Vec<ItemAddress> = dbs
+            .iter()
+            .map(|db| ItemAddress {
                 symbol_crc: 0,
                 access_area: db.relid,
                 access_sub_area: DB_VALUE_ACTUAL,
                 lid: vec![1],
-            };
-            let r = self.read_variables(&[addr])?;
-            if let Some(PValue::RID(ti)) = r.value(1) {
-                db.ti_relid = *ti;
+            })
+            .collect();
+        if !addrs.is_empty() {
+            let items = self.read_variables(&addrs)?.into_items(addrs.len());
+            for (db, item) in dbs.iter_mut().zip(items) {
+                if let Ok(PValue::RID(ti)) = item {
+                    db.ti_relid = ti;
+                }
             }
         }
         dbs.retain(|d| d.ti_relid != 0);
-        self.db_list = Some(dbs.clone());
-        Ok(dbs)
+        let list: Arc<[DataBlock]> = dbs.into();
+        self.db_list = Some(Arc::clone(&list));
+        Ok(list)
     }
 
     /// Fetch the OMS type-info container in one (multi-fragment) Explore and cache every type
@@ -1324,15 +1356,10 @@ impl Connection {
     /// on a cache miss.
     pub fn prefetch_type_container(&mut self) -> Result<()> {
         let resp = self.explore(OMS_TYPE_INFO_CONTAINER_RID, 1, 0, &[])?;
-        let mut stack: Vec<PObject> = resp.objects;
-        while let Some(obj) = stack.pop() {
-            for child in &obj.objects {
-                stack.push(child.clone());
-            }
-            if obj.vartype_list.is_some() {
-                let rid = obj.relation_id;
-                self.type_info_cache.entry(rid).or_insert(obj);
-            }
+        for obj in type_objects(resp.objects) {
+            self.type_info_cache
+                .entry(obj.relation_id)
+                .or_insert_with(|| Arc::new(obj));
         }
         Ok(())
     }
@@ -1343,12 +1370,12 @@ impl Connection {
     /// first. Blocks whose interface the PLC withholds (know-how protected) contribute nothing. A lost
     /// connection is an error rather than a partial list.
     pub fn browse_vars(&mut self) -> Result<Vec<VarInfo>> {
-        let dbs = self.datablock_list()?;
+        let dbs = self.data_blocks()?;
         if let Err(e) = self.prefetch_type_container() {
             self.skip_unless_lost(e, "the type-info prefetch")?; // best effort
         }
         let mut out = Vec::new();
-        for db in dbs {
+        for db in dbs.iter() {
             let prefix = quote_level(&db.name);
             let walked = self.walk_type(
                 db.relid,
@@ -1438,24 +1465,17 @@ impl Connection {
         if depth > MAX_BROWSE_DEPTH {
             return Ok(());
         }
-        let ti = self.type_info(ti_relid)?;
+        // A shared handle, not a borrow of the cache, so the loop can recurse (&mut self).
+        let ti = self.cached_type_info(ti_relid)?;
         let (Some(names), Some(types)) = (&ti.varname_list, &ti.vartype_list) else {
             return Ok(()); // no member list (empty area, or interface withheld)
         };
-        // Clone the member descriptors so we can recurse (which needs &mut self) without holding
-        // a borrow of the cache.
-        let members: Vec<(String, crate::proto::VartypeElement)> = names
-            .names
-            .iter()
-            .cloned()
-            .zip(types.elements.iter().cloned())
-            .collect();
-        for (mname, elem) in members {
+        for (mname, elem) in names.names.iter().zip(&types.elements) {
             let oi = &elem.offset_info;
             let name = if prefix.is_empty() {
-                quote_level(&mname)
+                quote_level(mname)
             } else {
-                format!("{prefix}.{}", quote_level(&mname))
+                format!("{prefix}.{}", quote_level(mname))
             };
             let mut base = lids.to_vec();
             base.push(elem.lid);
@@ -1615,16 +1635,23 @@ impl Connection {
 
     /// Like [`Connection::resolve_symbol`] but also returns the resolved leaf member's
     /// type-info element (datatype, string max length, …).
-    fn resolve_full(
-        &mut self,
-        symbol: &str,
-    ) -> Result<(ItemAddress, Option<crate::proto::VartypeElement>)> {
+    fn resolve_full(&mut self, symbol: &str) -> Result<ResolvedSymbol> {
+        if let Some(hit) = self.symbol_cache.get(symbol) {
+            return Ok(hit.clone());
+        }
+        let resolved = self.resolve_uncached(symbol)?;
+        self.symbol_cache
+            .insert(symbol.to_owned(), resolved.clone());
+        Ok(resolved)
+    }
+
+    fn resolve_uncached(&mut self, symbol: &str) -> Result<ResolvedSymbol> {
         let mut levels = parse_symbol_path(symbol)?;
         let first = levels[0].0.clone();
 
         // Determine the access root. A data block consumes the first path level (the DB
         // name); a controller area (M/Q/I) does not — the first level is already a tag in it.
-        let dbs = self.datablock_list()?;
+        let dbs = self.data_blocks()?;
         let (access_area, access_sub_area, root_ti, start) =
             if let Some(db) = dbs.iter().find(|d| d.name == first).cloned() {
                 // Array DB elements: TIA writes `"DB"[2]`; the PLC exposes them as member `THIS`.
@@ -1637,7 +1664,7 @@ impl Connection {
                 let mut found = None;
                 for (rid, ti, _label) in CONTROLLER_AREAS {
                     // An area with no tags has no member list; it just can't hold the symbol.
-                    let info = match self.type_info(ti) {
+                    let info = match self.cached_type_info(ti) {
                         Ok(info) => info,
                         Err(e) if self.poisoned => return Err(e),
                         Err(_) => continue,
@@ -1679,7 +1706,7 @@ impl Connection {
         let mut i = start;
         while i < levels.len() {
             let (name, indices) = &levels[i];
-            let ti = self.type_info(ti_relid)?;
+            let ti = self.cached_type_info(ti_relid)?;
             let names = ti
                 .varname_list
                 .as_ref()
@@ -2076,14 +2103,20 @@ impl Connection {
     fn recv_telegram(&mut self) -> Result<Vec<u8>> {
         loop {
             if let Some((version, end, body_len)) = scan_telegram(&self.rbuf[self.rpos..])? {
+                // Re-frame as a single chunk directly (what `pdu::frame_single_pdu` produces),
+                // copying each chunk's payload once.
                 let raw = &self.rbuf[self.rpos..self.rpos + end];
-                let mut data = Vec::with_capacity(body_len);
+                let mut framed = Vec::with_capacity(body_len + 8);
+                framed.extend_from_slice(&[pdu::PROTOCOL_ID, version]);
+                framed
+                    .extend_from_slice(&u16::try_from(body_len).unwrap_or(u16::MAX).to_be_bytes());
                 let mut i = 0;
                 while i + 4 < end {
                     let len = usize::from(u16::from_be_bytes([raw[i + 2], raw[i + 3]]));
-                    data.extend_from_slice(&raw[i + 4..i + 4 + len]);
+                    framed.extend_from_slice(&raw[i + 4..i + 4 + len]);
                     i += 4 + len;
                 }
+                framed.extend_from_slice(&[pdu::PROTOCOL_ID, version, 0, 0]);
                 self.rpos += end;
                 if self.rpos == self.rbuf.len() {
                     self.rbuf.clear();
@@ -2092,7 +2125,7 @@ impl Connection {
                     self.rbuf.drain(..self.rpos);
                     self.rpos = 0;
                 }
-                return Ok(pdu::frame_single_pdu(version, &data));
+                return Ok(framed);
             }
             let chunk = self
                 .tls
@@ -2130,6 +2163,20 @@ fn scan_telegram(buf: &[u8]) -> Result<Option<(u8, usize, usize)>> {
         i += 4 + len;
     }
     Ok(None)
+}
+
+/// Every object in `objects` (recursively) that carries a member list, each detached from its
+/// nested objects — moved, not cloned, so a deep tree is not copied once per level.
+fn type_objects(objects: Vec<PObject>) -> Vec<PObject> {
+    let mut out = Vec::new();
+    let mut stack = objects;
+    while let Some(mut obj) = stack.pop() {
+        stack.append(&mut obj.objects);
+        if obj.vartype_list.is_some() {
+            out.push(obj);
+        }
+    }
+    out
 }
 
 /// The subscription a framed telegram notifies about, if it is a `Notification` (`0x33`). A
@@ -2630,7 +2677,9 @@ mod tests {
             access_sub_area: 2,
             lid: vec![3],
         };
-        let e = conn.read_variables(std::slice::from_ref(&addr)).unwrap_err();
+        let e = conn
+            .read_variables(std::slice::from_ref(&addr))
+            .unwrap_err();
         // A late response would be taken as the answer to the next request: not retryable.
         assert!(!e.is_timeout(), "{e}");
         assert!(e.is_connection_lost(), "{e}");
