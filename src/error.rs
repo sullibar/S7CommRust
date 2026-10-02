@@ -40,6 +40,12 @@ pub enum Error {
     #[error("crypto error: {0}")]
     Crypto(String),
 
+    /// A received telegram failed its integrity check: on the legacy (non-TLS) transport, a
+    /// response chunk's digest didn't match or was missing. The telegram can't be trusted, so
+    /// the connection is poisoned; reconnect.
+    #[error("integrity check failed: {0}")]
+    Integrity(String),
+
     /// The connection is no longer usable: a prior request/response failed partway through
     /// (e.g. the socket dropped mid-telegram), so the sequence-number / integrity-id state is
     /// out of sync with the PLC. The connection is "poisoned" and every subsequent request
@@ -59,6 +65,10 @@ impl Error {
 
     pub(crate) fn closed(msg: impl Into<String>) -> Self {
         Error::Closed(msg.into())
+    }
+
+    pub(crate) fn integrity(msg: impl Into<String>) -> Self {
+        Error::Integrity(msg.into())
     }
 
     /// Map an I/O error raised while decoding an in-memory telegram. Running out of input there
@@ -87,12 +97,12 @@ impl Error {
 
     /// Whether this error means the connection is no longer usable and must be reconnected:
     /// a socket or TLS failure, a malformed TPKT/COTP/chunk frame (the byte stream is out of
-    /// step), or a poisoned connection. A bare timeout is *not* a lost connection (see
-    /// [`Error::is_timeout`]), and neither is a PLC refusing a request or a response that fails
-    /// to decode.
+    /// step), a telegram that failed its integrity check, or a poisoned connection. A bare
+    /// timeout is *not* a lost connection (see [`Error::is_timeout`]), and neither is a PLC
+    /// refusing a request or a response that fails to decode.
     pub fn is_connection_lost(&self) -> bool {
         match self {
-            Error::Closed(_) | Error::Tls(_) | Error::Framing(_) => true,
+            Error::Closed(_) | Error::Tls(_) | Error::Framing(_) | Error::Integrity(_) => true,
             Error::Io(_) => !self.is_timeout(),
             _ => false,
         }
