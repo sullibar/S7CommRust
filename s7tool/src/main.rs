@@ -17,7 +17,8 @@
 use std::io::{self, Write};
 use std::time::Duration;
 
-use s7commplus::value::{datetime, PValue};
+use s7commplus::value::datatype::softdatatype as sdt;
+use s7commplus::value::{datetime, strings, PValue};
 use s7commplus::{Connection, Error, Result, SubscriptionItem, VarInfo};
 
 const PROMPT: &str = "s7> ";
@@ -444,18 +445,7 @@ fn print_values(conn: &mut Connection, vars: &[VarInfo], strip: Option<&str>) {
         };
         let tname = sdt_name(var.softdatatype);
         match val {
-            // S7 STRING (softdatatype 19) reads back as a USInt array — decode to text.
-            Some(PValue::USIntArray(bytes)) if var.softdatatype == 19 => {
-                println!("  {disp} : {tname} = {:?}", decode_s7_string(&bytes));
-            }
-            // Date/time types (DTL, DATE, TIME, LDT, …) render as calendar/duration strings.
-            Some(ref v) if datetime::format(var.softdatatype, v).is_some() => {
-                println!(
-                    "  {disp} : {tname} = {}",
-                    datetime::format(var.softdatatype, v).unwrap()
-                );
-            }
-            Some(v) => println!("  {disp} : {tname} = {}", fmt_value(&v)),
+            Some(v) => println!("  {disp} : {tname} = {}", fmt_typed(var.softdatatype, &v)),
             None => println!("  {disp} : {tname} -> (no value / not readable)"),
         }
     }
@@ -522,8 +512,7 @@ fn subscribe_demo(
                 .get(ref_id)
                 .cloned()
                 .unwrap_or_else(|| (format!("ref#{ref_id}"), 0));
-            let disp = datetime::format(sdt, val).unwrap_or_else(|| fmt_value(val));
-            println!("   {name} = {disp}");
+            println!("   {name} = {}", fmt_typed(sdt, val));
         }
         for (ref_id, code) in &n.errors {
             let name = meta
@@ -588,36 +577,52 @@ fn alarms_demo(conn: &mut Connection, polls: usize) -> Result<()> {
     Ok(())
 }
 
-/// Read and print one tag by symbol name.
+/// Read and print one tag by symbol name, interpreted via its softdatatype.
 fn read_one(conn: &mut Connection, sym: &str) {
-    match conn.read_tag(sym) {
-        // S7 STRINGs read back as a USInt array; decode for display.
-        Ok(PValue::USIntArray(bytes)) => {
-            println!("  {sym} = {:?}  (String)", decode_s7_string(&bytes));
-        }
-        Ok(v) => println!("  {sym} = {}", fmt_value(&v)),
+    let read = conn
+        .resolve_var(sym)
+        .and_then(|var| Ok((var.softdatatype, conn.read_tag(sym)?)));
+    match read {
+        Ok((ty, v)) => println!("  {sym} : {} = {}", sdt_name(ty), fmt_typed(ty, &v)),
         Err(e) => println!("  {sym} -> ERROR: {e}"),
     }
 }
 
-/// Write one tag. The PLC value's type must match, so we read the current value first and
-/// parse the user's text into that same `PValue` variant, then read back to confirm.
+/// Write one tag, then read it back to confirm. Strings and chars are written from the text as
+/// typed; for other types the PLC value's wire type must match, so we read the current value
+/// first and parse the user's text into that same `PValue` variant.
 fn write_one(conn: &mut Connection, sym: &str, input: &str) -> Result<()> {
-    let current = conn.read_tag(sym)?;
-    match current {
-        // S7 STRING: the driver frames it from the variable's declared max length.
-        PValue::USIntArray(_) => {
-            conn.write_string(sym, input)?;
-            println!("  {sym} := {:?}  (String)", conn.read_string(sym)?);
+    let ty = conn.resolve_var(sym)?.softdatatype;
+    match ty {
+        // STRING / WSTRING: the driver frames them from the variable's declared max length.
+        sdt::STRING => conn.write_string(sym, input)?,
+        sdt::WSTRING => conn.write_wstring(sym, input)?,
+        // CHAR is one ISO-8859-1 byte, WCHAR one UTF-16 code unit.
+        sdt::CHAR | sdt::WCHAR => {
+            let mut chars = input.chars();
+            let (Some(c), None) = (chars.next(), chars.next()) else {
+                return Err(Error::Protocol(format!(
+                    "{} expects a single character, got {input:?}",
+                    sdt_name(ty)
+                )));
+            };
+            let value = if ty == sdt::CHAR {
+                u8::try_from(u32::from(c)).ok().map(PValue::USInt)
+            } else {
+                u16::try_from(u32::from(c)).ok().map(PValue::UInt)
+            }
+            .ok_or_else(|| Error::Protocol(format!("{c:?} does not fit in a {}", sdt_name(ty))))?;
+            conn.write_tag(sym, value)?;
         }
-        scalar => {
-            let value = parse_like(&scalar, input).ok_or_else(|| {
-                Error::Protocol(format!("can't parse {input:?} as {}", type_name(&scalar)))
+        _ => {
+            let current = conn.read_tag(sym)?;
+            let value = parse_like(&current, input).ok_or_else(|| {
+                Error::Protocol(format!("can't parse {input:?} as {}", type_name(&current)))
             })?;
             conn.write_tag(sym, value)?;
-            println!("  {sym} := {}", fmt_value(&conn.read_tag(sym)?));
         }
     }
+    println!("  {sym} := {}", fmt_typed(ty, &conn.read_tag(sym)?));
     Ok(())
 }
 
@@ -664,7 +669,57 @@ fn parse_bool(s: &str) -> Option<bool> {
     }
 }
 
-/// Render a scalar `PValue` compactly for display (word types also show hex).
+/// Render a value using the softdatatype `ty` it was read as: STRING/WSTRING as quoted text,
+/// CHAR/WCHAR as quoted characters, date/time types as calendar/duration strings, and whole
+/// arrays element by element. Anything else falls back to [`fmt_value`].
+fn fmt_typed(ty: u8, v: &PValue) -> String {
+    // A single STRING reads back as exactly `max_len + 2` bytes; a whole array of them as the
+    // element buffers back to back.
+    if let (sdt::STRING, PValue::USIntArray(b)) = (ty, v) {
+        let stride = usize::from(b.first().copied().unwrap_or(0)) + 2;
+        if b.len() > stride && b.len() % stride == 0 {
+            let items: Vec<String> = b
+                .chunks(stride)
+                .map(|c| format!("{:?}", strings::decode_s7_string(c)))
+                .collect();
+            return format!("[{}]", items.join(", "));
+        }
+    }
+    let text = match (ty, v) {
+        (sdt::STRING, PValue::USIntArray(b)) => Some(strings::decode_s7_string(b)),
+        (sdt::WSTRING, _) => strings::decode_wstring(v),
+        _ => None,
+    };
+    if let Some(s) = text {
+        return format!("{s:?}");
+    }
+    if let Some(s) = datetime::format(ty, v) {
+        return s;
+    }
+    match (ty, v) {
+        (sdt::CHAR, PValue::USInt(b)) => format!("{:?}", char::from(*b)),
+        (sdt::WCHAR, PValue::UInt(u)) => format!(
+            "{:?}",
+            char::from_u32(u32::from(*u)).unwrap_or(char::REPLACEMENT_CHARACTER)
+        ),
+        // A whole array (no index) reads back as an array of the element type.
+        (_, PValue::Array { items, .. }) => {
+            let items: Vec<String> = items.iter().map(|i| fmt_typed(ty, i)).collect();
+            format!("[{}]", items.join(", "))
+        }
+        (_, PValue::USIntArray(b)) => {
+            let items: Vec<String> = b
+                .iter()
+                .map(|&n| fmt_typed(ty, &PValue::USInt(n)))
+                .collect();
+            format!("[{}]", items.join(", "))
+        }
+        _ => fmt_value(v),
+    }
+}
+
+/// Render a `PValue` compactly for display (word types also show hex), without knowing its
+/// softdatatype — see [`fmt_typed`].
 fn fmt_value(v: &PValue) -> String {
     use PValue::*;
     match v {
@@ -684,7 +739,21 @@ fn fmt_value(v: &PValue) -> String {
         Real(x) => x.to_string(),
         LReal(x) => x.to_string(),
         WString(s) => format!("{s:?}"),
-        USIntArray(b) => format!("{:?} (String)", decode_s7_string(b)),
+        USIntArray(b) => format!("{b:?}"),
+        Array { items, .. } => {
+            let items: Vec<String> = items.iter().map(fmt_value).collect();
+            format!("[{}]", items.join(", "))
+        }
+        // A whole struct/UDT/system type (IEC_TIMER, …) read in one go: its members' offsets
+        // live in the type info, so show the raw member block.
+        PackedStruct { id, data, .. } => {
+            let hex: Vec<String> = data.iter().map(|b| format!("{b:02x}")).collect();
+            format!(
+                "<packed struct 0x{id:08x}, {} bytes: {}>",
+                data.len(),
+                hex.join(" ")
+            )
+        }
         RID(n) => format!("RID(0x{n:08x})"),
         other => format!("{other:?}"),
     }
@@ -713,44 +782,9 @@ fn type_name(v: &PValue) -> &'static str {
     }
 }
 
-/// Decode an S7 `STRING` from its USInt-array form `[max_len, actual_len, chars…]` (Latin-1).
-fn decode_s7_string(bytes: &[u8]) -> String {
-    if bytes.len() < 2 {
-        return String::new();
-    }
-    let actual = bytes[1] as usize;
-    let end = (2 + actual).min(bytes.len());
-    bytes[2..end].iter().map(|&b| b as char).collect()
-}
-
-/// Map a Siemens "softdatatype" id to its display name (best-effort; unknowns become `sdtN`).
-fn sdt_name(sdt: u8) -> String {
-    let name = match sdt {
-        1 => "Bool",
-        2 => "Byte",
-        3 => "Char",
-        4 => "Word",
-        5 => "Int",
-        6 => "DWord",
-        7 => "DInt",
-        8 => "Real",
-        9 => "Date",
-        11 => "Time",
-        17 => "Struct",
-        19 => "String",
-        48 => "LReal",
-        49 => "ULInt",
-        50 => "LInt",
-        51 => "LWord",
-        52 => "USInt",
-        53 => "UInt",
-        54 => "UDInt",
-        55 => "SInt",
-        62 => "WString",
-        67 => "DTL",
-        _ => return format!("sdt{sdt}"),
-    };
-    name.to_string()
+/// Display name for a softdatatype (the TIA Portal name; unknowns become `sdtN`).
+fn sdt_name(ty: u8) -> String {
+    sdt::name(ty).map_or_else(|| format!("sdt{ty}"), str::to_string)
 }
 
 /// Full usage text (stderr; shown for `-h` and argument errors).
@@ -801,7 +835,7 @@ fn help_body() -> &'static str {
      \x20   browse [DB|M|Q|I]   recursively list tags with their current values\n\
      \x20   dbs                 list the data blocks\n\
      \x20   read <sym>...       read one or more tags by symbol name\n\
-     \x20   write <sym> <val>   write a tag (type inferred from its current value)\n\
+     \x20   write <sym> <val>   write a tag (parsed per the tag's declared type)\n\
      \x20   level               show the effective protection level\n\
      \x20   legit <user> <pw>   authenticate (legitimation; experimental)\n\
      \x20   xidents <relid>     decompress a DB's identity/comment XML (attr 2449/2546)\n\

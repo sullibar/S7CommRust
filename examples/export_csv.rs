@@ -13,7 +13,8 @@
 
 use std::time::Duration;
 
-use s7commplus::value::PValue;
+use s7commplus::value::datatype::softdatatype as sdt;
+use s7commplus::value::{datetime, strings, PValue};
 use s7commplus::Connection;
 
 fn main() {
@@ -87,15 +88,26 @@ fn csv_field(s: &str) -> String {
     }
 }
 
-/// Format an optional read value for the CSV. S7 `String`s (softdatatype 19) arrive as a USInt
-/// array and are decoded to text; date/time types render via the value layer's helpers.
-fn fmt_value(value: &Option<PValue>, softdatatype: u8) -> String {
-    match value {
-        None => "(not readable)".to_string(),
-        Some(PValue::USIntArray(bytes)) if softdatatype == 19 => decode_s7_string(bytes),
-        Some(v) => {
-            s7commplus::value::datetime::format(softdatatype, v).unwrap_or_else(|| fmt_scalar(v))
-        }
+/// Format an optional read value for the CSV, interpreted via its softdatatype: S7 `String`s
+/// (a USInt array) and `WString`s (a UInt array) are decoded to text, `Char`/`WChar` to the
+/// character, and date/time types render via the value layer's helpers.
+fn fmt_value(value: &Option<PValue>, ty: u8) -> String {
+    let Some(v) = value else {
+        return "(not readable)".to_string();
+    };
+    if let Some(s) = (ty == sdt::WSTRING)
+        .then(|| strings::decode_wstring(v))
+        .flatten()
+    {
+        return s;
+    }
+    match (ty, v) {
+        (sdt::STRING, PValue::USIntArray(bytes)) => strings::decode_s7_string(bytes),
+        (sdt::CHAR, PValue::USInt(b)) => char::from(*b).to_string(),
+        (sdt::WCHAR, PValue::UInt(u)) => char::from_u32(u32::from(*u))
+            .unwrap_or(char::REPLACEMENT_CHARACTER)
+            .to_string(),
+        _ => datetime::format(ty, v).unwrap_or_else(|| fmt_scalar(v)),
     }
 }
 
@@ -119,47 +131,11 @@ fn fmt_scalar(v: &PValue) -> String {
         Real(x) => x.to_string(),
         LReal(x) => x.to_string(),
         WString(s) => s.clone(),
-        USIntArray(b) => decode_s7_string(b),
         other => format!("{other:?}"),
     }
 }
 
-/// Decode an S7 `STRING` from its USInt-array form `[max_len, actual_len, chars…]` (Latin-1).
-fn decode_s7_string(bytes: &[u8]) -> String {
-    if bytes.len() < 2 {
-        return String::new();
-    }
-    let actual = bytes[1] as usize;
-    let end = (2 + actual).min(bytes.len());
-    bytes[2..end].iter().map(|&b| b as char).collect()
-}
-
-/// Map a Siemens "softdatatype" id to a display name (unknowns become `sdtN`).
-fn sdt_name(sdt: u8) -> String {
-    let name = match sdt {
-        1 => "Bool",
-        2 => "Byte",
-        3 => "Char",
-        4 => "Word",
-        5 => "Int",
-        6 => "DWord",
-        7 => "DInt",
-        8 => "Real",
-        9 => "Date",
-        11 => "Time",
-        17 => "Struct",
-        19 => "String",
-        48 => "LReal",
-        49 => "ULInt",
-        50 => "LInt",
-        51 => "LWord",
-        52 => "USInt",
-        53 => "UInt",
-        54 => "UDInt",
-        55 => "SInt",
-        62 => "WString",
-        67 => "DTL",
-        _ => return format!("sdt{sdt}"),
-    };
-    name.to_string()
+/// Map a Siemens "softdatatype" id to its TIA Portal name (unknowns become `sdtN`).
+fn sdt_name(ty: u8) -> String {
+    sdt::name(ty).map_or_else(|| format!("sdt{ty}"), str::to_string)
 }

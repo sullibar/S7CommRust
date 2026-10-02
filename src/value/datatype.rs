@@ -90,8 +90,14 @@ pub mod softdatatype {
     pub const S5TIME: u8 = 12;
     /// DATE_AND_TIME (DT) — 8-byte BCD timestamp.
     pub const DATE_AND_TIME: u8 = 14;
+    /// STRUCT — a structured member (struct, UDT, FB instance, system type).
+    pub const STRUCT: u8 = 17;
     /// STRING — S7 string (ISO-8859-1, length-prefixed).
     pub const STRING: u8 = 19;
+    /// IEC_TIMER — the TP/TON/TOF instance struct.
+    pub const IEC_TIMER: u8 = 31;
+    /// BBOOL — a byte-aligned BOOL, as used for `Bool` members of optimized blocks.
+    pub const BBOOL: u8 = 40;
     /// LREAL — 64-bit IEEE float.
     pub const LREAL: u8 = 48;
     /// ULINT — unsigned 64-bit.
@@ -120,6 +126,62 @@ pub mod softdatatype {
     pub const LDT: u8 = 66;
     /// DTL — a struct of {YEAR:UInt, MONTH/DAY/WEEKDAY/HOUR/MINUTE/SECOND:USInt, NANOSECOND:UDInt}.
     pub const DTL: u8 = 67;
+
+    /// The TIA Portal name of a softdatatype id (e.g. `"Time_Of_Day"` for 10), or `None` for an
+    /// id this table does not know. [`BBOOL`] — how optimized blocks report `Bool` members — is
+    /// named `"Bool"`, as TIA Portal shows it.
+    pub fn name(sdt: u8) -> Option<&'static str> {
+        Some(match sdt {
+            BOOL | BBOOL => "Bool",
+            BYTE => "Byte",
+            CHAR => "Char",
+            WORD => "Word",
+            INT => "Int",
+            DWORD => "DWord",
+            DINT => "DInt",
+            REAL => "Real",
+            DATE => "Date",
+            TIME_OF_DAY => "Time_Of_Day",
+            TIME => "Time",
+            S5TIME => "S5Time",
+            DATE_AND_TIME => "Date_And_Time",
+            STRUCT => "Struct",
+            STRING => "String",
+            20 => "Pointer",
+            22 => "Any",
+            23 => "Block_FB",
+            24 => "Block_FC",
+            25 => "Block_DB",
+            28 => "Counter",
+            29 => "Timer",
+            30 => "IEC_Counter",
+            IEC_TIMER => "IEC_Timer",
+            LREAL => "LReal",
+            ULINT => "ULInt",
+            LINT => "LInt",
+            LWORD => "LWord",
+            USINT => "USInt",
+            UINT => "UInt",
+            UDINT => "UDInt",
+            SINT => "SInt",
+            WCHAR => "WChar",
+            WSTRING => "WString",
+            63 => "Variant",
+            LTIME => "LTime",
+            LTOD => "LTime_Of_Day",
+            LDT => "LDT",
+            DTL => "DTL",
+            68 => "IEC_LTimer",
+            69 => "IEC_SCounter",
+            70 => "IEC_DCounter",
+            71 => "IEC_LCounter",
+            72 => "IEC_UCounter",
+            73 => "IEC_USCounter",
+            74 => "IEC_UDCounter",
+            75 => "IEC_ULCounter",
+            _ => return None,
+        })
+    }
 }
 
 /// Datatype-flags bits (the first byte of a serialized value).
