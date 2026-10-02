@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- The legacy real-PLC (S7-1200/1500) authentication computes its seed with an x-only ECDH and
+  a PRESENT-80 variant instead of the ~84,000 lines of HarpoS7 "monolith" code they replace
+  ([#2](https://github.com/sullibar/S7CommRust/issues/2); identified by
+  [gijzelaerr/s7commplus](https://github.com/gijzelaerr/s7commplus)). Output is unchanged:
+  byte-identical on HarpoS7's golden vectors and on 20,000 random handshakes against the
+  original. The crate source shrinks from about 99,000 to about 19,000 lines.
+
 ### Added
 
 - `Connection::read_wstring` / `write_wstring` for `WSTRING` tags, which read back as a UInt

@@ -4,7 +4,7 @@
 // The curve parameters and the x-only ladder formulation follow `gijzelaerr/s7commplus`
 // (`s7commplus/v1_session_key/real_plc/curve.py`, MIT), which identified HarpoS7's
 // `SeedTransform` monoliths (`bonk-dev/HarpoS7`, MIT) as this scalar multiplication.
-// See `LICENSE-HarpoS7`.
+// See `LICENSE-HarpoS7` and `LICENSE-gijzelaerr-s7commplus`.
 
 //! The elliptic curve behind the real-PLC `SeedTransform`: `y² = x³ − x + B` over
 //! `GF(p)`, `p = 2¹⁶⁰ − 47`, whose group has prime order [`ORDER`].

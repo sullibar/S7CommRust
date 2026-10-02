@@ -14,9 +14,8 @@
 //! length-bound and AES-encrypted under a separate key.
 //!
 //! The three derived keys (`challenge_key`, `checksum_key`, `lut`) come from
-//! `KeyDerivationTransform(PreSeed(key1))`, which is Monolith-gated and lands with the EC
-//! layer; this module takes them as inputs so it can be validated independently against the
-//! blob tail of the `AuthenticateRealPlc` golden vector.
+//! [`super::seed::derive_keys`]`(pre_seed(key1))`; this module takes them as inputs so it can be
+//! validated independently against the blob tail of the `AuthenticateRealPlc` golden vector.
 
 use super::checksum;
 use aes::cipher::generic_array::GenericArray;
@@ -142,29 +141,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn advance_counter_matches_harpos7_rotate_left31() {
-        let mut state = 0x0123_4567_89AB_CDEFu64;
-        for _ in 0..1000 {
-            let mut iv = [0u8; 16];
-            for b in iv.iter_mut() {
-                state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                *b = (state >> 56) as u8;
-            }
-            let mut old = iv;
-            crate::legacy::family0::field::rotate_left31(&mut old);
-            advance_counter(&mut iv);
-            assert_eq!(iv, old);
-        }
+    fn advance_counter_multiplies_by_x_in_gcm_field() {
+        // Bit-reflected: a set low bit shifts out and folds back as 0xE1 in the top byte.
+        let mut iv = 1u128.to_le_bytes();
+        advance_counter(&mut iv);
+        assert_eq!(u128::from_le_bytes(iv), 0xE1 << 120);
+        let mut iv = 0x8000_0000_0000_0000_0000_0000_0000_0002u128.to_le_bytes();
+        advance_counter(&mut iv);
+        assert_eq!(
+            u128::from_le_bytes(iv),
+            0x4000_0000_0000_0000_0000_0000_0000_0001
+        );
     }
     use crate::legacy::family0::checksum::{generate_lut, LUT_LEN};
     use hex_literal::hex;
 
     // The S71500 AuthenticateRealPlc golden blob (LegacyAuthenticationSchemeTests.cs) with the
     // deterministic fill: key2 = 0x35×24, iv = 0x25×16, challenge = 0xDD×20. The three derived
-    // keys are dumped from KeyDerivationTransform(PreSeed(key1=0x35×24)) via the .NET oracle
-    // (validated separately once Monolith 9/10 land). Expected = blob bytes [0x6C..0xB4].
+    // keys are dumped from KeyDerivationTransform(PreSeed(key1=0x35×24)) via the .NET oracle.
+    // Expected = blob bytes [0x6C..0xB4].
     #[test]
     fn encrypt_body_matches_s71500_blob_tail() {
         let iv = [0x25u8; 16];

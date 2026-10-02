@@ -8,9 +8,9 @@
 //! RealPlc (S7-1200/1500) auth orchestration.
 //!
 //! The full `AuthenticateRealPlc` assembles the 180-byte blob (`metadata + seed + IV +
-//! enc-challenge + enc-key2 + checksum`) and derives the 24-byte session key. This module
-//! currently provides the session-key derivation (validated against the golden vectors) and
-//! will grow the full blob assembly once the EC seed layer (comb + Monolith combine) lands.
+//! enc-challenge + enc-key2 + checksum`) and derives the 24-byte session key, validated
+//! byte-for-byte against HarpoS7's three `AuthenticateRealPlc` golden vectors and against 48
+//! handshakes recorded from HarpoS7's original monolith implementation.
 //!
 //! The one RealPlc-vs-PLCSIM inversion to remember: the session key is derived from **key2**
 //! (PLCSIM used key1). The KDF itself is identical — [`crate::legacy::keys::derive_session_key`].
@@ -198,34 +198,7 @@ mod tests {
         );
     }
 
-    // ---- Differential tests against the original HarpoS7 monolith chain ----
-
-    /// The original `AuthenticateRealPlc` seed path (Transform7 + Monolith1..11 + Transform13).
-    fn authenticate_monolith(
-        blob_out: &mut [u8],
-        session_key_out: &mut [u8],
-        challenge: &[u8],
-        public_key: &[u8],
-        family: PublicKeyFamily,
-        fill_random: &mut dyn FnMut(&mut [u8]),
-    ) {
-        use crate::legacy::family0::transforms;
-        let mut key2 = [0u8; 24];
-        fill_random(&mut key2);
-        let mut key1 = [0u8; 24];
-        fill_random(&mut key1);
-        let mut iv = [0u8; 16];
-        fill_random(&mut iv);
-        blob::write_metadata(&mut blob_out[0..48], public_key, &key2, family);
-        let mut t1 = [0u8; 60];
-        transforms::pre_seed(&mut t1, &key1);
-        seed::seed_transform(&mut blob_out[48..108], public_key, &t1, fill_random);
-        let mut t2 = [0u8; 48];
-        transforms::key_derivation(&mut t2, &t1);
-        seal_body(blob_out, session_key_out, challenge, &key2, &iv, &t2);
-    }
-
-    /// SplitMix64: a small deterministic generator for reproducible random cases.
+    /// SplitMix64: the deterministic fill used to generate `differential.txt`.
     struct SplitMix(u64);
 
     impl SplitMix {
@@ -244,105 +217,41 @@ mod tests {
         }
     }
 
-    const CATALOGUE: [(PublicKeyFamily, &str); 16] = [
-        (PublicKeyFamily::S71500, "0448ACCBD5A0BFD2"),
-        (PublicKeyFamily::S71500, "181B7B0847D11694"),
-        (PublicKeyFamily::S71500, "1B580465BB0551B2"),
-        (PublicKeyFamily::S71500, "2C1DD211E529278D"),
-        (PublicKeyFamily::S71500, "580B8A122D42D1C0"),
-        (PublicKeyFamily::S71500, "60CDAAA33E0B5D20"),
-        (PublicKeyFamily::S71500, "65227E2580029B7F"),
-        (PublicKeyFamily::S71500, "6BA412F7F1D965AA"),
-        (PublicKeyFamily::S71500, "99E4632334CC7993"),
-        (PublicKeyFamily::S71500, "ACD68E9BF9901F8B"),
-        (PublicKeyFamily::S71500, "C4F47B876DA76D52"),
-        (PublicKeyFamily::S71500, "D3F9CD55A57FE4EB"),
-        (PublicKeyFamily::S71500, "E69E7A996524AFAC"),
-        (PublicKeyFamily::S71200, "A95850575DF7B3DE"),
-        (PublicKeyFamily::S71200, "AC9BE476CB324E65"),
-        (PublicKeyFamily::S71200, "BD426B091F08731A"),
-    ];
-
-    /// Number of random cases; raise with `S7_FAMILY0_DIFF_CASES` for a longer soak.
-    fn diff_cases(default: usize) -> usize {
-        std::env::var("S7_FAMILY0_DIFF_CASES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(default)
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 
+    /// 48 handshakes computed by HarpoS7's original monolith chain (Transform7, Monolith1..11,
+    /// Transform12/13) before it was replaced: all 16 catalogue public keys plus random curve
+    /// and twist x-coordinates, random challenges, and SplitMix64-seeded key material. Each line
+    /// is `family fill_seed public_key challenge blob session_key`.
     #[test]
-    fn ecdh_chain_matches_monolith_chain_on_random_inputs() {
-        let mut rng = SplitMix(0x5EED_FA11_0000_0001);
-        for case in 0..diff_cases(160) {
-            // Every catalogue key in turn; every fifth case a random x (curve or twist point).
-            let (family, public_key): (PublicKeyFamily, Vec<u8>) = if case % 5 == 4 {
-                let mut k = vec![0u8; 40];
-                rng.fill(&mut k);
-                (PublicKeyFamily::S71500, k)
-            } else {
-                let (family, id) = CATALOGUE[case % CATALOGUE.len()];
-                (
-                    family,
-                    crate::legacy::pubkey_store::lookup(family, id)
-                        .unwrap()
-                        .to_vec(),
-                )
+    fn matches_the_original_monolith_chain() {
+        let fixture = include_str!("../../../tests/vectors/family0/differential.txt");
+        let mut cases = 0;
+        for line in fixture.lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            let family = match f[0] {
+                "1500" => PublicKeyFamily::S71500,
+                _ => PublicKeyFamily::S71200,
             };
-            // Like the live path, only fingerprintable challenges reach the session-key step.
-            let mut challenge = [0u8; 20];
-            rng.fill(&mut challenge);
-            while !crate::legacy::fingerprint::is_challenge_fingerprintable(&challenge) {
-                rng.fill(&mut challenge);
-            }
-            let fill_seed = rng.next();
-
-            let (mut blob_new, mut sk_new) = ([0u8; REALPLC_BLOB_LEN], [0u8; SESSION_KEY_LEN]);
-            let mut f = SplitMix(fill_seed);
+            let mut fill = SplitMix(u64::from_str_radix(f[1], 16).unwrap());
+            let (mut blob, mut sk) = ([0u8; REALPLC_BLOB_LEN], [0u8; SESSION_KEY_LEN]);
             authenticate_real_plc(
-                &mut blob_new,
-                &mut sk_new,
-                &challenge,
-                &public_key,
+                &mut blob,
+                &mut sk,
+                &unhex(f[3]),
+                &unhex(f[2]),
                 family,
-                &mut |b| f.fill(b),
+                &mut |b| fill.fill(b),
             );
-
-            let (mut blob_old, mut sk_old) = ([0u8; REALPLC_BLOB_LEN], [0u8; SESSION_KEY_LEN]);
-            let mut f = SplitMix(fill_seed);
-            authenticate_monolith(
-                &mut blob_old,
-                &mut sk_old,
-                &challenge,
-                &public_key,
-                family,
-                &mut |b| f.fill(b),
-            );
-
-            assert_eq!(
-                blob_new, blob_old,
-                "blob differs in case {case} (fill seed {fill_seed:#x})"
-            );
-            assert_eq!(sk_new, sk_old, "session key differs in case {case}");
+            assert_eq!(blob.to_vec(), unhex(f[4]), "blob, line {}", cases + 1);
+            assert_eq!(sk.to_vec(), unhex(f[5]), "session key, line {}", cases + 1);
+            cases += 1;
         }
-    }
-
-    #[test]
-    fn key_derivation_matches_monolith_on_random_key1() {
-        use crate::legacy::family0::transforms;
-        let mut rng = SplitMix(0x5EED_FA11_0000_0002);
-        for case in 0..diff_cases(160) {
-            let mut key1 = [0u8; 24];
-            rng.fill(&mut key1);
-            let mut t1 = [0u8; 60];
-            transforms::pre_seed(&mut t1, &key1);
-            let mut old = [0u8; 48];
-            transforms::key_derivation(&mut old, &t1);
-            assert_eq!(
-                seed::derive_keys(&seed::pre_seed(&key1)),
-                old,
-                "case {case}"
-            );
-        }
+        assert_eq!(cases, 48);
     }
 }

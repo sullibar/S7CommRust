@@ -127,4 +127,7 @@ S7_PLC_IP=192.168.0.1 cargo run --example export_csv -- tags.csv
 
 LGPL-3.0-or-later. This is a derivative work of `thomas-v2/S7CommPlusDriver`
 (LGPL-3.0-or-later); see [`LICENSE`](LICENSE). The legacy (non-TLS) support in `src/legacy/`
-is derived from HarpoS7 and used under the MIT License; see [`LICENSE-HarpoS7`](LICENSE-HarpoS7).
+is derived from HarpoS7 and used under the MIT License; see [`LICENSE-HarpoS7`](LICENSE-HarpoS7). The
+real-PLC seed and key derivation (`src/legacy/family0/`) follow
+[gijzelaerr/s7commplus](https://github.com/gijzelaerr/s7commplus) (MIT); see
+[`LICENSE-gijzelaerr-s7commplus`](LICENSE-gijzelaerr-s7commplus).

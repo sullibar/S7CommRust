@@ -1,89 +1,29 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 s7commplus-rs contributors
 //
-// Ported from `bonk-dev/HarpoS7` (MIT):
-//   HarpoS7.Family0/Transforms/SeedTransform.cs
-// See `LICENSE-HarpoS7`.
+// Replaces the ports of `bonk-dev/HarpoS7` (MIT) `HarpoS7.Family0/Transforms/{PreSeed,Seed,
+// KeyDerivation}Transform.cs` and `Transform13.cs`. What those transforms compute, and the
+// constants below, were identified in `gijzelaerr/s7commplus`
+// (`s7commplus/v1_session_key/real_plc/seed.py`, MIT).
+// See `LICENSE-HarpoS7` and `LICENSE-gijzelaerr-s7commplus`.
 
-//! `SeedTransform`: the 60-byte EC-encrypted seed (the RealPlc blob's ECIES core).
+//! The real-PLC seed and blob keys, from `key1` and the PLC public key.
 //!
-//! Output layout: `dst[0x14..0x28]` = affine x of the ephemeral point `k·G`; `dst[0x28..0x3C]`
-//! = the ephemeral scalar seed `prng1`; `dst[0x00..0x14]` = the ECDH combine
-//! `Monolith11( t1 ‖ Transform13( Monolith8( k·publicKey ) ) )`. The same `(prng1, prng2)`
-//! drives both `k·G` and `k·publicKey`.
+//! - [`pre_seed`] (`PreSeedTransform`): `key1`'s three 64-bit blocks encrypted with
+//!   [PRESENT-80](super::present) under a fixed key, as one 160-bit value.
+//! - [`write_seed`] (`SeedTransform`): an ephemeral x-only [ECDH](super::curve) with the PLC
+//!   public key. The blob gets the ephemeral x-coordinate, and a mask derived from the shared
+//!   x-coordinate (`Transform13`) hides the pre-seed.
+//! - [`derive_keys`] (`KeyDerivationTransform`): six fixed blocks encrypted under halves of
+//!   the pre-seed, giving the challenge key, the checksum key and the checksum LUT seed.
 //!
-//! The two ephemeral 20-byte buffers are supplied by the injected `fill_random` closure (a
-//! CSPRNG in production; a fixed fill in the golden tests, mirroring HarpoS7's
-//! `SpanExtensions.StaticFillSequence`).
+//! HarpoS7 passes these values between its transforms in an encoded form (three words per
+//! bit); here they are plain 160-bit little-endian values.
 
 use super::{curve, present};
-// The original monolith chain, kept as the differential-test reference.
-#[cfg(test)]
-use super::{data::TRANSFORM7_DATA, monolith, transform7::transform7, transforms::transform13};
 
-/// `SeedTransform.DestinationSize` (used by the seed round-trip test).
-#[cfg(test)]
-const SEED_LEN: usize = 0x3C;
-
-#[cfg(test)]
-/// `Monolith1.Loop(buf, buf)` — the aliased (destination == source) normalization used by
-/// `SeedTransform`: run `execute` (reading a snapshot, writing `buf`) until it returns nonzero.
-fn loop_normalize_in_place(buf: &mut [u8]) {
-    loop {
-        let src = buf.to_vec();
-        if monolith::m1::execute(buf, &src) != 0 {
-            break;
-        }
-    }
-}
-
-#[cfg(test)]
-/// `SeedTransform.Execute(destination[0x3C], publicKey[0x28], t1[0x3C])`.
-pub fn seed_transform(
-    destination: &mut [u8],
-    public_key: &[u8],
-    t1: &[u8],
-    fill_random: &mut dyn FnMut(&mut [u8]),
-) {
-    let mut prng1 = [0u8; 20];
-    fill_random(&mut prng1);
-
-    let mut prng2 = [0u8; 20];
-    let mut t7 = [0u8; 72];
-    let base = &TRANSFORM7_DATA[0xD8..0x100]; // base point G (40 bytes)
-
-    // Ephemeral point R = k·G; retry until its affine x is nonzero.
-    loop {
-        fill_random(&mut prng2);
-        transform7(&mut t7, &prng1, &prng2, base);
-        loop_normalize_in_place(&mut t7);
-        let mut x = [0u8; 20];
-        monolith::m2::execute(&mut x, &t7);
-        if x.iter().any(|&b| b != 0) {
-            destination[0x14..0x28].copy_from_slice(&x);
-            break;
-        }
-    }
-    destination[0x28..0x3C].copy_from_slice(&prng1);
-
-    // ECDH point k·publicKey, combined with t1.
-    transform7(&mut t7, &prng1, &prng2, public_key);
-    loop_normalize_in_place(&mut t7);
-
-    let mut m8 = [0u8; 60];
-    monolith::m8::execute(&mut m8, &t7);
-
-    let mut m11src = [0u8; 120];
-    m11src[..60].copy_from_slice(&t1[..60]);
-    transform13(&mut m11src[60..120], &m8);
-
-    let mut m11 = [0u8; 20];
-    monolith::m11::execute(&mut m11, &m11src);
-    destination[0..20].copy_from_slice(&m11);
-}
-
-/// The key register whose Monolith10 round-key layout is HarpoS7's `Transform1Data`; the
-/// PreSeed encrypts `key1` under it.
+/// The key register under which the PreSeed encrypts `key1` (HarpoS7 stores its round keys,
+/// as `Transform1Data`).
 const PRE_SEED_KEY: u128 = 0xA98D_E7C5_164A_D032_538F;
 
 /// Fixed plaintexts: HarpoS7's `SharedData` words `0..12` (KeyDerivation) and `12..18`
@@ -166,37 +106,31 @@ pub fn derive_keys(pre_seed: &[u8; 20]) -> [u8; 48] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::legacy::family0::data::SHARED_DATA;
+    use hex_literal::hex;
+
+    /// HarpoS7's `transform1` PreSeed vector output (`transform1-dst.bin`), decoded from its
+    /// three-words-per-bit form with the original monolith chain before that was removed.
+    /// `transform6` (SeedTransform) uses the same value as its pre-seed input.
+    const HARPOS7_PRE_SEED: [u8; 20] = hex!("9267ec3b962cbb459267ec3b962cbb459267ec3b");
 
     #[test]
-    fn plaintexts_are_harpos7_shared_data() {
-        let word =
-            |i: usize| u64::from(SHARED_DATA[2 * i + 1]) << 32 | u64::from(SHARED_DATA[2 * i]);
-        for (i, &p) in KEY_PLAINTEXTS.iter().enumerate() {
-            assert_eq!(p, word(i));
-        }
-        for (i, &p) in SEED_MASK_PLAINTEXTS.iter().enumerate() {
-            assert_eq!(p, word(6 + i));
-        }
+    fn pre_seed_matches_harpos7_transform1() {
+        let key1 = include_bytes!("../../../tests/vectors/family0/transforms/transform1-src.bin");
+        assert_eq!(pre_seed(key1), HARPOS7_PRE_SEED);
     }
 
     #[test]
-    fn generator_is_harpos7_transform7_base() {
-        assert_eq!(curve::GENERATOR_X, TRANSFORM7_DATA[0xD8..0xEC]);
-    }
-
-    #[test]
-    fn seed_transform_matches_transform6() {
+    fn write_seed_matches_harpos7_transform6() {
         // transform6: StaticFillSequence = [0x2D] -> every fill is 0x2D.
         let public_key =
             include_bytes!("../../../tests/vectors/family0/transforms/transform6-publicKey.bin");
-        let t1 = include_bytes!("../../../tests/vectors/family0/transforms/transform6-t1.bin");
         let expected =
             include_bytes!("../../../tests/vectors/family0/transforms/transform6-dst.bin");
 
-        let mut dst = [0u8; SEED_LEN];
-        let mut fill = |b: &mut [u8]| b.fill(0x2D);
-        seed_transform(&mut dst, public_key, t1, &mut fill);
+        let mut dst = [0u8; 0x3C];
+        write_seed(&mut dst, public_key, &HARPOS7_PRE_SEED, &mut |b| {
+            b.fill(0x2D)
+        });
         assert_eq!(&dst[..], &expected[..]);
     }
 }

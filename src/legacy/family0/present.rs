@@ -4,7 +4,7 @@
 // The cipher identification and key-schedule constants follow `gijzelaerr/s7commplus`
 // (`s7commplus/v1_session_key/real_plc/present.py`, MIT), which identified HarpoS7's
 // Monolith9/Monolith10 (`bonk-dev/HarpoS7`, MIT) as this PRESENT-80 variant.
-// See `LICENSE-HarpoS7`.
+// See `LICENSE-HarpoS7` and `LICENSE-gijzelaerr-s7commplus`.
 
 //! The PRESENT-80 variant behind the real-PLC seed and key derivation.
 //!
