@@ -45,6 +45,9 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- Legacy connections no longer fail about 1 time in 256 with "legacy auth rejected (errorcode
+  -255)". The key ids in the auth request are variable-length, and a short one left a stale
+  template byte behind it; they are now spliced in and the frame lengths recomputed.
 - Requests larger than about 1 KB no longer make the PLC drop the connection (e.g. a
   subscription to more than ~50 tags). They were sent as one TLS record, exceeding the
   1024-byte COTP TPDU size negotiated with the PLC; they are now split into S7CommPlus chunks
