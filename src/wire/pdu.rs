@@ -85,6 +85,17 @@ pub mod ids {
     /// Attribute id: the server-session version Struct (echoed back during session setup).
     pub const SERVER_SESSION_VERSION: u32 = 306;
 
+    // Communication resources (`CommRessources.ReadMax` in the reference).
+    /// The root object: the access area of the PLC's system limits.
+    pub const OBJECT_ROOT: u32 = 201;
+    /// Access sub-area of the PLC's system limits (read with LID [`TAGS_PER_READ_REQUEST_MAX`]
+    /// and [`TAGS_PER_WRITE_REQUEST_MAX`]).
+    pub const SYSTEM_LIMITS: u32 = 1037;
+    /// System-limits LID: most items one GetMultiVariables may carry.
+    pub const TAGS_PER_READ_REQUEST_MAX: u32 = 1000;
+    /// System-limits LID: most items one SetMultiVariables may carry.
+    pub const TAGS_PER_WRITE_REQUEST_MAX: u32 = 1001;
+
     // Object-qualifier ids (appended to Get/SetMultiVariables requests).
     /// Object-qualifier attribute id.
     pub const OBJECT_QUALIFIER: u32 = 1256;

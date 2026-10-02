@@ -62,6 +62,14 @@ impl RequestHeader {
     }
 }
 
+/// Whether a response return value signals success: the error bit is clear **and** the low 16
+/// bits, read as a signed error code, are not negative. The error bit alone is not enough: a PLC
+/// refuses a GetMultiVariables with more items than it allows with `0xa027a600007bfffc` (error
+/// bit clear, error code -4), and the reference treats any non-zero value there as a failure.
+pub fn return_value_is_ok(return_value: u64) -> bool {
+    return_value & RETURN_VALUE_ERROR_BIT == 0 && (return_value as i16) >= 0
+}
+
 /// The leading header of a response body (header fields + the common body prefix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponseHeader {
@@ -101,9 +109,9 @@ impl ResponseHeader {
         })
     }
 
-    /// True when the return value's error bit is clear.
+    /// True when the return value signals success; see [`return_value_is_ok`].
     pub fn is_ok(&self) -> bool {
-        self.return_value & RETURN_VALUE_ERROR_BIT == 0
+        return_value_is_ok(self.return_value)
     }
 }
 
@@ -153,5 +161,14 @@ mod tests {
         assert_eq!(h.function_code, functioncode::CREATE_OBJECT);
         assert_eq!(h.sequence_number, 7);
         assert!(h.is_ok());
+    }
+
+    #[test]
+    fn return_value_success_needs_error_bit_clear_and_code_non_negative() {
+        assert!(return_value_is_ok(0));
+        assert!(return_value_is_ok(0x0000_0000_0000_0001));
+        assert!(!return_value_is_ok(RETURN_VALUE_ERROR_BIT));
+        // The PLC's answer to a GetMultiVariables over its item limit: error bit clear, code -4.
+        assert!(!return_value_is_ok(0xa027_a600_007b_fffc));
     }
 }

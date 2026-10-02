@@ -58,12 +58,15 @@ const BROWSE_ATTRS: [u32; 3] = [
 const OMS_TYPE_INFO_CONTAINER_RID: u32 = 537;
 /// Recursion guard for the browse walk (nested structs; S7 types are not cyclic).
 const MAX_BROWSE_DEPTH: usize = 16;
-/// How many variables to read per `GetMultiVariables` request when reading a browsed batch.
-/// Real PLCs cap the items (and total size) per request; 48 was the measured sweet spot on a live
-/// S7-1200 (~12% faster than 32, still under the cap). [`Connection::read_var_values`] adaptively
-/// splits any batch a PLC refuses, so a larger value never loses data — it just costs a retry.
-/// Override with `S7_READ_BATCH`.
+/// How many variables to read per `GetMultiVariables` request when reading a browsed batch, at
+/// most. 48 was the measured sweet spot on a live S7-1200 (~12% faster than 32); the batch is also
+/// capped at the PLC's own item limit. [`Connection::read_var_values`] adaptively splits any batch
+/// a PLC refuses, so a larger value never loses data — it just costs a retry. Override with
+/// `S7_READ_BATCH`.
 const READ_BATCH: usize = 48;
+/// Items per Get/SetMultiVariables request until the PLC's own limits are read (the reference's
+/// `CommRessources` default).
+const DEFAULT_TAGS_PER_REQUEST: usize = 20;
 
 /// A discovered data block: its name, object relation id, number, and type-info relation id.
 #[derive(Debug, Clone)]
@@ -168,6 +171,10 @@ pub struct Connection {
     /// Notification telegrams received while awaiting a response (an active subscription pushes
     /// them asynchronously); delivered in order by [`Connection::next_notification`].
     pending_notifications: VecDeque<Vec<u8>>,
+    /// Most items the PLC accepts in one GetMultiVariables (`SystemLimits`, read at connect).
+    max_read_tags: usize,
+    /// Most items the PLC accepts in one SetMultiVariables (`SystemLimits`, read at connect).
+    max_write_tags: usize,
 }
 
 /// Captures how a [`Connection`] was created so it can be re-established after a network drop.
@@ -230,6 +237,8 @@ impl Connection {
             reconnect_target: ReconnectTarget::Tls { addrs, timeout },
             auto_reconnect: false,
             pending_notifications: VecDeque::new(),
+            max_read_tags: DEFAULT_TAGS_PER_REQUEST,
+            max_write_tags: DEFAULT_TAGS_PER_REQUEST,
         };
 
         // Step 4: CreateObject → session.
@@ -246,6 +255,7 @@ impl Connection {
         conn.setup_session(&server_session_version)?;
         // Subsequent requests carry an integrity id.
         conn.with_integrity = true;
+        conn.read_request_limits()?;
         Ok(conn)
     }
 
@@ -263,13 +273,7 @@ impl Connection {
                 getrandom::getrandom(b).expect("OS CSPRNG")
             })?;
         let target = ReconnectTarget::LegacyPlcsim { addrs, timeout };
-        Ok(Self::new_legacy(
-            tcp,
-            session_key,
-            session_id,
-            session_id2,
-            target,
-        ))
+        Self::new_legacy(tcp, session_key, session_id, session_id2, target)
     }
 
     /// Connect to a **real** S7-1200/1500 on legacy (pre-TLS) firmware. The key family (`00:`
@@ -325,13 +329,7 @@ impl Connection {
                     timeout,
                     key: public_key.map(<[u8]>::to_vec),
                 };
-                return Ok(Self::new_legacy(
-                    tcp,
-                    session_key,
-                    session_id,
-                    session_id2,
-                    target,
-                ));
+                return Self::new_legacy(tcp, session_key, session_id, session_id2, target);
             }
             RealPlcOutcome::KeyNotBundled { family } => family,
         };
@@ -367,13 +365,7 @@ impl Connection {
                         timeout,
                         key: Some(key.to_vec()), // the bundled key that worked
                     };
-                    return Ok(Self::new_legacy(
-                        t,
-                        session_key,
-                        session_id,
-                        session_id2,
-                        target,
-                    ));
+                    return Self::new_legacy(t, session_key, session_id, session_id2, target);
                 }
                 Ok(RealPlcOutcome::KeyNotBundled { .. }) => {} // unreachable with a key
                 Err(e) => last_err = Some(e), // wrong key → PLC reset; try the next candidate
@@ -387,15 +379,16 @@ impl Connection {
         }))
     }
 
-    /// Build a legacy (non-TLS) `Connection` from a handshaken socket + derived session key.
+    /// Build a legacy (non-TLS) `Connection` from a handshaken socket + derived session key, and
+    /// read the PLC's request limits.
     fn new_legacy(
         tcp: IsoTcp,
         session_key: [u8; 24],
         session_id: u32,
         session_id2: u32,
         reconnect_target: ReconnectTarget,
-    ) -> Self {
-        Connection {
+    ) -> Result<Self> {
+        let mut conn = Connection {
             tcp,
             tls: None,
             rbuf: Vec::new(),
@@ -413,7 +406,65 @@ impl Connection {
             reconnect_target,
             auto_reconnect: false,
             pending_notifications: VecDeque::new(),
+            max_read_tags: DEFAULT_TAGS_PER_REQUEST,
+            max_write_tags: DEFAULT_TAGS_PER_REQUEST,
+        };
+        conn.read_request_limits()?;
+        Ok(conn)
+    }
+
+    /// Read how many items the PLC accepts per Get/SetMultiVariables (its `SystemLimits`, as the
+    /// reference's `CommRessources.ReadMax` does), so larger reads and writes are split to fit.
+    /// Over the limit the PLC refuses the whole request. Best effort: if the PLC doesn't answer,
+    /// the conservative default stays; only a lost connection is an error.
+    fn read_request_limits(&mut self) -> Result<()> {
+        let limit = |lid| ItemAddress {
+            symbol_crc: 0,
+            access_area: ids::OBJECT_ROOT,
+            access_sub_area: ids::SYSTEM_LIMITS,
+            lid: vec![lid],
+        };
+        let resp = match self.read_variables(&[
+            limit(ids::TAGS_PER_READ_REQUEST_MAX),
+            limit(ids::TAGS_PER_WRITE_REQUEST_MAX),
+        ]) {
+            Ok(resp) => resp,
+            Err(e) if self.poisoned => return Err(e),
+            Err(e) => {
+                log::debug!("PLC request limits unavailable ({e}); keeping the defaults");
+                return Ok(());
+            }
+        };
+        let read = |item| {
+            resp.value(item)
+                .and_then(PValue::as_i64)
+                .and_then(|v| usize::try_from(v).ok())
+                .filter(|&v| v > 0)
+        };
+        if let Some(n) = read(1) {
+            self.max_read_tags = n;
         }
+        if let Some(n) = read(2) {
+            self.max_write_tags = n;
+        }
+        log::debug!(
+            "PLC request limits: {} items per read, {} per write",
+            self.max_read_tags,
+            self.max_write_tags
+        );
+        Ok(())
+    }
+
+    /// Most items one `GetMultiVariables` may carry, as the PLC reported at connect (20 if it
+    /// didn't). [`Connection::read_variables`] splits larger reads to fit.
+    pub fn max_tags_per_read(&self) -> usize {
+        self.max_read_tags
+    }
+
+    /// Most items one `SetMultiVariables` may carry, as the PLC reported at connect (20 if it
+    /// didn't). [`Connection::write_variables`] splits larger writes to fit.
+    pub fn max_tags_per_write(&self) -> usize {
+        self.max_write_tags
     }
 
     /// The negotiated session id.
@@ -540,7 +591,39 @@ impl Connection {
     /// Read one or more symbolic variables via GetMultiVariables. If auto-reconnect is enabled
     /// (see [`Connection::set_auto_reconnect`]) and the connection is lost, this reconnects and
     /// retries once (reads are idempotent, so retrying is safe).
+    ///
+    /// More addresses than the PLC accepts per request ([`Connection::max_tags_per_read`]) are
+    /// read in several requests and merged into one response, with item numbers still counting
+    /// from 1 across the whole `addresses` slice.
     pub fn read_variables(
+        &mut self,
+        addresses: &[ItemAddress],
+    ) -> Result<GetMultiVariablesResponse> {
+        let max = self.max_read_tags.max(1);
+        if addresses.len() <= max {
+            return self.read_variables_retrying(addresses);
+        }
+        let mut merged: Option<GetMultiVariablesResponse> = None;
+        for (n, chunk) in addresses.chunks(max).enumerate() {
+            let resp = self.read_variables_retrying(chunk)?;
+            let offset = (n * max) as u32;
+            let out = merged.get_or_insert_with(|| GetMultiVariablesResponse {
+                header: resp.header,
+                values: Vec::with_capacity(addresses.len()),
+                errors: Vec::new(),
+                integrity_id: 0,
+            });
+            out.header = resp.header;
+            out.integrity_id = resp.integrity_id;
+            out.values
+                .extend(resp.values.into_iter().map(|(i, v)| (i + offset, v)));
+            out.errors
+                .extend(resp.errors.into_iter().map(|(i, e)| (i + offset, e)));
+        }
+        Ok(merged.expect("more than one chunk"))
+    }
+
+    fn read_variables_retrying(
         &mut self,
         addresses: &[ItemAddress],
     ) -> Result<GetMultiVariablesResponse> {
@@ -583,7 +666,46 @@ impl Connection {
     }
 
     /// Write one or more symbolic variables via SetMultiVariables (paired by position).
+    ///
+    /// A rejected *item* does not make this fail: check the response's `errors` (or use
+    /// [`Connection::write_tags`], which does). More items than the PLC accepts per request
+    /// ([`Connection::max_tags_per_write`]) are written in several requests — not atomically, so
+    /// if a later request fails the earlier ones have already been applied — and the responses are
+    /// merged, with item numbers counting from 1 across the whole slice.
     pub fn write_variables(
+        &mut self,
+        addresses: &[ItemAddress],
+        values: &[PValue],
+    ) -> Result<SetMultiVariablesResponse> {
+        if addresses.len() != values.len() {
+            return Err(Error::protocol(format!(
+                "write_variables: {} addresses but {} values",
+                addresses.len(),
+                values.len()
+            )));
+        }
+        let max = self.max_write_tags.max(1);
+        if addresses.len() <= max {
+            return self.write_variables_once(addresses, values);
+        }
+        let mut merged: Option<SetMultiVariablesResponse> = None;
+        for (n, (addrs, vals)) in addresses.chunks(max).zip(values.chunks(max)).enumerate() {
+            let resp = self.write_variables_once(addrs, vals)?;
+            let offset = (n * max) as u32;
+            let out = merged.get_or_insert_with(|| SetMultiVariablesResponse {
+                header: resp.header,
+                errors: Vec::new(),
+                integrity_id: 0,
+            });
+            out.header = resp.header;
+            out.integrity_id = resp.integrity_id;
+            out.errors
+                .extend(resp.errors.into_iter().map(|(i, e)| (i + offset, e)));
+        }
+        Ok(merged.expect("more than one chunk"))
+    }
+
+    fn write_variables_once(
         &mut self,
         addresses: &[ItemAddress],
         values: &[PValue],
@@ -1314,7 +1436,8 @@ impl Connection {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(READ_BATCH);
+            .unwrap_or(READ_BATCH)
+            .min(self.max_read_tags.max(1));
         let mut out = Vec::with_capacity(vars.len());
         for chunk in vars.chunks(batch) {
             self.read_chunk_adaptive(chunk, &mut out)?;
@@ -1723,12 +1846,12 @@ impl Connection {
                 data: ciphertext,
             },
         )?;
-        // Denied if the error bit is set OR the low 16 bits (as a signed int) are negative —
-        // the reference treats `(Int16)ReturnValue < 0` as access-denied.
-        let rv = resp.header.return_value;
-        if !resp.header.is_ok() || (rv as i16) < 0 {
+        // Denied if the error bit is set OR the low 16 bits (as a signed int) are negative — the
+        // reference treats `(Int16)ReturnValue < 0` as access-denied, and `is_ok` checks both.
+        if !resp.header.is_ok() {
             return Err(Error::protocol(format!(
-                "legitimation rejected (access denied): return_value=0x{rv:016x}"
+                "legitimation rejected (access denied): return_value=0x{:016x}",
+                resp.header.return_value
             )));
         }
         Ok(())

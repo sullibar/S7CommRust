@@ -34,12 +34,16 @@ const COTP_PDU_TYPE_CR: u8 = 0xe0;
 const COTP_PDU_TYPE_CC: u8 = 0xd0;
 const COTP_PDU_TYPE_DT: u8 = 0xf0;
 
-/// Maximum payload carried in a single TPKT frame (length field is a u16, minus headers).
-const MAX_TPKT_PAYLOAD: usize = u16::MAX as usize - TPKT_HEADER_LEN - COTP_DT_HEADER.len();
+/// TPDU size proposed in the connection request (parameter value `0x0a` = 2^10 bytes).
+const PROPOSED_TPDU_SIZE: usize = 1024;
+/// COTP parameter code for the TPDU size (in the CR and the CC).
+const COTP_PARAM_TPDU_SIZE: u8 = 0xc0;
 
 /// A blocking ISO-on-TCP transport.
 pub(crate) struct IsoTcp {
     stream: TcpStream,
+    /// Largest payload one DT frame may carry: the negotiated TPDU size minus the DT header.
+    max_dt_payload: usize,
 }
 
 impl IsoTcp {
@@ -73,7 +77,10 @@ impl IsoTcp {
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
 
-        let mut this = IsoTcp { stream };
+        let mut this = IsoTcp {
+            stream,
+            max_dt_payload: PROPOSED_TPDU_SIZE - COTP_DT_HEADER.len(),
+        };
         this.iso_connect(calling_tsap, called_tsap)?;
         Ok(this)
     }
@@ -95,16 +102,24 @@ impl IsoTcp {
                 frame[1]
             )));
         }
+        // The PLC may confirm a smaller TPDU than we proposed, never a larger one.
+        let tpdu = confirmed_tpdu_size(&frame)
+            .unwrap_or(PROPOSED_TPDU_SIZE)
+            .min(PROPOSED_TPDU_SIZE);
+        log::debug!("COTP connected, TPDU size {tpdu}");
+        self.max_dt_payload = tpdu - COTP_DT_HEADER.len();
         Ok(())
     }
 
-    /// Send `payload` as one or more COTP DT frames (fragmenting if it exceeds the TPKT
-    /// length limit, with the EOT bit set only on the final frame).
+    /// Send `payload` as one or more COTP DT frames, each within the negotiated TPDU size, with
+    /// the EOT bit set only on the final frame. A frame over the TPDU size makes the PLC drop the
+    /// connection (seen on legacy requests over ~1 KB; the TLS path also splits at the
+    /// S7CommPlus level, so its records already fit).
     pub fn send_iso_packet(&mut self, payload: &[u8]) -> Result<()> {
         let mut pos = 0;
         loop {
             let remaining = payload.len() - pos;
-            let chunk = remaining.min(MAX_TPKT_PAYLOAD);
+            let chunk = remaining.min(self.max_dt_payload);
             let is_last = pos + chunk >= payload.len();
 
             let total = TPKT_HEADER_LEN + COTP_DT_HEADER.len() + chunk;
@@ -178,6 +193,25 @@ impl IsoTcp {
     }
 }
 
+/// The TPDU size a COTP Connection Confirm carries (`frame` starts at the length indicator):
+/// parameters follow the 6 fixed bytes after it, each as code, length, value.
+fn confirmed_tpdu_size(frame: &[u8]) -> Option<usize> {
+    let end = (1 + usize::from(*frame.first()?)).min(frame.len());
+    let mut params = frame.get(7..end)?;
+    while let [code, len, rest @ ..] = params {
+        let (value, tail) = rest.split_at_checked(usize::from(*len))?;
+        if *code == COTP_PARAM_TPDU_SIZE {
+            // 2^7 = 128 .. 2^13 = 8192 are the sizes ISO 8073 defines.
+            return match value {
+                [exp @ 7..=13] => Some(1 << exp),
+                _ => None,
+            };
+        }
+        params = tail;
+    }
+    None
+}
+
 /// Build the COTP Connection Request telegram (TPKT + COTP CR with TSAP parameters).
 fn build_cotp_cr(calling_tsap: u16, called_tsap: &[u8]) -> Vec<u8> {
     // COTP fixed part after the length indicator: CR, DST-REF(0), SRC-REF(1), class 0.
@@ -189,8 +223,8 @@ fn build_cotp_cr(calling_tsap: u16, called_tsap: &[u8]) -> Vec<u8> {
         0x01, // SRC-REF
         0x00, // class / option
     ];
-    // Parameter: TPDU size (0xC0), len 1, value 0x0a = 1024 bytes.
-    cotp.extend_from_slice(&[0xc0, 0x01, 0x0a]);
+    // Parameter: TPDU size, len 1, value 0x0a = 1024 bytes (PROPOSED_TPDU_SIZE).
+    cotp.extend_from_slice(&[COTP_PARAM_TPDU_SIZE, 0x01, 0x0a]);
     // Parameter: calling (source) TSAP (0xC1), len 2.
     cotp.push(0xc1);
     cotp.push(0x02);
@@ -231,5 +265,55 @@ mod tests {
         assert_eq!(cr[19], 0x10);
         assert_eq!(&cr[20..36], b"SIMATIC-ROOT-HMI");
         assert_eq!(cr.len(), 36);
+    }
+
+    #[test]
+    fn confirmed_tpdu_size_parses_the_cc_parameter() {
+        // LI, CC, dst-ref, src-ref, class, then TPDU size 2^9 and a calling TSAP.
+        let cc = [9 + 4, 0xd0, 0, 1, 0, 1, 0, 0xc0, 1, 9, 0xc1, 2, 6, 0];
+        assert_eq!(confirmed_tpdu_size(&cc), Some(512));
+        assert_eq!(confirmed_tpdu_size(&[6, 0xd0, 0, 1, 0, 1, 0]), None); // no parameters
+        assert_eq!(
+            confirmed_tpdu_size(&[9, 0xd0, 0, 1, 0, 1, 0, 0xc0, 1, 30]),
+            None
+        );
+        assert_eq!(
+            confirmed_tpdu_size(&[9, 0xd0, 0, 1, 0, 1, 0, 0xc0, 5]),
+            None
+        ); // truncated
+    }
+
+    #[test]
+    fn large_payloads_are_segmented_to_the_confirmed_tpdu_size() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // A fake PLC: confirm a 512-byte TPDU, then record the DT frames of one TSDU.
+        let plc = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut cr = [0u8; 36];
+            s.read_exact(&mut cr).unwrap();
+            s.write_all(&[3, 0, 0, 14, 9, 0xd0, 0, 1, 0, 1, 0, 0xc0, 1, 9])
+                .unwrap();
+            let mut frames = Vec::new();
+            loop {
+                let mut hdr = [0u8; 4];
+                s.read_exact(&mut hdr).unwrap();
+                let mut rest = vec![0u8; usize::from(u16::from_be_bytes([hdr[2], hdr[3]])) - 4];
+                s.read_exact(&mut rest).unwrap();
+                let eot = rest[2] & 0x80 != 0;
+                frames.push((rest.len(), eot));
+                if eot {
+                    return frames;
+                }
+            }
+        });
+        let mut tcp = IsoTcp::connect(addr, Duration::from_secs(5)).unwrap();
+        tcp.send_iso_packet(&[0xab; 1200]).unwrap();
+        // COTP TPDUs of at most 512 bytes (3-byte DT header + 509 data), EOT only on the last.
+        assert_eq!(
+            plc.join().unwrap(),
+            vec![(512, false), (512, false), (3 + 1200 - 2 * 509, true)]
+        );
     }
 }

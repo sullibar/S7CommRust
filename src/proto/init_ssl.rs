@@ -12,7 +12,7 @@
 use std::io::Cursor;
 
 use crate::error::{Error, Result};
-use crate::proto::header::{RequestHeader, ResponseHeader};
+use crate::proto::header::{return_value_is_ok, RequestHeader, ResponseHeader};
 use crate::wire::pdu::{self, functioncode, ids, protocol_version};
 
 /// Transport flags value used by the reference `InitSslRequest`.
@@ -57,9 +57,9 @@ pub struct InitSslResponse {
 }
 
 impl InitSslResponse {
-    /// True when the return value's error bit is clear.
+    /// True when the return value signals success (see [`return_value_is_ok`]).
     pub fn is_ok(&self) -> bool {
-        self.return_value & 0x4000_0000_0000_0000 == 0
+        return_value_is_ok(self.return_value)
     }
 }
 
