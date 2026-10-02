@@ -1907,7 +1907,7 @@ fn array_element_id(oi: &crate::proto::OffsetInfo, indices: &[i32]) -> Option<u3
             return None;
         }
         let zero = indices[0].checked_sub(oi.array_lower_bounds)?;
-        if zero < 0 || (zero as u32) > oi.array_element_count {
+        if zero < 0 || (zero as u32) >= oi.array_element_count {
             return None;
         }
         Some(zero as u32)
@@ -1921,7 +1921,7 @@ fn array_element_id(oi: &crate::proto::OffsetInfo, indices: &[i32]) -> Option<u3
         for i in 0..dim_count {
             let lb = oi.mdim_lower_bounds[dim_count - i - 1];
             let v = indices[i].checked_sub(lb)?;
-            if v < 0 || (v as u32) > oi.mdim_element_count[dim_count - i - 1] {
+            if v < 0 || (v as u32) >= oi.mdim_element_count[dim_count - i - 1] {
                 return None;
             }
             idx[i] = v as i64;
@@ -2081,6 +2081,8 @@ mod tests {
         assert_eq!(array_element_id(&oi, &[3]), Some(2));
         assert_eq!(array_element_id(&oi, &[1]), Some(0));
         assert_eq!(array_element_id(&oi, &[0]), None); // below lower bound
+        assert_eq!(array_element_id(&oi, &[10]), Some(9)); // last element
+        assert_eq!(array_element_id(&oi, &[11]), None); // one past the upper bound
         assert_eq!(array_element_id(&oi, &[1, 2]), None); // wrong dim count
     }
 
@@ -2096,6 +2098,10 @@ mod tests {
         oi.mdim_element_count[1] = 4;
         assert_eq!(array_element_id(&oi, &[1, 2]), Some(5));
         assert_eq!(array_element_id(&oi, &[0, 0]), Some(0));
+        assert_eq!(array_element_id(&oi, &[3, 2]), Some(11)); // last element
+                                                              // One past the end in either dimension must not wrap into a neighbouring row.
+        assert_eq!(array_element_id(&oi, &[4, 0]), None);
+        assert_eq!(array_element_id(&oi, &[0, 3]), None);
     }
 
     #[test]

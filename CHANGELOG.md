@@ -15,6 +15,9 @@ All notable changes to this project are documented here. The format is based on
     `"Data block.1"."value.1"`. Browsed `VarInfo::name`s quote such levels so they round-trip
     through `resolve_symbol`;
   - array-DB elements resolve with TIA's `"Array DB"[2]` syntax.
+- Array indices one past the upper bound are now rejected. Previously, on a multi-dimensional
+  array they wrapped into the next row (`arr[0,3]` of `Array[0..1, 0..2]` read `arr[1,0]`),
+  and on a 1-D array the PLC rejected them with an opaque error code.
 
 ## [0.1.0] - 2026-07-05
 
