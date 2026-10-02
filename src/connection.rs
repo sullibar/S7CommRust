@@ -87,6 +87,8 @@ pub struct DataBlock {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VarInfo {
     /// Fully-qualified symbol path (e.g. `"Motor_DB.axis[2].speed"`; area tags have no DB prefix).
+    /// Levels containing `.`, `[` or `]` are double-quoted, so the path round-trips through
+    /// [`Connection::resolve_symbol`].
     pub name: String,
     /// `AccessArea` — the DB relation id, or the M/Q/I area RID.
     pub access_area: u32,
@@ -1179,7 +1181,7 @@ impl Connection {
                 db.relid,
                 DB_VALUE_ACTUAL,
                 db.ti_relid,
-                &db.name,
+                &quote_level(&db.name),
                 &[],
                 0,
                 &mut out,
@@ -1199,7 +1201,16 @@ impl Connection {
         name: &str,
     ) -> Result<Vec<VarInfo>> {
         let mut out = Vec::new();
-        self.walk_type(db_relid, DB_VALUE_ACTUAL, ti_relid, name, &[], 0, &mut out)?;
+        let prefix = quote_level(name);
+        self.walk_type(
+            db_relid,
+            DB_VALUE_ACTUAL,
+            ti_relid,
+            &prefix,
+            &[],
+            0,
+            &mut out,
+        )?;
         Ok(out)
     }
 
@@ -1251,9 +1262,9 @@ impl Connection {
         for (mname, elem) in members {
             let oi = &elem.offset_info;
             let name = if prefix.is_empty() {
-                mname.clone()
+                quote_level(&mname)
             } else {
-                format!("{prefix}.{mname}")
+                format!("{prefix}.{}", quote_level(&mname))
             };
             let mut base = lids.to_vec();
             base.push(elem.lid);
@@ -1375,7 +1386,8 @@ impl Connection {
 
     /// Resolve a symbol like `"Data_block_1.toto"` to its [`ItemAddress`] by walking the
     /// block's type info. Handles nested structs/FBs and 1-D/M-D array indexing
-    /// (`"DB.arr[2]"`, `"DB.m[1,2]"`).
+    /// (`"DB.arr[2]"`, `"DB.m[1,2]"`). Names containing `.`, `[` or `]` are double-quoted as in
+    /// TIA Portal: `"\"Data block.1\".\"value.1\""`.
     pub fn resolve_symbol(&mut self, symbol: &str) -> Result<ItemAddress> {
         Ok(self.resolve_full(symbol)?.0)
     }
@@ -1386,8 +1398,8 @@ impl Connection {
         &mut self,
         symbol: &str,
     ) -> Result<(ItemAddress, Option<crate::proto::VartypeElement>)> {
-        let levels: Vec<&str> = symbol.split('.').collect();
-        let first = parse_level(levels.first().copied().unwrap_or("")).0;
+        let levels = parse_symbol_path(symbol)?;
+        let first = levels[0].0.as_str();
 
         // Determine the access root. A data block consumes the first path level (the DB
         // name); a controller area (M/Q/I) does not — the first level is already a tag in it.
@@ -1398,7 +1410,12 @@ impl Connection {
             } else {
                 let mut found = None;
                 for (rid, ti, _label) in CONTROLLER_AREAS {
-                    let info = self.type_info(ti)?;
+                    // An area with no tags has no member list; it just can't hold the symbol.
+                    let info = match self.type_info(ti) {
+                        Ok(info) => info,
+                        Err(e) if e.is_connection_lost() => return Err(e),
+                        Err(_) => continue,
+                    };
                     let present = info
                         .varname_list
                         .as_ref()
@@ -1409,8 +1426,18 @@ impl Connection {
                     }
                 }
                 found.ok_or_else(|| {
+                    let hint = dbs
+                        .iter()
+                        .find(|d| d.name.contains('.') && symbol.starts_with(d.name.as_str()))
+                        .map(|d| {
+                            format!(
+                                " (names containing '.' must be double-quoted: \"{}\")",
+                                d.name
+                            )
+                        })
+                        .unwrap_or_default();
                     Error::protocol(format!(
-                        "symbol '{symbol}' not found in any data block or M/Q/I area"
+                        "symbol '{symbol}' not found in any data block or M/Q/I area{hint}"
                     ))
                 })?
             };
@@ -1425,7 +1452,7 @@ impl Connection {
         let mut leaf: Option<crate::proto::VartypeElement> = None;
         let mut i = start;
         while i < levels.len() {
-            let (name, indices) = parse_level(levels[i]);
+            let (name, indices) = &levels[i];
             let ti = self.type_info(ti_relid)?;
             let names = ti
                 .varname_list
@@ -1451,7 +1478,7 @@ impl Connection {
             // Array indexing: append the (zero-based, row-major) element id, plus an extra
             // `.1` when the elements are structs (array-of-struct).
             if !indices.is_empty() {
-                let array_lid = array_element_id(oi, &indices)
+                let array_lid = array_element_id(oi, indices)
                     .ok_or_else(|| Error::protocol(format!("bad array index for '{name}'")))?;
                 addr.lid.push(array_lid);
                 if oi.has_relation() {
@@ -1476,7 +1503,7 @@ impl Connection {
         if i < levels.len() {
             return Err(Error::protocol(format!(
                 "could not fully resolve '{symbol}' (stopped before '{}')",
-                levels[i]
+                levels[i].0
             )));
         }
         Ok((addr, leaf))
@@ -1814,24 +1841,53 @@ fn is_notification_telegram(buf: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-/// Split a symbol path level into its name and any array indices: `arr[2]` → `("arr", [2])`,
-/// `m[1,2]` → `("m", [1, 2])`, `field` → `("field", [])`.
-fn parse_level(level: &str) -> (&str, Vec<i32>) {
-    match level.find('[') {
-        Some(open) => {
-            let name = &level[..open];
-            let close = level[open..]
-                .find(']')
-                .map(|c| open + c)
-                .unwrap_or(level.len());
-            let inner = &level[open + 1..close];
-            let indices = inner
-                .split(',')
-                .filter_map(|x| x.trim().parse::<i32>().ok())
-                .collect();
-            (name, indices)
+/// Split a symbol path into its levels, each a name plus any array indices:
+/// `DB.arr[2].x` → `[("DB", []), ("arr", [2]), ("x", [])]`, `DB.m[1,2]` → `[.., ("m", [1, 2])]`.
+///
+/// A name may be wrapped in double quotes, as TIA Portal writes it, so it can contain `.`, `[`
+/// or `]`: `"Data block.1"."value.1"` → `[("Data block.1", []), ("value.1", [])]`. Indices
+/// follow the closing quote (`"my arr"[2]`). An unterminated quote is an error.
+fn parse_symbol_path(symbol: &str) -> Result<Vec<(String, Vec<i32>)>> {
+    let mut levels = Vec::new();
+    let mut name = String::new();
+    let mut indices = Vec::new();
+    let mut chars = symbol.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => loop {
+                match chars.next() {
+                    Some('"') => break,
+                    Some(q) => name.push(q),
+                    None => {
+                        return Err(Error::protocol(format!(
+                            "unterminated quote in symbol '{symbol}'"
+                        )))
+                    }
+                }
+            },
+            '.' => levels.push((std::mem::take(&mut name), std::mem::take(&mut indices))),
+            '[' => {
+                let inner: String = chars.by_ref().take_while(|&c| c != ']').collect();
+                indices.extend(
+                    inner
+                        .split(',')
+                        .filter_map(|x| x.trim().parse::<i32>().ok()),
+                );
+            }
+            _ => name.push(c),
         }
-        None => (level, Vec::new()),
+    }
+    levels.push((name, indices));
+    Ok(levels)
+}
+
+/// Format one browsed member name as a symbol path level, double-quoting it (TIA style) when it
+/// contains characters that [`parse_symbol_path`] would otherwise treat as syntax.
+fn quote_level(name: &str) -> String {
+    if name.contains(['.', '[', ']']) {
+        format!("\"{name}\"")
+    } else {
+        name.to_string()
     }
 }
 
@@ -1957,12 +2013,54 @@ mod tests {
     use super::*;
     use crate::proto::OffsetInfo;
 
+    fn levels(symbol: &str) -> Vec<(String, Vec<i32>)> {
+        parse_symbol_path(symbol).unwrap()
+    }
+
+    fn lv(name: &str, indices: &[i32]) -> (String, Vec<i32>) {
+        (name.to_string(), indices.to_vec())
+    }
+
     #[test]
-    fn parse_level_handles_names_and_indices() {
-        assert_eq!(parse_level("toto"), ("toto", vec![]));
-        assert_eq!(parse_level("arr[2]"), ("arr", vec![2]));
-        assert_eq!(parse_level("m[1,2]"), ("m", vec![1, 2]));
-        assert_eq!(parse_level("a[ -3 ]"), ("a", vec![-3]));
+    fn parse_symbol_path_handles_names_and_indices() {
+        assert_eq!(levels("toto"), [lv("toto", &[])]);
+        assert_eq!(levels("DB.arr[2]"), [lv("DB", &[]), lv("arr", &[2])]);
+        assert_eq!(levels("DB.m[1,2]"), [lv("DB", &[]), lv("m", &[1, 2])]);
+        assert_eq!(levels("DB.a[ -3 ]"), [lv("DB", &[]), lv("a", &[-3])]);
+        assert_eq!(
+            levels("DB.s[1].x"),
+            [lv("DB", &[]), lv("s", &[1]), lv("x", &[])]
+        );
+    }
+
+    #[test]
+    fn parse_symbol_path_handles_quoted_names() {
+        // Issue #1: TIA names may contain dots.
+        assert_eq!(
+            levels("\"Data block.1\".\"value.1\""),
+            [lv("Data block.1", &[]), lv("value.1", &[])]
+        );
+        assert_eq!(
+            levels("\"Data_block_1\".toto"),
+            [lv("Data_block_1", &[]), lv("toto", &[])]
+        );
+        assert_eq!(
+            levels("DB.\"my.arr\"[3].\"a[b]\""),
+            [lv("DB", &[]), lv("my.arr", &[3]), lv("a[b]", &[])]
+        );
+        assert!(parse_symbol_path("\"Data block.1.value").is_err());
+    }
+
+    #[test]
+    fn quote_level_round_trips_through_parser() {
+        assert_eq!(quote_level("plain_name"), "plain_name");
+        assert_eq!(quote_level("value.1"), "\"value.1\"");
+        let path = format!(
+            "{}.{}[2]",
+            quote_level("Data block.1"),
+            quote_level("arr.x")
+        );
+        assert_eq!(levels(&path), [lv("Data block.1", &[]), lv("arr.x", &[2])]);
     }
 
     #[test]

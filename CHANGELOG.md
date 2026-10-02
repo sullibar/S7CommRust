@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Symbol paths now accept TIA-style double-quoted names, so DB and member names containing
+  dots can be read and written: `"Data block.1"."value.1"`. Browsed `VarInfo::name`s quote
+  such levels so they round-trip through `resolve_symbol`
+  ([#1](https://github.com/sullibar/S7CommRust/issues/1)).
+
 ## [0.1.0] - 2026-07-05
 
 First public release — a Rust port of
