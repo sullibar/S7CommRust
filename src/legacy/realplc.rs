@@ -219,11 +219,7 @@ pub fn real_plc_handshake(
 
     tcp.send_iso_packet(&frame[7..])?;
     let r = recv_response(tcp)?;
-    let rv = if r.len() > 14 {
-        decode_vlq_u64(&r[14..])
-    } else {
-        u64::MAX
-    };
+    let rv = r.get(14..).map_or(u64::MAX, decode_vlq_u64);
     if rv != 0 {
         return Err(Error::protocol(format!(
             "real-PLC auth rejected: ReturnValue=0x{rv:016x} (errorcode={})",

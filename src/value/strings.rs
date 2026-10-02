@@ -23,12 +23,13 @@ use crate::value::datatype::{flags, tag};
 use crate::value::PValue;
 
 /// Decode an S7 `STRING` from its USInt-array form `[max_len, actual_len, chars…]` (ISO-8859-1).
-/// A truncated buffer yields the characters that are present.
+/// A truncated buffer yields the characters that are present; an `actual_len` past `max_len` is
+/// clamped to `max_len`, so the unused tail of the buffer never shows up as text.
 pub fn decode_s7_string(bytes: &[u8]) -> String {
     if bytes.len() < 2 {
         return String::new();
     }
-    let act_len = bytes[1] as usize;
+    let act_len = bytes[1].min(bytes[0]) as usize;
     let end = (2 + act_len).min(bytes.len());
     bytes[2..end].iter().map(|&b| b as char).collect()
 }
@@ -65,7 +66,7 @@ pub fn decode_wstring(v: &PValue) -> Option<String> {
     if units.len() < 2 {
         return Some(String::new());
     }
-    let end = (2 + units[1] as usize).min(units.len());
+    let end = (2 + units[1].min(units[0]) as usize).min(units.len());
     Some(String::from_utf16_lossy(&units[2..end]))
 }
 
@@ -167,5 +168,23 @@ mod tests {
         assert_eq!(uints(&v), vec![2, 1, 0x61, 0]);
         let v = encode_wstring("a😀", 3);
         assert_eq!(decode_wstring(&v).as_deref(), Some("a😀"));
+    }
+
+    #[test]
+    fn actual_length_is_clamped_to_max_length() {
+        // [max 2, actual 5, ...]: bytes past max_len are padding, not text.
+        assert_eq!(
+            decode_s7_string(&[2, 5, b'a', b'b', b'x', b'y', b'z']),
+            "ab"
+        );
+        let v = PValue::Array {
+            element_type: tag::UINT,
+            flags: flags::ARRAY,
+            items: [1u16, 3, 0x61, 0x62, 0x63]
+                .into_iter()
+                .map(PValue::UInt)
+                .collect(),
+        };
+        assert_eq!(decode_wstring(&v).as_deref(), Some("a"));
     }
 }

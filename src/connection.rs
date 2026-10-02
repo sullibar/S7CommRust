@@ -125,6 +125,9 @@ pub struct Subscription {
     next_credit_limit: i16,
 }
 
+/// Length of a legacy real-PLC public key (the bundled keys and [`Connection::connect_real_plc_with_key`]).
+const REAL_PLC_PUBLIC_KEY_LEN: usize = 40;
+
 /// Default per-operation socket timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -290,6 +293,12 @@ impl Connection {
         timeout: Duration,
         public_key: &[u8],
     ) -> Result<Self> {
+        if public_key.len() != REAL_PLC_PUBLIC_KEY_LEN {
+            return Err(Error::Crypto(format!(
+                "real-PLC public key must be {REAL_PLC_PUBLIC_KEY_LEN} bytes (got {})",
+                public_key.len()
+            )));
+        }
         Self::connect_real_plc_impl(addr, timeout, Some(public_key))
     }
 
@@ -1829,6 +1838,9 @@ impl Connection {
                 version = header[1]; // trailer => end of telegram
                 break;
             }
+            if data.len() + len > pdu::MAX_TELEGRAM_LEN {
+                return Err(Error::framing("telegram exceeds the reassembly size cap"));
+            }
             self.fill(len)?;
             let chunk = self.take(len);
             data.extend_from_slice(&chunk);
@@ -1888,25 +1900,53 @@ fn parse_symbol_path(symbol: &str) -> Result<Vec<(String, Vec<i32>)>> {
     let mut chars = symbol.chars();
     while let Some(c) = chars.next() {
         match c {
-            '"' => loop {
-                match chars.next() {
-                    Some('"') => break,
-                    Some(q) => name.push(q),
-                    None => {
-                        return Err(Error::protocol(format!(
-                            "unterminated quote in symbol '{symbol}'"
-                        )))
+            '"' => {
+                if !indices.is_empty() {
+                    return Err(Error::protocol(format!(
+                        "unexpected '\"' after an array index in symbol '{symbol}'"
+                    )));
+                }
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some(q) => name.push(q),
+                        None => {
+                            return Err(Error::protocol(format!(
+                                "unterminated quote in symbol '{symbol}'"
+                            )))
+                        }
                     }
                 }
-            },
+            }
             '.' => levels.push((std::mem::take(&mut name), std::mem::take(&mut indices))),
             '[' => {
-                let inner: String = chars.by_ref().take_while(|&c| c != ']').collect();
-                indices.extend(
-                    inner
-                        .split(',')
-                        .filter_map(|x| x.trim().parse::<i32>().ok()),
-                );
+                let mut inner = String::new();
+                loop {
+                    match chars.next() {
+                        Some(']') => break,
+                        Some(c) => inner.push(c),
+                        None => {
+                            return Err(Error::protocol(format!(
+                                "unterminated '[' in symbol '{symbol}'"
+                            )))
+                        }
+                    }
+                }
+                // A bad index must not silently select the whole array.
+                for part in inner.split(',') {
+                    let index = part.trim().parse::<i32>().map_err(|_| {
+                        Error::protocol(format!(
+                            "bad array index '{}' in symbol '{symbol}'",
+                            part.trim()
+                        ))
+                    })?;
+                    indices.push(index);
+                }
+            }
+            _ if !indices.is_empty() => {
+                return Err(Error::protocol(format!(
+                    "unexpected '{c}' after an array index in symbol '{symbol}'"
+                )))
             }
             _ => name.push(c),
         }
@@ -2058,6 +2098,23 @@ mod tests {
             [lv("DB", &[]), lv("my.arr", &[3]), lv("a[b]", &[])]
         );
         assert!(parse_symbol_path("\"Data block.1.value").is_err());
+    }
+
+    #[test]
+    fn parse_symbol_path_rejects_bad_indices() {
+        // These used to drop the index and silently address the whole array.
+        for bad in [
+            "DB.arr[abc]",
+            "DB.arr[]",
+            "DB.arr[1",
+            "DB.m[1,]",
+            "DB.arr[1]x",
+            "DB.arr[1]\"x\"",
+        ] {
+            assert!(parse_symbol_path(bad).is_err(), "{bad}");
+        }
+        // Repeated brackets still read as one multi-dimensional index.
+        assert_eq!(levels("DB.m[1][2]"), [lv("DB", &[]), lv("m", &[1, 2])]);
     }
 
     #[test]

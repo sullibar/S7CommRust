@@ -32,7 +32,7 @@ pub enum Error {
     #[error("protocol error: {0}")]
     Protocol(String),
 
-    /// A VLQ value did not terminate within its maximum byte length.
+    /// A VLQ value in a received telegram was malformed or cut off.
     #[error("malformed VLQ: {0}")]
     Vlq(String),
 
@@ -59,6 +59,16 @@ impl Error {
 
     pub(crate) fn closed(msg: impl Into<String>) -> Self {
         Error::Closed(msg.into())
+    }
+
+    /// Map an I/O error raised while decoding an in-memory telegram. Running out of input there
+    /// means the telegram is malformed or truncated — not that the connection was lost.
+    pub(crate) fn decode(e: io::Error) -> Self {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            Error::protocol("telegram truncated: unexpected end of data")
+        } else {
+            Error::Io(e)
+        }
     }
 
     /// Whether this error is a plain socket read/write timeout (no data yet). The connection

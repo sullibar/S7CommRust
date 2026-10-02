@@ -129,11 +129,7 @@ pub fn handshake(
     // 3. Send the auth and require ReturnValue == 0 (otherwise the session is not authenticated).
     tcp.send_iso_packet(&frame[7..])?;
     let r = recv_response(tcp)?;
-    let rv = if r.len() > 14 {
-        decode_vlq_u64(&r[14..])
-    } else {
-        u64::MAX
-    };
+    let rv = r.get(14..).map_or(u64::MAX, decode_vlq_u64);
     if rv != 0 {
         return Err(Error::protocol(format!(
             "legacy auth rejected: ReturnValue=0x{rv:016x} (errorcode={})",
@@ -191,7 +187,8 @@ fn vlq_u64_len(b: &[u8]) -> usize {
 pub fn frame_v3(session_key: &[u8; 24], v2_framed: &[u8]) -> Result<Vec<u8>> {
     let data = &v2_framed[4..v2_framed.len() - 4];
     let digest = packet_digest(session_key, data)?;
-    let chunk_len = (1 + 32 + data.len()) as u16;
+    let chunk_len = u16::try_from(1 + 32 + data.len())
+        .map_err(|_| Error::protocol("legacy request too large for one V3 chunk (64 KiB)"))?;
     let mut out = vec![0x72, 0x03];
     out.extend_from_slice(&chunk_len.to_be_bytes());
     out.push(0x20);
@@ -214,6 +211,11 @@ pub fn recv_and_strip(tcp: &mut IsoTcp) -> Result<Vec<u8>> {
         telegrams += 1;
         if accumulate_chunks(&telegram, &mut data, &mut version)? {
             break; // saw the len==0 trailer → PDU complete
+        }
+        if data.len() > crate::wire::pdu::MAX_TELEGRAM_LEN {
+            return Err(Error::framing(
+                "legacy telegram exceeds the reassembly size cap",
+            ));
         }
     }
     log::debug!(
@@ -260,7 +262,11 @@ fn accumulate_chunks(payload: &[u8], data: &mut Vec<u8>, version: &mut u8) -> Re
         let chunk = &payload[i..i + len];
         i += len;
         if *version == 0x03 && chunk.first() == Some(&0x20) {
-            data.extend_from_slice(&chunk[33..]); // skip 1-byte marker + 32-byte digest
+            // 1-byte marker + 32-byte digest, then the fragment.
+            let fragment = chunk
+                .get(33..)
+                .ok_or_else(|| Error::framing("legacy chunk shorter than its digest"))?;
+            data.extend_from_slice(fragment);
         } else {
             data.extend_from_slice(chunk);
         }
@@ -286,26 +292,10 @@ pub(crate) fn key_id_vlq(key_id: &[u8; 8]) -> Vec<u8> {
     buf
 }
 
-/// Decode an S7p `UInt64` VLQ (matches upstream `S7p.DecodeUInt64Vlq`).
-pub(crate) fn decode_vlq_u64(b: &[u8]) -> u64 {
-    let mut val: u64 = 0;
-    let mut cont = 0u8;
-    let mut i = 0;
-    for _ in 0..8 {
-        let o = b[i];
-        i += 1;
-        val <<= 7;
-        cont = o & 0x80;
-        val += u64::from(o & 0x7f);
-        if cont == 0 {
-            break;
-        }
-    }
-    if cont > 0 {
-        val <<= 8;
-        val += u64::from(b[i]);
-    }
-    val
+/// Decode an S7p `UInt64` VLQ (matches upstream `S7p.DecodeUInt64Vlq`); `u64::MAX` when `b` ends
+/// inside the VLQ (a truncated reply then reads as a rejection rather than panicking).
+pub(crate) fn decode_vlq_u64(mut b: &[u8]) -> u64 {
+    vlq::decode_u64(&mut b).unwrap_or(u64::MAX)
 }
 
 /// Overwrite the bytes immediately following the first occurrence of `pat` in `buf` with `val`.
@@ -377,5 +367,42 @@ mod tests {
                 &AUTH_SETMULTI_TEMPLATE[BLOB_OFFSET + blob.len()..]
             );
         }
+    }
+
+    #[test]
+    fn short_digest_chunk_is_an_error_not_a_panic() {
+        // `72 03 00 01 20`: a V3 chunk marked as digested but only one byte long used to panic
+        // slicing past the 33-byte marker + digest.
+        let (mut data, mut version) = (Vec::new(), 0);
+        assert!(
+            accumulate_chunks(&[0x72, 0x03, 0x00, 0x01, 0x20], &mut data, &mut version).is_err()
+        );
+    }
+
+    #[test]
+    fn digest_chunks_reassemble() {
+        let mut telegram = vec![0x72, 0x03, 0x00, 36, 0x20];
+        telegram.extend_from_slice(&[0xee; 32]); // digest (not checked here)
+        telegram.extend_from_slice(b"abc");
+        let (mut data, mut version) = (Vec::new(), 0);
+        assert!(!accumulate_chunks(&telegram, &mut data, &mut version).unwrap());
+        telegram.extend_from_slice(&[0x72, 0x03, 0x00, 0x00]);
+        data.clear();
+        assert!(accumulate_chunks(&telegram, &mut data, &mut version).unwrap());
+        assert_eq!(data, b"abc");
+    }
+
+    #[test]
+    fn truncated_auth_return_value_is_a_rejection_not_a_panic() {
+        // The auth reply's ReturnValue VLQ cut off mid-value used to index past the buffer.
+        assert_eq!(decode_vlq_u64(&[0x80]), u64::MAX);
+        assert_eq!(decode_vlq_u64(&[]), u64::MAX);
+        assert_eq!(decode_vlq_u64(&[0x00]), 0);
+    }
+
+    #[test]
+    fn oversized_v3_request_is_rejected() {
+        let framed = crate::wire::pdu::frame_single_pdu(0x02, &vec![0u8; 70_000]);
+        assert!(frame_v3(&[7u8; 24], &framed).is_err());
     }
 }

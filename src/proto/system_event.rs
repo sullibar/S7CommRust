@@ -52,12 +52,7 @@ pub fn is_system_event(buf: &[u8]) -> bool {
 /// Parse a SystemEvent telegram (a framed PDU whose protocol version is `0xfe`).
 pub fn parse_system_event(buf: &[u8]) -> Result<SystemEvent> {
     let h = pdu::parse_header(buf)?;
-    let end = if h.data_len > 0 {
-        (h.body_offset + h.data_len as usize).min(buf.len())
-    } else {
-        buf.len()
-    };
-    let body = &buf[h.body_offset..end];
+    let body = &buf[h.body_offset..h.body_end(buf)];
     let mut cur = Cursor::new(body);
     let reserved1 = p::decode_u32(&mut cur)?;
     let confirmed_bytes = p::decode_u32(&mut cur)?;
