@@ -1386,8 +1386,9 @@ impl Connection {
 
     /// Resolve a symbol like `"Data_block_1.toto"` to its [`ItemAddress`] by walking the
     /// block's type info. Handles nested structs/FBs and 1-D/M-D array indexing
-    /// (`"DB.arr[2]"`, `"DB.m[1,2]"`). Names containing `.`, `[` or `]` are double-quoted as in
-    /// TIA Portal: `"\"Data block.1\".\"value.1\""`.
+    /// (`"DB.arr[2]"`, `"DB.m[1,2]"`). Paths can be written as TIA Portal shows them: names may
+    /// be double-quoted, which is required when they contain `.`, `[` or `]`
+    /// (`"\"Data block.1\".\"value.1\""`), and array-DB elements are `"\"Array DB\"[2]"`.
     pub fn resolve_symbol(&mut self, symbol: &str) -> Result<ItemAddress> {
         Ok(self.resolve_full(symbol)?.0)
     }
@@ -1398,14 +1399,19 @@ impl Connection {
         &mut self,
         symbol: &str,
     ) -> Result<(ItemAddress, Option<crate::proto::VartypeElement>)> {
-        let levels = parse_symbol_path(symbol)?;
-        let first = levels[0].0.as_str();
+        let mut levels = parse_symbol_path(symbol)?;
+        let first = levels[0].0.clone();
 
         // Determine the access root. A data block consumes the first path level (the DB
         // name); a controller area (M/Q/I) does not — the first level is already a tag in it.
         let dbs = self.datablock_list()?;
         let (access_area, access_sub_area, root_ti, start) =
             if let Some(db) = dbs.iter().find(|d| d.name == first).cloned() {
+                // Array DB elements: TIA writes `"DB"[2]`; the PLC exposes them as member `THIS`.
+                if !levels[0].1.is_empty() {
+                    let indices = std::mem::take(&mut levels[0].1);
+                    levels.insert(1, ("THIS".to_string(), indices));
+                }
                 (db.relid, DB_VALUE_ACTUAL, db.ti_relid, 1usize)
             } else {
                 let mut found = None;
@@ -1419,7 +1425,7 @@ impl Connection {
                     let present = info
                         .varname_list
                         .as_ref()
-                        .is_some_and(|n| n.names.iter().any(|name| name == first));
+                        .is_some_and(|n| n.names.contains(&first));
                     if present {
                         found = Some((rid, CONTROLLER_AREA_VALUE_ACTUAL, ti, 0usize));
                         break;
