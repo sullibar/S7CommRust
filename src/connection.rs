@@ -26,6 +26,7 @@ use crate::proto::{
     SetMultiVariablesResponse, SetVariableResponse,
 };
 use crate::transport::{IsoTcp, TlsChannel};
+use crate::value::strings::{decode_s7_string, decode_wstring, encode_s7_string, encode_wstring};
 use crate::value::PValue;
 use crate::wire::pdu::{self, functioncode, ids, protocol_version};
 
@@ -55,8 +56,6 @@ const BROWSE_ATTRS: [u32; 3] = [
 /// RID of the OMS type-info container (`Ids.ObjectOMSTypeInfoContainer`) — one Explore returns
 /// every block's type info at once.
 const OMS_TYPE_INFO_CONTAINER_RID: u32 = 537;
-/// Softdatatype value for `BBOOL` (bit-packed bool) — needs the array-id bit-packing skip.
-const SDT_BBOOL: u8 = 40;
 /// Recursion guard for the browse walk (nested structs; S7 types are not cyclic).
 const MAX_BROWSE_DEPTH: usize = 16;
 /// How many times to reconnect (for a fresh challenge) when a legacy auth challenge can't be
@@ -82,8 +81,9 @@ pub struct DataBlock {
     pub ti_relid: u32,
 }
 
-/// A leaf variable discovered by the browse walk: its fully-qualified symbol path, the access
-/// address parts, and its datatype. Read/write it via [`VarInfo::address`].
+/// A variable discovered by the browse walk (or resolved by [`Connection::resolve_var`]): its
+/// fully-qualified symbol path, the access address parts, and its datatype. Read/write it via
+/// [`VarInfo::address`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VarInfo {
     /// Fully-qualified symbol path (e.g. `"Motor_DB.axis[2].speed"`; area tags have no DB prefix).
@@ -96,9 +96,10 @@ pub struct VarInfo {
     pub access_sub_area: u32,
     /// The access LID sequence.
     pub lids: Vec<u32>,
-    /// The member's softdatatype (1=Bool, 8=DInt, 14=Real, 19=String, 62=WString, …).
+    /// The member's softdatatype (1=Bool, 7=DInt, 8=Real, 19=String, 62=WString, …; see
+    /// [`crate::value::datatype::softdatatype`]).
     pub softdatatype: u8,
-    /// Declared max length for `String` members (0 otherwise).
+    /// Declared max length for `String`/`WString` members (0 otherwise).
     pub string_max_len: u16,
 }
 
@@ -1393,6 +1394,25 @@ impl Connection {
         Ok(self.resolve_full(symbol)?.0)
     }
 
+    /// Like [`Connection::resolve_symbol`], but returns a [`VarInfo`] that also carries the
+    /// member's softdatatype and declared string length. A [`PValue`] alone doesn't say what it
+    /// means (a `DATE` reads as `UInt`, a `STRING` and a `DATE_AND_TIME` both read as a USInt
+    /// array), so use this to interpret a value, e.g. with [`crate::value::datetime::format`].
+    ///
+    /// For a whole array (no `[..]` index) the softdatatype is the element type. A bare DB name
+    /// has no member, so its softdatatype is `0`.
+    pub fn resolve_var(&mut self, symbol: &str) -> Result<VarInfo> {
+        let (addr, leaf) = self.resolve_full(symbol)?;
+        Ok(VarInfo {
+            name: symbol.to_string(),
+            access_area: addr.access_area,
+            access_sub_area: addr.access_sub_area,
+            lids: addr.lid,
+            softdatatype: leaf.as_ref().map_or(0, |e| e.softdatatype),
+            string_max_len: leaf.as_ref().map_or(0, |e| e.offset_info.string_max_len),
+        })
+    }
+
     /// Like [`Connection::resolve_symbol`] but also returns the resolved leaf member's
     /// type-info element (datatype, string max length, …).
     fn resolve_full(
@@ -1490,10 +1510,11 @@ impl Connection {
                 if oi.has_relation() {
                     addr.lid.push(1);
                 }
-            } else if (oi.is_1dim || oi.is_mdim) && oi.has_relation() {
-                // A bare array-of-struct name without `[..]` (whole-array read) — unsupported.
+            } else if (oi.is_1dim || oi.is_mdim) && oi.has_relation() && i + 1 < levels.len() {
+                // A whole array-of-struct can be read as the leaf, but its members can only be
+                // reached through an element.
                 return Err(Error::protocol(format!(
-                    "whole array-of-struct read of '{name}' not supported; index it"
+                    "'{name}' is an array; index it to reach its members"
                 )));
             }
 
@@ -1536,13 +1557,7 @@ impl Connection {
     /// match the PLC variable's type.
     pub fn write_tag(&mut self, symbol: &str, value: PValue) -> Result<()> {
         let addr = self.resolve_symbol(symbol)?;
-        let resp = self.write_variables(&[addr], &[value])?;
-        if let Some((item, e)) = resp.errors.first() {
-            return Err(Error::protocol(format!(
-                "write '{symbol}' rejected: item {item} return_value=0x{e:016x}"
-            )));
-        }
-        Ok(())
+        self.write_resolved(symbol, addr, value)
     }
 
     /// Read several tags by name in one `GetMultiVariables` round-trip. Returns one result per
@@ -1605,18 +1620,62 @@ impl Connection {
         }
     }
 
-    /// Write an S7 `STRING` tag by name. The variable's declared max length (from its type
-    /// info) frames the written buffer; characters outside ISO-8859-1 become `?`.
+    /// Write an S7 `STRING` tag by name. The variable's declared max length frames the written
+    /// buffer; longer text is truncated, and characters outside ISO-8859-1 become `?`.
     pub fn write_string(&mut self, symbol: &str, value: &str) -> Result<()> {
+        let (addr, max_len) = self.resolve_string(symbol)?;
+        let payload = encode_s7_string(value, max_len.min(254) as u8);
+        self.write_resolved(symbol, addr, PValue::USIntArray(payload))
+    }
+
+    /// Read an S7 `WSTRING` tag by name. On the wire a WSTRING is a UInt array
+    /// `[max_len, actual_len, code units…]` in UTF-16; this decodes it to a Rust `String`.
+    pub fn read_wstring(&mut self, symbol: &str) -> Result<String> {
+        let v = self.read_tag(symbol)?;
+        decode_wstring(&v).ok_or_else(|| {
+            Error::protocol(format!(
+                "'{symbol}' did not read back as a WSTRING (got {v:?})"
+            ))
+        })
+    }
+
+    /// Write an S7 `WSTRING` tag by name. The variable's declared max length frames the written
+    /// buffer; longer text is truncated to that many UTF-16 code units.
+    pub fn write_wstring(&mut self, symbol: &str, value: &str) -> Result<()> {
+        let (addr, max_len) = self.resolve_string(symbol)?;
+        self.write_resolved(symbol, addr, encode_wstring(value, max_len))
+    }
+
+    /// Resolve a `STRING`/`WSTRING` symbol to its address and declared max length. The length
+    /// comes from the type info when its offset info carries it; array elements' offset info
+    /// doesn't, so it is then taken from the `[max_len, actual_len, …]` header of the current
+    /// value (falling back to the default 254).
+    fn resolve_string(&mut self, symbol: &str) -> Result<(ItemAddress, u16)> {
         let (addr, leaf) = self.resolve_full(symbol)?;
-        let max_len = leaf
-            .as_ref()
+        let declared = leaf
             .map(|e| e.offset_info.string_max_len)
-            .filter(|&m| m > 0)
-            .unwrap_or(254)
-            .min(254) as u8;
-        let payload = encode_s7_string(value, max_len);
-        let resp = self.write_variables(&[addr], &[PValue::USIntArray(payload)])?;
+            .filter(|&m| m > 0);
+        let max_len = match declared {
+            Some(m) => m,
+            None => {
+                let resp = self.read_variables(std::slice::from_ref(&addr))?;
+                match resp.value(1) {
+                    Some(PValue::USIntArray(b)) => b.first().map(|&m| u16::from(m)),
+                    Some(PValue::Array { items, .. }) => match items.first() {
+                        Some(PValue::UInt(m)) => Some(*m),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+                .unwrap_or(254)
+            }
+        };
+        Ok((addr, max_len))
+    }
+
+    /// Write one already-resolved value, turning an item-level rejection into an error.
+    fn write_resolved(&mut self, symbol: &str, addr: ItemAddress, value: PValue) -> Result<()> {
+        let resp = self.write_variables(&[addr], &[value])?;
         if let Some((item, e)) = resp.errors.first() {
             return Err(Error::protocol(format!(
                 "write '{symbol}' rejected: item {item} return_value=0x{e:016x}"
@@ -1968,7 +2027,7 @@ fn mdim_elements(oi: &crate::proto::OffsetInfo, softdatatype: u8) -> Vec<(String
 
         xx[0] += 1;
         // BBOOL arrays: the id of the fastest dimension only advances in units up to 8 per byte.
-        if softdatatype == SDT_BBOOL
+        if softdatatype == crate::value::datatype::softdatatype::BBOOL
             && xx[0] >= oi.mdim_element_count[0]
             && oi.mdim_element_count[0] % 8 != 0
         {
@@ -1986,31 +2045,6 @@ fn mdim_elements(oi: &crate::proto::OffsetInfo, softdatatype: u8) -> Vec<(String
             break;
         }
     }
-    out
-}
-
-/// Decode an S7 `STRING` from its USInt-array form `[max_len, actual_len, chars…]` (Latin-1).
-fn decode_s7_string(bytes: &[u8]) -> String {
-    if bytes.len() < 2 {
-        return String::new();
-    }
-    let act_len = bytes[1] as usize;
-    let end = (2 + act_len).min(bytes.len());
-    bytes[2..end].iter().map(|&b| b as char).collect()
-}
-
-/// Encode an S7 `STRING` to its USInt-array write form: `[max_len, actual_len, chars…]`
-/// padded to `max_len + 2` bytes (Latin-1; non-Latin-1 chars become `?`).
-fn encode_s7_string(value: &str, max_len: u8) -> Vec<u8> {
-    let chars: Vec<u8> = value
-        .chars()
-        .map(|c| if (c as u32) <= 0xff { c as u8 } else { b'?' })
-        .collect();
-    let act = chars.len().min(max_len as usize);
-    let mut out = vec![0u8; max_len as usize + 2];
-    out[0] = max_len;
-    out[1] = act as u8;
-    out[2..2 + act].copy_from_slice(&chars[..act]);
     out
 }
 
@@ -2150,19 +2184,5 @@ mod tests {
                 ("[11,2]".into(), 3),
             ]
         );
-    }
-
-    #[test]
-    fn s7_string_roundtrip() {
-        let encoded = encode_s7_string("Hello", 254);
-        assert_eq!(encoded.len(), 256);
-        assert_eq!(encoded[0], 254); // max len
-        assert_eq!(encoded[1], 5); // actual len
-        assert_eq!(&encoded[2..7], b"Hello");
-        assert_eq!(decode_s7_string(&encoded), "Hello");
-        // Truncation to max length.
-        let short = encode_s7_string("abcdef", 3);
-        assert_eq!(short, vec![3, 3, b'a', b'b', b'c']);
-        assert_eq!(decode_s7_string(&short), "abc");
     }
 }

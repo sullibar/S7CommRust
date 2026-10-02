@@ -260,6 +260,25 @@ impl S7DateTime {
     }
 }
 
+impl S7Duration {
+    /// Decode an `S5TIME` word: a 3-digit BCD count in bits 0–11 and a time base in bits 12–13
+    /// (0 = 10 ms, 1 = 100 ms, 2 = 1 s, 3 = 10 s). `None` if the count is not valid BCD.
+    pub fn from_s5time(w: u16) -> Option<S7Duration> {
+        let mut count = 0i64;
+        for shift in [8, 4, 0] {
+            let digit = (w >> shift) & 0x0f;
+            if digit > 9 {
+                return None;
+            }
+            count = count * 10 + i64::from(digit);
+        }
+        let base_ms = [10, 100, 1_000, 10_000][usize::from((w >> 12) & 0x3)];
+        Some(S7Duration {
+            nanos: count * base_ms * 1_000_000,
+        })
+    }
+}
+
 impl S7TimeOfDay {
     fn from_day_nanos(ns: i64) -> S7TimeOfDay {
         let (hour, minute, second, nanosecond) =
@@ -289,6 +308,7 @@ pub fn format(softdatatype: u8, v: &PValue) -> Option<String> {
             .to_string(),
         ),
         sdt::LTIME => Some(S7Duration { nanos: v.as_i64()? }.to_string()),
+        sdt::S5TIME => S7Duration::from_s5time(v.as_u64()? as u16).map(|d| d.to_string()),
         sdt::LDT => Some(S7DateTime::from_unix_nanos(v.as_i64()?).to_string()),
         sdt::DTL => S7DateTime::from_dtl(v).map(|d| d.to_string()),
         sdt::DATE_AND_TIME => S7DateTime::from_date_and_time(v.as_bytes()?).map(|d| d.to_string()),
@@ -382,6 +402,28 @@ mod tests {
             format(sdt::TIME_OF_DAY, &PValue::UDInt(45_930_500)).unwrap(),
             "12:45:30.5"
         );
+    }
+
+    #[test]
+    fn s5time() {
+        // 0x0200: BCD 200, base 10 ms → 2 s (the value seen on the PLCSIM rig).
+        assert_eq!(format(sdt::S5TIME, &PValue::Word(0x0200)).unwrap(), "T#2s");
+        // 0x2123: BCD 123, base 1 s → 2m3s; 0x3999: 999 × 10 s, the S5TIME maximum.
+        assert_eq!(
+            format(sdt::S5TIME, &PValue::Word(0x2123)).unwrap(),
+            "T#2m3s"
+        );
+        assert_eq!(
+            format(sdt::S5TIME, &PValue::Word(0x3999)).unwrap(),
+            "T#2h46m30s"
+        );
+        // 0x0015: 15 × 10 ms.
+        assert_eq!(
+            format(sdt::S5TIME, &PValue::Word(0x0015)).unwrap(),
+            "T#0s150ms"
+        );
+        // Not BCD.
+        assert!(format(sdt::S5TIME, &PValue::Word(0x00a0)).is_none());
     }
 
     #[test]

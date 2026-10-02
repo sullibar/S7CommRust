@@ -57,9 +57,10 @@ fn main() -> s7commplus::Result<()> {
 ### What you can do
 
 - **Connect** — `connect` (TLS) or `connect_legacy` (older firmware).
-- **Browse** — `datablock_list`, `explore`, `type_info`, `resolve_symbol`.
+- **Browse** — `datablock_list`, `explore`, `type_info`, `resolve_symbol`, and `resolve_var`
+  (which adds the tag's softdatatype, to interpret its value).
 - **Read / write by name** — `read_tag` / `write_tag`, batched `read_tags` / `write_tags`,
-  and the string helpers `read_string` / `write_string`.
+  and the string helpers `read_string` / `write_string` and `read_wstring` / `write_wstring`.
 - **Subscribe** — `subscribe` / `subscribe_with` for cyclic value pushes, then
   `next_notification`; a finite credit limit is auto-refreshed for you.
 - **Alarms** — `subscribe_alarms`, then read `Notification::alarms()`; `Alarm::message()`

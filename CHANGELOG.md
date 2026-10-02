@@ -6,6 +6,27 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- `Connection::read_wstring` / `write_wstring` for `WSTRING` tags, which read back as a UInt
+  array `[max_len, actual_len, UTF-16 code units…]`, and a public `value::strings` module with
+  the `STRING`/`WSTRING` codecs for values that come from batched reads or subscriptions.
+- `Connection::resolve_var`: resolves a symbol to a `VarInfo`, so a single tag's softdatatype is
+  available to interpret its value (a `DATE` reads as `UInt`; `STRING` and `DATE_AND_TIME` both
+  read as a USInt array).
+- `value::datatype::softdatatype::name` (TIA Portal type names) and the `STRUCT`, `IEC_TIMER`
+  and `BBOOL` constants.
+- `datetime::format` renders `S5TIME` (via the new `S7Duration::from_s5time`).
+- Arrays of structs/UDTs can be read and written as a whole element (`"DB".arrUdt[1]`) or a
+  whole array (`"DB".arrUdt`): the value is a `PValue::Array` of `PackedStruct`s. Previously
+  this failed with "array of variable-length datatype 0x17 not yet supported" (the reference
+  driver doesn't decode it either).
+- s7tool decodes values by their declared type in `browse`, `read` and `sub`: `WString`,
+  `Char`/`WChar` as text, all date/time types (`read` previously showed `Time_Of_Day` as raw
+  milliseconds and a whole `DTL` as raw bytes), whole arrays element by element, and names every
+  type (`Bool` in optimized blocks, `WChar`, `LTime`, `S5Time`, … previously showed as `sdtN`).
+  `write` handles `WString`, `Char` and `WChar`.
+
 ### Fixed
 
 - Symbol paths can now be written exactly as TIA Portal shows them
@@ -18,6 +39,11 @@ All notable changes to this project are documented here. The format is based on
 - Array indices one past the upper bound are now rejected. Previously, on a multi-dimensional
   array they wrapped into the next row (`arr[0,3]` of `Array[0..1, 0..2]` read `arr[1,0]`),
   and on a 1-D array the PLC rejected them with an opaque error code.
+- `write_string` on an element of an `Array of String[n]` no longer gets rejected by the PLC:
+  the type info of array elements carries no max length, so it fell back to 254. The length is
+  now taken from the current value's header.
+- s7tool no longer shows every USInt array as a `String` (a `Date_And_Time` displayed as
+  `"\u{1}"`, for example).
 
 ## [0.1.0] - 2026-07-05
 
