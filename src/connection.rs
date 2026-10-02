@@ -58,9 +58,6 @@ const BROWSE_ATTRS: [u32; 3] = [
 const OMS_TYPE_INFO_CONTAINER_RID: u32 = 537;
 /// Recursion guard for the browse walk (nested structs; S7 types are not cyclic).
 const MAX_BROWSE_DEPTH: usize = 16;
-/// How many times to reconnect (for a fresh challenge) when a legacy auth challenge can't be
-/// fingerprinted. ~1/6 of challenges are unusable, so a handful of retries makes it near-certain.
-const CHALLENGE_RETRIES: usize = 10;
 /// How many variables to read per `GetMultiVariables` request when reading a browsed batch.
 /// Real PLCs cap the items (and total size) per request; 48 was the measured sweet spot on a live
 /// S7-1200 (~12% faster than 32, still under the cap). [`Connection::read_var_values`] adaptively
@@ -257,30 +254,18 @@ impl Connection {
     /// Hardware-validated on an S7-PLCSIM **Advanced** FW2.8 instance.
     pub fn connect_legacy<A: ToSocketAddrs>(addr: A, timeout: Duration) -> Result<Self> {
         let addrs: Vec<std::net::SocketAddr> = addr.to_socket_addrs()?.collect();
-        // Retry on a challenge that can't be fingerprinted (a fresh connection = fresh challenge).
-        for _ in 0..CHALLENGE_RETRIES {
-            let mut tcp = IsoTcp::connect(addrs.as_slice(), timeout)?;
-            match crate::legacy::session::handshake(&mut tcp, &mut |b| {
+        let mut tcp = IsoTcp::connect(addrs.as_slice(), timeout)?;
+        let (session_key, session_id, session_id2) =
+            crate::legacy::session::handshake(&mut tcp, &mut |b| {
                 getrandom::getrandom(b).expect("OS CSPRNG")
-            })? {
-                Some((session_key, session_id, session_id2)) => {
-                    let target = ReconnectTarget::LegacyPlcsim {
-                        addrs: addrs.clone(),
-                        timeout,
-                    };
-                    return Ok(Self::new_legacy(
-                        tcp,
-                        session_key,
-                        session_id,
-                        session_id2,
-                        target,
-                    ));
-                }
-                None => continue, // unfingerprintable challenge — reconnect
-            }
-        }
-        Err(Error::protocol(
-            "legacy PLCSIM: no usable (fingerprintable) challenge after several reconnects",
+            })?;
+        let target = ReconnectTarget::LegacyPlcsim { addrs, timeout };
+        Ok(Self::new_legacy(
+            tcp,
+            session_key,
+            session_id,
+            session_id2,
+            target,
         ))
     }
 
@@ -314,52 +299,35 @@ impl Connection {
         public_key: Option<&[u8]>,
     ) -> Result<Self> {
         use crate::legacy::realplc::{real_plc_handshake, RealPlcOutcome};
-        // Resolve once so we can reconnect: a wrong key makes the PLC reset the connection, and
-        // ~1/6 of challenges can't be fingerprinted (a fresh connection gets a fresh challenge).
+        // Resolve once so we can reconnect: a wrong key makes the PLC reset the connection.
         let addrs: Vec<std::net::SocketAddr> = addr.to_socket_addrs()?.collect();
         let mut rng = |b: &mut [u8]| getrandom::getrandom(b).expect("OS CSPRNG");
 
-        // One auth attempt with a given key, reconnecting on an unfingerprintable challenge.
-        // Returns `Ok(Some(conn))` on success, `Ok(None)` if the key was wrong (or exhausted
-        // retries), and propagates a family for the key-not-bundled case via `Err`-free channel.
         // Phase 1: try the explicit/auto-looked-up key; discover the family if none is bundled.
-        let mut family = None;
-        for _ in 0..CHALLENGE_RETRIES {
-            let mut tcp = IsoTcp::connect(addrs.as_slice(), timeout)?;
-            match real_plc_handshake(&mut tcp, public_key, &mut rng)? {
-                RealPlcOutcome::Authenticated {
+        let mut tcp = IsoTcp::connect(addrs.as_slice(), timeout)?;
+        let family = match real_plc_handshake(&mut tcp, public_key, &mut rng)? {
+            RealPlcOutcome::Authenticated {
+                session_key,
+                session_id,
+                session_id2,
+            } => {
+                let target = ReconnectTarget::RealPlc {
+                    addrs: addrs.clone(),
+                    timeout,
+                    key: public_key.map(<[u8]>::to_vec),
+                };
+                return Ok(Self::new_legacy(
+                    tcp,
                     session_key,
                     session_id,
                     session_id2,
-                } => {
-                    let target = ReconnectTarget::RealPlc {
-                        addrs: addrs.clone(),
-                        timeout,
-                        key: public_key.map(<[u8]>::to_vec),
-                    };
-                    return Ok(Self::new_legacy(
-                        tcp,
-                        session_key,
-                        session_id,
-                        session_id2,
-                        target,
-                    ));
-                }
-                RealPlcOutcome::RetryChallenge => continue, // fresh connection, fresh challenge
-                RealPlcOutcome::KeyNotBundled { family: f } => {
-                    family = Some(f);
-                    break;
-                }
+                    target,
+                ));
             }
-        }
-        let Some(family) = family else {
-            return Err(Error::protocol(
-                "real-PLC: no usable (fingerprintable) challenge after several reconnects",
-            ));
+            RealPlcOutcome::KeyNotBundled { family } => family,
         };
 
-        // Phase 2: the PLC advertised only its family — auto-try each bundled key for it, each
-        // with its own challenge-retry.
+        // Phase 2: the PLC advertised only its family — auto-try each bundled key for it.
         let candidates = crate::legacy::pubkey_store::candidates(family);
         log::info!(
             "real-PLC {family:?}: key id not advertised — auto-trying {} bundled key(s)",
@@ -367,45 +335,39 @@ impl Connection {
         );
         let mut last_err: Option<Error> = None;
         for (i, key) in candidates.iter().enumerate() {
-            for _ in 0..CHALLENGE_RETRIES {
-                let mut t = match IsoTcp::connect(addrs.as_slice(), timeout) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        last_err = Some(e);
-                        break;
-                    }
-                };
-                match real_plc_handshake(&mut t, Some(key), &mut rng) {
-                    Ok(RealPlcOutcome::Authenticated {
+            let mut t = match IsoTcp::connect(addrs.as_slice(), timeout) {
+                Ok(t) => t,
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+            match real_plc_handshake(&mut t, Some(key), &mut rng) {
+                Ok(RealPlcOutcome::Authenticated {
+                    session_key,
+                    session_id,
+                    session_id2,
+                }) => {
+                    log::info!(
+                        "real-PLC: authenticated with bundled key {}/{}",
+                        i + 1,
+                        candidates.len()
+                    );
+                    let target = ReconnectTarget::RealPlc {
+                        addrs: addrs.clone(),
+                        timeout,
+                        key: Some(key.to_vec()), // the bundled key that worked
+                    };
+                    return Ok(Self::new_legacy(
+                        t,
                         session_key,
                         session_id,
                         session_id2,
-                    }) => {
-                        log::info!(
-                            "real-PLC: authenticated with bundled key {}/{}",
-                            i + 1,
-                            candidates.len()
-                        );
-                        let target = ReconnectTarget::RealPlc {
-                            addrs: addrs.clone(),
-                            timeout,
-                            key: Some(key.to_vec()), // the bundled key that worked
-                        };
-                        return Ok(Self::new_legacy(
-                            t,
-                            session_key,
-                            session_id,
-                            session_id2,
-                            target,
-                        ));
-                    }
-                    Ok(RealPlcOutcome::RetryChallenge) => continue, // fresh challenge, same key
-                    Ok(RealPlcOutcome::KeyNotBundled { .. }) => break, // unreachable with a key
-                    Err(e) => {
-                        last_err = Some(e); // wrong key → PLC reset; move to the next candidate
-                        break;
-                    }
+                        target,
+                    ));
                 }
+                Ok(RealPlcOutcome::KeyNotBundled { .. }) => {} // unreachable with a key
+                Err(e) => last_err = Some(e), // wrong key → PLC reset; try the next candidate
             }
         }
         Err(last_err.unwrap_or_else(|| {

@@ -13,7 +13,7 @@
 //! reduction polynomial `0x01_0000_8005`). [`checksum`] then folds a 16-byte key
 //! through that table (byte-wise, with a rotate between rounds) into a 16-byte tag.
 //!
-//! Both are pure bit/table arithmetic (no elliptic-curve Monoliths), validated
+//! Both are pure bit/table arithmetic (no elliptic-curve arithmetic), validated
 //! byte-for-byte against HarpoS7's `transform3` (LUT) and `transform4` (checksum)
 //! golden vectors. In the blob these are `RealPlcAuthenticator.DeriveKeysAndLookupTable`
 //! (`LutGenerator`) and the running-checksum / `UpdateChecksum` step (`ChecksumTransform`).

@@ -47,5 +47,4 @@ pub(crate) mod seed;
 pub(crate) mod session;
 
 mod aes_consts;
-mod fingerprint_consts;
 mod seed_consts;

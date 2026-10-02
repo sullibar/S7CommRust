@@ -8,15 +8,15 @@
 //! RealPlc (S7-1200/1500) auth orchestration.
 //!
 //! The full `AuthenticateRealPlc` assembles the 180-byte blob (`metadata + seed + IV +
-//! enc-challenge + enc-key2 + checksum`) and derives the 24-byte session key. This module
-//! currently provides the session-key derivation (validated against the golden vectors) and
-//! will grow the full blob assembly once the EC seed layer (comb + Monolith combine) lands.
+//! enc-challenge + enc-key2 + checksum`) and derives the 24-byte session key, validated
+//! byte-for-byte against HarpoS7's three `AuthenticateRealPlc` golden vectors and against 48
+//! handshakes recorded from HarpoS7's original monolith implementation.
 //!
 //! The one RealPlc-vs-PLCSIM inversion to remember: the session key is derived from **key2**
 //! (PLCSIM used key1). The KDF itself is identical — [`crate::legacy::keys::derive_session_key`].
 
 use super::blob::{self, PublicKeyFamily, REALPLC_BLOB_LEN};
-use super::{checksum, cipher, seed, transforms};
+use super::{checksum, cipher, seed};
 use crate::legacy::digest::SESSION_KEY_LEN;
 use crate::legacy::keys::derive_session_key;
 
@@ -58,14 +58,24 @@ pub fn authenticate_real_plc(
     // Metadata (key-id from key2).
     blob::write_metadata(&mut blob_out[0..48], public_key, &key2, family);
 
-    // EC-encrypted seed. PreSeed(key1) feeds both the seed combine and the AES-key derivation.
-    let mut t1 = [0u8; 60];
-    transforms::pre_seed(&mut t1, &key1);
-    seed::seed_transform(&mut blob_out[48..108], public_key, &t1, fill_random);
+    // ECDH-masked seed. PreSeed(key1) feeds both the seed and the AES-key derivation.
+    let pre_seed = seed::pre_seed(&key1);
+    seed::write_seed(&mut blob_out[48..108], public_key, &pre_seed, fill_random);
+    let t2 = seed::derive_keys(&pre_seed);
 
-    // Derive the two AES keys + the LUT for the blob-body cipher.
-    let mut t2 = [0u8; 48];
-    transforms::key_derivation(&mut t2, &t1);
+    seal_body(blob_out, session_key_out, challenge, &key2, &iv, &t2);
+}
+
+/// Encrypt the blob body (IV, challenge, key2, checksum) under the derived keys `t2` and
+/// write the session key.
+fn seal_body(
+    blob_out: &mut [u8],
+    session_key_out: &mut [u8],
+    challenge: &[u8],
+    key2: &[u8; 24],
+    iv: &[u8; 16],
+    t2: &[u8; 48],
+) {
     let challenge_key: [u8; 16] = t2[0..16].try_into().unwrap();
     let checksum_key: [u8; 16] = t2[16..32].try_into().unwrap();
     let mut lut = [0u8; checksum::LUT_LEN];
@@ -74,15 +84,15 @@ pub fn authenticate_real_plc(
     // IV + encrypted challenge + encrypted key2 + sealed checksum.
     cipher::encrypt_body(
         &mut blob_out[108..180],
-        &iv,
-        &key2,
+        iv,
+        key2,
         challenge,
         &challenge_key,
         &checksum_key,
         &lut,
     );
 
-    session_key_out[..SESSION_KEY_LEN].copy_from_slice(&real_plc_session_key(&key2, challenge));
+    session_key_out[..SESSION_KEY_LEN].copy_from_slice(&real_plc_session_key(key2, challenge));
 }
 
 #[cfg(test)]
@@ -186,5 +196,62 @@ mod tests {
             include_bytes!("../../../tests/vectors/family0/auth/s71200b-blob.bin"),
             include_bytes!("../../../tests/vectors/family0/auth/s71200b-sk.bin"),
         );
+    }
+
+    /// SplitMix64: the deterministic fill used to generate `differential.txt`.
+    struct SplitMix(u64);
+
+    impl SplitMix {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn fill(&mut self, buf: &mut [u8]) {
+            for b in buf {
+                *b = self.next() as u8;
+            }
+        }
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// 48 handshakes computed by HarpoS7's original monolith chain (Transform7, Monolith1..11,
+    /// Transform12/13) before it was replaced: all 16 catalogue public keys plus random curve
+    /// and twist x-coordinates, random challenges, and SplitMix64-seeded key material. Each line
+    /// is `family fill_seed public_key challenge blob session_key`.
+    #[test]
+    fn matches_the_original_monolith_chain() {
+        let fixture = include_str!("../../../tests/vectors/family0/differential.txt");
+        let mut cases = 0;
+        for line in fixture.lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            let family = match f[0] {
+                "1500" => PublicKeyFamily::S71500,
+                _ => PublicKeyFamily::S71200,
+            };
+            let mut fill = SplitMix(u64::from_str_radix(f[1], 16).unwrap());
+            let (mut blob, mut sk) = ([0u8; REALPLC_BLOB_LEN], [0u8; SESSION_KEY_LEN]);
+            authenticate_real_plc(
+                &mut blob,
+                &mut sk,
+                &unhex(f[3]),
+                &unhex(f[2]),
+                family,
+                &mut |b| fill.fill(b),
+            );
+            assert_eq!(blob.to_vec(), unhex(f[4]), "blob, line {}", cases + 1);
+            assert_eq!(sk.to_vec(), unhex(f[5]), "session key, line {}", cases + 1);
+            cases += 1;
+        }
+        assert_eq!(cases, 48);
     }
 }

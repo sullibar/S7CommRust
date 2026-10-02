@@ -58,8 +58,8 @@ mod tests {
     use super::*;
     use hex_literal::hex;
 
-    // No PLCSIM auth vector exists in HarpoS7 (only the RealPlc/Monolith path is unit-tested
-    // there), so validate structure + self-consistency against the already-validated pieces.
+    // No PLCSIM auth vector exists in HarpoS7 (only the RealPlc path is unit-tested there),
+    // so validate structure + self-consistency against the already-validated pieces.
     // The full blob's end-to-end check is the live PLC accepting it.
     #[test]
     fn authenticate_plcsim_structure() {

@@ -9,16 +9,15 @@
 //! that encrypts `challenge[2..18]` and `key2`, sealed with a LUT/`ChecksumTransform` MAC.
 //!
 //! This is **not** standard CTR (and differs from the PLCSIM `HarpoAesCtr`): each block is
-//! `AES-ECB(iv) ⊕ plaintext` with the IV advanced by [`super::field::rotate_left31`] between
+//! `AES-ECB(iv) ⊕ plaintext` with the IV advanced by [`advance_counter`] (HarpoS7's `RotateLeft31`) between
 //! blocks, and a running checksum folded through [`super::checksum::checksum`] and finally
 //! length-bound and AES-encrypted under a separate key.
 //!
 //! The three derived keys (`challenge_key`, `checksum_key`, `lut`) come from
-//! `KeyDerivationTransform(PreSeed(key1))`, which is Monolith-gated and lands with the EC
-//! layer; this module takes them as inputs so it can be validated independently against the
-//! blob tail of the `AuthenticateRealPlc` golden vector.
+//! [`super::seed::derive_keys`]`(pre_seed(key1))`; this module takes them as inputs so it can be
+//! validated independently against the blob tail of the `AuthenticateRealPlc` golden vector.
 
-use super::{checksum, field};
+use super::checksum;
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::Aes128;
@@ -87,7 +86,7 @@ pub fn encrypt_body(
     dst[off..off + 16].copy_from_slice(&ct);
     off += 16;
     encrypted_bytes += 16;
-    field::rotate_left31(&mut iv_state);
+    advance_counter(&mut iv_state);
     update_checksum(&mut cs, &ct, lut);
 
     // Region E: encrypt full 16-byte blocks of key2 (one block for 24-byte key2).
@@ -99,7 +98,7 @@ pub fn encrypt_body(
         dst[off..off + 16].copy_from_slice(&ct);
         off += 16;
         encrypted_bytes += 16;
-        field::rotate_left31(&mut iv_state);
+        advance_counter(&mut iv_state);
         update_checksum(&mut cs, &ct, lut);
     }
 
@@ -130,16 +129,37 @@ pub fn encrypt_body(
     off
 }
 
+/// Advance the counter block: multiply the little-endian 128-bit value by `x` in GCM's
+/// bit-reflected field (HarpoS7 calls this `BigIntOperations.RotateLeft31`).
+fn advance_counter(iv: &mut [u8; 16]) {
+    let v = u128::from_le_bytes(*iv);
+    *iv = ((v >> 1) ^ if v & 1 == 1 { 0xE1 << 120 } else { 0 }).to_le_bytes();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advance_counter_multiplies_by_x_in_gcm_field() {
+        // Bit-reflected: a set low bit shifts out and folds back as 0xE1 in the top byte.
+        let mut iv = 1u128.to_le_bytes();
+        advance_counter(&mut iv);
+        assert_eq!(u128::from_le_bytes(iv), 0xE1 << 120);
+        let mut iv = 0x8000_0000_0000_0000_0000_0000_0000_0002u128.to_le_bytes();
+        advance_counter(&mut iv);
+        assert_eq!(
+            u128::from_le_bytes(iv),
+            0x4000_0000_0000_0000_0000_0000_0000_0001
+        );
+    }
     use crate::legacy::family0::checksum::{generate_lut, LUT_LEN};
     use hex_literal::hex;
 
     // The S71500 AuthenticateRealPlc golden blob (LegacyAuthenticationSchemeTests.cs) with the
     // deterministic fill: key2 = 0x35×24, iv = 0x25×16, challenge = 0xDD×20. The three derived
-    // keys are dumped from KeyDerivationTransform(PreSeed(key1=0x35×24)) via the .NET oracle
-    // (validated separately once Monolith 9/10 land). Expected = blob bytes [0x6C..0xB4].
+    // keys are dumped from KeyDerivationTransform(PreSeed(key1=0x35×24)) via the .NET oracle.
+    // Expected = blob bytes [0x6C..0xB4].
     #[test]
     fn encrypt_body_matches_s71500_blob_tail() {
         let iv = [0x25u8; 16];

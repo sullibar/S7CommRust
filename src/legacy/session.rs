@@ -86,13 +86,12 @@ const AUTH_SETMULTI_TEMPLATE: [u8; 433] = [
 
 /// Perform the legacy handshake on an already COTP-connected socket: plaintext `CreateObject`
 /// (full `ServerSession`) → PlcSim challenge-response auth (with the real-PLC session-setup fix).
-/// Returns `Some((session_key, session_id, session_id2))`, or `None` if this session's challenge
-/// can't be fingerprinted (~1/6 of challenges — the caller should reconnect for a fresh one).
+/// Returns `(session_key, session_id, session_id2)`.
 /// `fill_random` supplies the auth's ephemeral key material.
 pub fn handshake(
     tcp: &mut IsoTcp,
     fill_random: &mut dyn FnMut(&mut [u8]),
-) -> Result<Option<([u8; 24], u32, u32)>> {
+) -> Result<([u8; 24], u32, u32)> {
     // 1. Plaintext CreateObject → session id + per-session challenge (attribute 303).
     tcp.send_iso_packet(&CREATE_OBJECT_POC[7..])?;
     let resp = recv_response(tcp)?;
@@ -103,12 +102,6 @@ pub fn handshake(
     let session_id2 = create.session_id2().unwrap_or(0);
     let challenge = find_challenge(&resp)
         .ok_or_else(|| Error::protocol("legacy CreateObject: challenge (attr 303) not found"))?;
-
-    // The session key is derived through the HarpoS7 challenge fingerprint, which can't handle
-    // ~1/6 of challenges; ask the caller to reconnect for a fresh one if so.
-    if !crate::legacy::fingerprint::is_challenge_fingerprintable(&challenge) {
-        return Ok(None);
-    }
 
     // 2. Build the encrypted-key blob + derive the session key, then assemble the auth request.
     let (blob, session_key) = authenticate_plcsim(&PLCSIM_PUBLIC_KEY, &challenge, fill_random);
@@ -150,7 +143,7 @@ pub fn handshake(
             rv as u16 as i16
         )));
     }
-    Ok(Some((session_key, session_id, session_id2)))
+    Ok((session_key, session_id, session_id2))
 }
 
 /// Wrap a normal (V2) framed PDU as a legacy ProtocolVersion-`0x03` PDU carrying the HMAC
