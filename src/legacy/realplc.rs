@@ -25,7 +25,7 @@ use crate::legacy::family0::auth::authenticate_real_plc;
 use crate::legacy::family0::blob::{PublicKeyFamily, REALPLC_BLOB_LEN};
 use crate::legacy::pubkey_store;
 use crate::legacy::session::{
-    decode_vlq_u64, find_challenge, key_id_vlq, recv_response, CREATE_OBJECT_POC,
+    build_auth_request, decode_vlq_u64, find_challenge, recv_response, CREATE_OBJECT_POC,
 };
 use crate::transport::IsoTcp;
 
@@ -42,20 +42,12 @@ pub(crate) fn build_real_plc_request(
     blob: &[u8],
     session_id: u32,
 ) -> Vec<u8> {
-    // (template, publicKeyIdOffset, symmetricKeyIdOffset, encryptedKeyBlobOffset)
-    let (mut data, pk_off, sk_off, blob_off): (Vec<u8>, usize, usize, usize) = match family {
-        PublicKeyFamily::S71500 => (S71500_AUTH_TEMPLATE.to_vec(), 0x40, 0x60, 0x7D),
-        PublicKeyFamily::S71200 => (S71200_AUTH_TEMPLATE.to_vec(), 0x40, 0x61, 0x7E),
+    // (template, (publicKeyIdOffset, symmetricKeyIdOffset, encryptedKeyBlobOffset))
+    let (template, offsets): (&[u8], _) = match family {
+        PublicKeyFamily::S71500 => (&S71500_AUTH_TEMPLATE, (0x40, 0x60, 0x7D)),
+        PublicKeyFamily::S71200 => (&S71200_AUTH_TEMPLATE, (0x40, 0x61, 0x7E)),
     };
-    let pk_vlq = key_id_vlq(pubkey_id);
-    let sk_vlq = key_id_vlq(symkey_id);
-    data[pk_off..pk_off + pk_vlq.len()].copy_from_slice(&pk_vlq);
-    data[sk_off..sk_off + sk_vlq.len()].copy_from_slice(&sk_vlq);
-    data[blob_off..blob_off + blob.len()].copy_from_slice(blob);
-    // sessionIdOffset = 0x14, written twice (again at +5).
-    data[0x14..0x18].copy_from_slice(&session_id.to_be_bytes());
-    data[0x19..0x1D].copy_from_slice(&session_id.to_be_bytes());
-    data
+    build_auth_request(template, offsets, pubkey_id, symkey_id, blob, session_id)
 }
 
 /// Read the VLQ value of session-setup attribute `attr` (marker `82 <attr> 00 04 <vlq>`) from a

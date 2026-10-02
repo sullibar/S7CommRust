@@ -21,8 +21,6 @@ use crate::transport::IsoTcp;
 use crate::wire::vlq;
 
 // Auth `SetMultiVariables` patch offsets (into the framed template, TPKT included).
-const SESSION_ID_OFFSET_1: usize = 0x14;
-const SESSION_ID_OFFSET_2: usize = 0x19;
 const PUBKEY_ID_OFFSET: usize = 0x42;
 const SYMKEY_ID_OFFSET: usize = 0x63;
 const BLOB_OFFSET: usize = 0x80;
@@ -105,15 +103,14 @@ pub fn handshake(
 
     // 2. Build the encrypted-key blob + derive the session key, then assemble the auth request.
     let (blob, session_key) = authenticate_plcsim(&PLCSIM_PUBLIC_KEY, &challenge, fill_random);
-    let pubkey_id = key_id_vlq(&derive_key_id(&PLCSIM_PUBLIC_KEY));
-    let symkey_id = key_id_vlq(&derive_key_id(&session_key));
-
-    let mut frame = AUTH_SETMULTI_TEMPLATE;
-    frame[SESSION_ID_OFFSET_1..SESSION_ID_OFFSET_1 + 4].copy_from_slice(&session_id.to_be_bytes());
-    frame[SESSION_ID_OFFSET_2..SESSION_ID_OFFSET_2 + 4].copy_from_slice(&session_id.to_be_bytes());
-    frame[PUBKEY_ID_OFFSET..PUBKEY_ID_OFFSET + pubkey_id.len()].copy_from_slice(&pubkey_id);
-    frame[SYMKEY_ID_OFFSET..SYMKEY_ID_OFFSET + symkey_id.len()].copy_from_slice(&symkey_id);
-    frame[BLOB_OFFSET..BLOB_OFFSET + blob.len()].copy_from_slice(&blob);
+    let mut frame = build_auth_request(
+        &AUTH_SETMULTI_TEMPLATE,
+        (PUBKEY_ID_OFFSET, SYMKEY_ID_OFFSET, BLOB_OFFSET),
+        &derive_key_id(&PLCSIM_PUBLIC_KEY),
+        &derive_key_id(&session_key),
+        &blob,
+        session_id,
+    );
     // The real-PLC (S71500) session-setup values 0x3b-0x3e (PLCSIM Advanced requires these; the
     // captured PlcSim values trigger an internal firmware error -258).
     patch_after(&mut frame, &[0x82, 0x3b, 0x00, 0x04], &[0x84, 0x00]);
@@ -144,6 +141,49 @@ pub fn handshake(
         )));
     }
     Ok((session_key, session_id, session_id2))
+}
+
+/// Assemble an auth `SetMultiVariables` request from a captured `template` (TPKT included):
+/// patch in the session id, the public/session key ids and the encrypted-key `blob`.
+/// `offsets` = (public key id, session key id, blob), as found in the template.
+///
+/// The key ids are VLQs whose length depends on the value (9 octets for most ids, fewer when the
+/// top byte is zero — ~1/256 of session keys), so the template's ids are *replaced* rather than
+/// overwritten in place, and the PDU / TPKT lengths are recomputed. Overwriting in place would
+/// leave a stale template byte behind a short id, which the PLC rejects (errorcode -255).
+pub(crate) fn build_auth_request(
+    template: &[u8],
+    (pubkey_off, symkey_off, blob_off): (usize, usize, usize),
+    pubkey_id: &[u8; 8],
+    symkey_id: &[u8; 8],
+    blob: &[u8],
+    session_id: u32,
+) -> Vec<u8> {
+    let mut frame = template.to_vec();
+    // Back to front, so each patch leaves the earlier offsets valid.
+    frame[blob_off..blob_off + blob.len()].copy_from_slice(blob);
+    for (off, id) in [(symkey_off, symkey_id), (pubkey_off, pubkey_id)] {
+        let old_len = vlq_u64_len(&frame[off..]);
+        frame.splice(off..off + old_len, key_id_vlq(id));
+    }
+    // The session id appears twice: the request header and the SetMultiVariables object id.
+    frame[0x14..0x18].copy_from_slice(&session_id.to_be_bytes());
+    frame[0x19..0x1d].copy_from_slice(&session_id.to_be_bytes());
+
+    // TPKT length (whole frame) and PDU data length (7-byte TPKT/COTP, `72 02 <len>` header and
+    // `72 02 00 00` trailer excluded).
+    let tpkt_len = u16::try_from(frame.len()).expect("auth request fits a TPKT");
+    frame[2..4].copy_from_slice(&tpkt_len.to_be_bytes());
+    frame[9..11].copy_from_slice(&(tpkt_len - 15).to_be_bytes());
+    frame
+}
+
+/// Length in octets of the S7p `UInt64` VLQ at the start of `b` (1–9; see [`decode_vlq_u64`]).
+fn vlq_u64_len(b: &[u8]) -> usize {
+    b.iter()
+        .take(8)
+        .position(|o| o & 0x80 == 0)
+        .map_or(9, |i| i + 1)
 }
 
 /// Wrap a normal (V2) framed PDU as a legacy ProtocolVersion-`0x03` PDU carrying the HMAC
@@ -273,5 +313,69 @@ fn patch_after(buf: &mut [u8], pat: &[u8], val: &[u8]) {
     if let Some(p) = buf.windows(pat.len()).position(|w| w == pat) {
         let start = p + pat.len();
         buf[start..start + val.len()].copy_from_slice(val);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vlq_u64_len_matches_encoding() {
+        for v in [0u64, 0x7f, 0x80, 1 << 55, (1 << 56) - 1, 1 << 56, u64::MAX] {
+            let enc = key_id_vlq(&v.to_le_bytes());
+            assert_eq!(vlq_u64_len(&enc), enc.len(), "value 0x{v:x}");
+            assert_eq!(decode_vlq_u64(&enc), v, "value 0x{v:x}");
+        }
+    }
+
+    /// A key id whose top byte is zero encodes as an 8-octet VLQ instead of 9; the request must
+    /// shrink accordingly rather than keep a stale template byte (PLC: errorcode -255).
+    #[test]
+    fn auth_request_handles_short_key_id() {
+        let offsets = (PUBKEY_ID_OFFSET, SYMKEY_ID_OFFSET, BLOB_OFFSET);
+        let pubkey_id = derive_key_id(&PLCSIM_PUBLIC_KEY);
+        let blob = [0xa5u8; crate::legacy::blob::PLCSIM_BLOB_LEN];
+        for (symkey_id, len) in [
+            ([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88], 9),
+            ([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x00], 8),
+            ([0x11, 0x22, 0x33, 0x44, 0x55, 0x00, 0x00, 0x00], 6),
+        ] {
+            let frame = build_auth_request(
+                &AUTH_SETMULTI_TEMPLATE,
+                offsets,
+                &pubkey_id,
+                &symkey_id,
+                &blob,
+                0x7000_0f8f,
+            );
+            let shrink = 9 - len;
+            assert_eq!(frame.len(), AUTH_SETMULTI_TEMPLATE.len() - shrink);
+            assert_eq!(
+                usize::from(u16::from_be_bytes([frame[2], frame[3]])),
+                frame.len()
+            );
+            assert_eq!(
+                usize::from(u16::from_be_bytes([frame[9], frame[10]])),
+                frame.len() - 15
+            );
+            assert_eq!(&frame[0x14..0x18], &0x7000_0f8fu32.to_be_bytes());
+            assert_eq!(&frame[0x19..0x1d], &0x7000_0f8fu32.to_be_bytes());
+
+            let pk = &frame[PUBKEY_ID_OFFSET..];
+            assert_eq!(decode_vlq_u64(pk), u64::from_le_bytes(pubkey_id));
+            let sk = &frame[SYMKEY_ID_OFFSET..];
+            assert_eq!(vlq_u64_len(sk), len);
+            assert_eq!(decode_vlq_u64(sk), u64::from_le_bytes(symkey_id));
+            // The next attribute (0x8e 0x23) follows the id directly.
+            assert_eq!(&sk[len..len + 2], &[0x8e, 0x23]);
+            // Everything after the id is the template, shifted.
+            let blob_at = BLOB_OFFSET - shrink;
+            assert_eq!(&frame[blob_at..blob_at + blob.len()], &blob);
+            assert_eq!(
+                &frame[blob_at + blob.len()..],
+                &AUTH_SETMULTI_TEMPLATE[BLOB_OFFSET + blob.len()..]
+            );
+        }
     }
 }
