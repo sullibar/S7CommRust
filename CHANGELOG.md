@@ -17,6 +17,10 @@ All notable changes to this project are documented here. The format is based on
 - `value::datatype::softdatatype::name` (TIA Portal type names) and the `STRUCT`, `IEC_TIMER`
   and `BBOOL` constants.
 - `datetime::format` renders `S5TIME` (via the new `S7Duration::from_s5time`).
+- Arrays of structs/UDTs can be read and written as a whole element (`"DB".arrUdt[1]`) or a
+  whole array (`"DB".arrUdt`): the value is a `PValue::Array` of `PackedStruct`s. Previously
+  this failed with "array of variable-length datatype 0x17 not yet supported" (the reference
+  driver doesn't decode it either).
 - s7tool decodes values by their declared type in `browse`, `read` and `sub`: `WString`,
   `Char`/`WChar` as text, all date/time types (`read` previously showed `Time_Of_Day` as raw
   milliseconds and a whole `DTL` as raw bytes), whole arrays element by element, and names every

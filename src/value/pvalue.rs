@@ -138,9 +138,52 @@ fn struct_is_packed(id: u32) -> bool {
     (id > 0x9000_0000 && id < 0x9fff_ffff) || (id > 0x0200_0000 && id < 0x02ff_ffff)
 }
 
-/// `PackedStructTransportFlagBits.Count2Present` — when set, the element count is written a
-/// second time (both copies equal) before the raw member bytes.
+/// `PackedStructTransportFlagBits.Count2Present` — when set, a second length follows the first
+/// before the raw member bytes. For a single struct both are equal; for an array of packed
+/// structs they are the element stride and the total byte length.
 const PACKED_STRUCT_COUNT2_PRESENT: u32 = 1 << 10;
+
+/// Payload of an array of packed structs — the inverse of
+/// `PValue::deserialize_packed_struct_array`: one header taken from the first element, the
+/// stride and total length, then every element's member block. All elements must be
+/// [`PValue::PackedStruct`]s of the same type and size.
+fn serialize_packed_struct_array<W: Write>(w: &mut W, items: &[PValue]) -> Result<usize> {
+    let mut blocks = Vec::with_capacity(items.len());
+    let mut header = None;
+    for item in items {
+        let PValue::PackedStruct {
+            id,
+            interface_timestamp,
+            transport_flags,
+            data,
+        } = item
+        else {
+            return Err(Error::protocol(
+                "struct array elements must all be packed structs",
+            ));
+        };
+        let h = (*id, *interface_timestamp, *transport_flags, data.len());
+        if *header.get_or_insert(h) != h {
+            return Err(Error::protocol(
+                "struct array elements must share type and size",
+            ));
+        }
+        blocks.push(data);
+    }
+    let Some((id, interface_timestamp, transport_flags, stride)) = header else {
+        return Err(Error::protocol("cannot serialize an empty struct array"));
+    };
+    let mut n = 0;
+    n += p::encode_u32(w, id)?;
+    n += p::encode_u64(w, interface_timestamp)?;
+    n += vlq::encode_u32(w, transport_flags | PACKED_STRUCT_COUNT2_PRESENT)?;
+    n += vlq::encode_u32(w, stride as u32)?;
+    n += vlq::encode_u32(w, (stride * blocks.len()) as u32)?;
+    for data in blocks {
+        n += p::encode_octets(w, data)?;
+    }
+    Ok(n)
+}
 
 impl PValue {
     /// Best-effort `bool` view: `true`/`false` for `Bool`, or non-zero for any integer type.
@@ -346,6 +389,11 @@ impl PValue {
                 n += p::encode_octets(w, data)?;
                 Ok(n)
             }
+            PValue::Array {
+                element_type: dt::STRUCT,
+                items,
+                ..
+            } => serialize_packed_struct_array(w, items),
             PValue::Array { items, .. } => {
                 let mut n = 0;
                 n += vlq::encode_u32(w, items.len() as u32)?;
@@ -378,9 +426,10 @@ impl PValue {
 
     /// Deserialize an array value. Regular and address arrays are a VLQ element count
     /// followed by that many bare element payloads (supported for scalars and `Blob` — the
-    /// latter used by alarm associated-values). Sparse arrays are `(key, value)` pairs. The
-    /// remaining variable-length element types (`WString`/`Struct`/`Variant`/`S7String`) use
-    /// an address-array layout we don't decode yet and error clearly rather than desync.
+    /// latter used by alarm associated-values). Sparse arrays are `(key, value)` pairs. Packed
+    /// `Struct` arrays have their own layout (see `deserialize_packed_struct_array`). The
+    /// remaining variable-length element types (`WString`/`Variant`/`S7String`) use an
+    /// address-array layout we don't decode yet and error clearly rather than desync.
     fn deserialize_array<R: Read>(r: &mut R, flags: u8, datatype: u8) -> Result<PValue> {
         if flags & flags::SPARSE_ARRAY != 0 {
             // Sparse array: (VLQ key, value) entries terminated by a zero key. The value
@@ -398,7 +447,8 @@ impl PValue {
             });
         }
         match datatype {
-            dt::WSTRING | dt::STRUCT | dt::VARIANT | dt::S7STRING => {
+            dt::STRUCT => return Self::deserialize_packed_struct_array(r, flags),
+            dt::WSTRING | dt::VARIANT | dt::S7STRING => {
                 return Err(Error::protocol(format!(
                     "array of variable-length datatype 0x{datatype:02x} not yet supported (flags 0x{flags:02x})"
                 )));
@@ -417,6 +467,48 @@ impl PValue {
         }
         Ok(PValue::Array {
             element_type: datatype,
+            flags,
+            items,
+        })
+    }
+
+    /// Deserialize an array of packed structs (an element, or the whole, of an `Array of UDT` /
+    /// `Array of Struct`). Unlike other arrays it carries no element count: it is a single
+    /// packed-struct header whose two lengths are the element stride and the total byte length,
+    /// followed by the elements' member blocks back to back. Each element becomes a
+    /// [`PValue::PackedStruct`] carrying the shared header.
+    fn deserialize_packed_struct_array<R: Read>(r: &mut R, flags: u8) -> Result<PValue> {
+        let id = p::decode_u32(r)?;
+        if !struct_is_packed(id) {
+            return Err(Error::protocol(format!(
+                "array of non-packed structs not yet supported (id 0x{id:08x}, flags 0x{flags:02x})"
+            )));
+        }
+        let interface_timestamp = p::decode_u64(r)?;
+        let transport_flags = vlq::decode_u32(r)?;
+        let stride = vlq::decode_u32(r)? as usize;
+        let total = if transport_flags & PACKED_STRUCT_COUNT2_PRESENT != 0 {
+            vlq::decode_u32(r)? as usize
+        } else {
+            stride
+        };
+        if (stride == 0 && total != 0) || (stride != 0 && total % stride != 0) {
+            return Err(Error::protocol(format!(
+                "packed struct array: total length {total} is not a multiple of stride {stride}"
+            )));
+        }
+        let data = crate::wire::primitives::decode_octets(r, total)?;
+        let items = data
+            .chunks(stride.max(1))
+            .map(|chunk| PValue::PackedStruct {
+                id,
+                interface_timestamp,
+                transport_flags,
+                data: chunk.to_vec(),
+            })
+            .collect();
+        Ok(PValue::Array {
+            element_type: dt::STRUCT,
             flags,
             items,
         })
@@ -818,5 +910,84 @@ mod tests {
         // Two identical VLQ count bytes (0x04, 0x04) must appear before the 4 data bytes.
         let tail = &out[out.len() - 6..];
         assert_eq!(tail, &[0x04, 0x04, 0x01, 0x02, 0x03, 0x04]);
+    }
+
+    /// The value PLCSIM returned for a whole `Array[0..1] of "UDT.1"` (16-byte elements).
+    fn udt_array_wire() -> Vec<u8> {
+        let mut v = vec![
+            0x10,
+            dt::STRUCT, // flags (array), datatype
+            0x91,
+            0x00,
+            0x00,
+            0x01, // struct id (UDT type, packed range)
+            0x62,
+            0xd7,
+            0x2f,
+            0x46,
+            0x41,
+            0x36,
+            0x6d,
+            0x72, // interface timestamp
+            0x88,
+            0x02, // transport flags 0x402 (Count2Present)
+            0x10,
+            0x20, // stride 16, total 32
+        ];
+        v.extend([0u8; 16]); // element 0
+        v.extend([0, 0, 0, 0, 0, 0x0b, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // element 1: a = 11
+        v
+    }
+
+    #[test]
+    fn packed_struct_array_splits_by_stride_and_roundtrips() {
+        let wire = udt_array_wire();
+        let v = PValue::deserialize(&mut Cursor::new(&wire)).unwrap();
+        let PValue::Array {
+            element_type,
+            items,
+            ..
+        } = &v
+        else {
+            panic!("not an array: {v:?}");
+        };
+        assert_eq!(*element_type, dt::STRUCT);
+        assert_eq!(items.len(), 2);
+        match &items[1] {
+            PValue::PackedStruct { id, data, .. } => {
+                assert_eq!(*id, 0x9100_0001);
+                assert_eq!(data.len(), 16);
+                assert_eq!(&data[4..6], &[0x00, 0x0b]);
+            }
+            other => panic!("not a packed struct: {other:?}"),
+        }
+        let mut out = Vec::new();
+        v.serialize(&mut out).unwrap();
+        assert_eq!(out, wire);
+    }
+
+    #[test]
+    fn packed_struct_array_single_element() {
+        // An indexed element (`arrStruct[1]`): stride == total, one 8-byte element.
+        let mut wire = vec![0x10, dt::STRUCT, 0x92, 0x01, 0x00, 0x04];
+        wire.extend([
+            0x8a, 0x9a, 0x2a, 0x44, 0xa3, 0x9c, 0x79, 0xd9, 0x88, 0x02, 0x08, 0x08,
+        ]);
+        wire.extend([0x3f, 0xa0, 0, 0, 0, 0, 0, 0]);
+        let v = PValue::deserialize(&mut Cursor::new(&wire)).unwrap();
+        match &v {
+            PValue::Array { items, .. } => assert_eq!(items.len(), 1),
+            other => panic!("not an array: {other:?}"),
+        }
+        let mut out = Vec::new();
+        v.serialize(&mut out).unwrap();
+        assert_eq!(out, wire);
+    }
+
+    #[test]
+    fn packed_struct_array_rejects_bad_lengths() {
+        let mut wire = udt_array_wire();
+        wire[17] = 0x1f; // total 31: not a multiple of the 16-byte stride
+        assert!(PValue::deserialize(&mut Cursor::new(&wire)).is_err());
     }
 }

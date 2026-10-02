@@ -1510,10 +1510,11 @@ impl Connection {
                 if oi.has_relation() {
                     addr.lid.push(1);
                 }
-            } else if (oi.is_1dim || oi.is_mdim) && oi.has_relation() {
-                // A bare array-of-struct name without `[..]` (whole-array read) — unsupported.
+            } else if (oi.is_1dim || oi.is_mdim) && oi.has_relation() && i + 1 < levels.len() {
+                // A whole array-of-struct can be read as the leaf, but its members can only be
+                // reached through an element.
                 return Err(Error::protocol(format!(
-                    "whole array-of-struct read of '{name}' not supported; index it"
+                    "'{name}' is an array; index it to reach its members"
                 )));
             }
 
