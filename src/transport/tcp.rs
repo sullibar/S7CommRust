@@ -44,6 +44,10 @@ pub(crate) struct IsoTcp {
     stream: TcpStream,
     /// Largest payload one DT frame may carry: the negotiated TPDU size minus the DT header.
     max_dt_payload: usize,
+    /// Bytes read from the socket but not yet consumed as a whole TPKT frame.
+    rx: Vec<u8>,
+    /// DT fragments of the TSDU being reassembled (no EOT seen yet).
+    tsdu: Vec<u8>,
 }
 
 impl IsoTcp {
@@ -80,6 +84,8 @@ impl IsoTcp {
         let mut this = IsoTcp {
             stream,
             max_dt_payload: PROPOSED_TPDU_SIZE - COTP_DT_HEADER.len(),
+            rx: Vec::new(),
+            tsdu: Vec::new(),
         };
         this.iso_connect(calling_tsap, called_tsap)?;
         Ok(this)
@@ -144,8 +150,11 @@ impl IsoTcp {
     }
 
     /// Receive a complete ISO payload, reassembling COTP DT fragments until EOT.
+    ///
+    /// Resumable: a read timeout keeps the fragments and bytes received so far, and the next call
+    /// continues the same frame. (Losing them would leave the stream out of step, which is what a
+    /// timeout while polling for notifications used to do.)
     pub fn recv_iso_packet(&mut self) -> Result<Vec<u8>> {
-        let mut payload = Vec::new();
         loop {
             let frame = self.recv_tpkt_frame()?;
             // frame layout: [LI][PDU type][...]. For DT: [0x02][0xF0][TPDU-NR+EOT][data..].
@@ -164,32 +173,51 @@ impl IsoTcp {
                 return Err(Error::framing("COTP header length indicator out of range"));
             }
             let eot = frame[2] & 0x80 != 0;
-            payload.extend_from_slice(&frame[data_start..]);
+            self.tsdu.extend_from_slice(&frame[data_start..]);
             if eot {
-                break;
+                return Ok(std::mem::take(&mut self.tsdu));
+            }
+            if self.tsdu.len() > crate::wire::pdu::MAX_TELEGRAM_LEN {
+                return Err(Error::framing("COTP TSDU exceeds the reassembly size cap"));
             }
         }
-        Ok(payload)
     }
 
     /// Read one TPKT frame and return the COTP portion (everything after the 4-byte
     /// TPKT header, starting at the COTP length-indicator byte).
+    ///
+    /// Bytes are read into `rx` and only consumed once the whole frame is there, so a
+    /// read timeout part-way through loses nothing.
     fn recv_tpkt_frame(&mut self) -> Result<Vec<u8>> {
-        let mut header = [0u8; TPKT_HEADER_LEN];
-        self.stream.read_exact(&mut header)?;
-        if header[0] != 0x03 {
-            return Err(Error::framing(format!(
-                "bad TPKT version 0x{:02x}",
-                header[0]
-            )));
+        loop {
+            if let [version, _, hi, lo, ..] = self.rx[..] {
+                if version != 0x03 {
+                    return Err(Error::framing(format!("bad TPKT version 0x{version:02x}")));
+                }
+                let total = usize::from(u16::from_be_bytes([hi, lo]));
+                if total < TPKT_HEADER_LEN {
+                    return Err(Error::framing("TPKT length smaller than header"));
+                }
+                if self.rx.len() >= total {
+                    let frame = self.rx[TPKT_HEADER_LEN..total].to_vec();
+                    self.rx.drain(..total);
+                    return Ok(frame);
+                }
+            }
+            let mut buf = [0u8; 8192];
+            let n = match self.stream.read(&mut buf) {
+                Ok(0) => {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "connection closed by the PLC",
+                    )))
+                }
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            };
+            self.rx.extend_from_slice(&buf[..n]);
         }
-        let total = u16::from_be_bytes([header[2], header[3]]) as usize;
-        if total < TPKT_HEADER_LEN {
-            return Err(Error::framing("TPKT length smaller than header"));
-        }
-        let mut rest = vec![0u8; total - TPKT_HEADER_LEN];
-        self.stream.read_exact(&mut rest)?;
-        Ok(rest)
     }
 }
 
@@ -315,5 +343,51 @@ mod tests {
             plc.join().unwrap(),
             vec![(512, false), (512, false), (3 + 1200 - 2 * 509, true)]
         );
+    }
+
+    /// A fake PLC that accepts one connection, confirms it, and hands the socket to `script`.
+    fn fake_plc(
+        script: impl FnOnce(TcpStream) + Send + 'static,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut cr = [0u8; 36];
+            s.read_exact(&mut cr).unwrap();
+            s.write_all(&[3, 0, 0, 11, 6, 0xd0, 0, 1, 0, 1, 0]).unwrap();
+            script(s);
+        });
+        (addr, handle)
+    }
+
+    #[test]
+    fn a_timeout_mid_frame_resumes_where_it_stopped() {
+        // Two DT fragments of one TSDU; the PLC stalls inside the first frame and between them.
+        let first: Vec<u8> = [&[3, 0, 0, 10, 2, 0xf0, 0x00][..], b"abc"].concat();
+        let second: Vec<u8> = [&[3, 0, 0, 9, 2, 0xf0, 0x80][..], b"de"].concat();
+        let (addr, plc) = fake_plc(move |mut s| {
+            s.write_all(&first[..5]).unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+            s.write_all(&first[5..]).unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+            s.write_all(&second).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let mut tcp = IsoTcp::connect(addr, Duration::from_millis(150)).unwrap();
+        let mut timeouts = 0;
+        let payload = loop {
+            match tcp.recv_iso_packet() {
+                Ok(p) => break p,
+                Err(e) if e.is_timeout() => timeouts += 1,
+                Err(e) => panic!("{e}"),
+            }
+        };
+        assert_eq!(payload, b"abcde");
+        assert!(
+            timeouts >= 2,
+            "expected the stalls to time out, got {timeouts}"
+        );
+        plc.join().unwrap();
     }
 }

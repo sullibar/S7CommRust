@@ -488,7 +488,7 @@ fn subscribe_demo(
         })
         .collect();
 
-    let mut sub = match credit {
+    let sub = match credit {
         Some(c) => conn.subscribe_with(&items, cycle_ms, 0x14, c)?,
         None => conn.subscribe(&items, cycle_ms)?,
     };
@@ -499,7 +499,7 @@ fn subscribe_demo(
         sub.object_id
     );
     for i in 1..=notifs {
-        let n = conn.next_notification(&mut sub)?;
+        let n = conn.next_notification(&sub)?;
         println!(
             "notification #{i}: seq={} credit_tick={} values={} errors={}",
             n.sequence_number,
@@ -528,14 +528,14 @@ fn subscribe_demo(
 /// Subscribe to alarms and poll for `polls` reads, printing any alarm events (coming/going, id,
 /// domain, timestamp). Timeouts (no alarm) are shown but don't abort — alarms are event-driven.
 fn alarms_demo(conn: &mut Connection, polls: usize) -> Result<()> {
-    let mut sub = conn.subscribe_alarms()?;
+    let sub = conn.subscribe_alarms()?;
     println!(
         "alarm subscription created (object 0x{:08x}); polling {polls} time(s) for alarm events...",
         sub.object_id
     );
     let mut total = 0usize;
     for i in 1..=polls {
-        match conn.next_notification(&mut sub) {
+        match conn.next_notification(&sub) {
             Ok(n) => {
                 let alarms = n.alarms();
                 if alarms.is_empty() {

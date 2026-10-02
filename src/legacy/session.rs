@@ -202,34 +202,39 @@ pub fn frame_v3(session_key: &[u8; 24], v2_framed: &[u8]) -> Result<Vec<u8>> {
 /// framing across as many telegrams as it spans, and return a clean single PDU the
 /// `proto::parse_*` helpers accept. A large Explore response arrives as several telegrams whose
 /// `72 03 <len>` chunks concatenate up to the final `72 03 00 00` trailer.
-pub fn recv_and_strip(tcp: &mut IsoTcp) -> Result<Vec<u8>> {
-    let mut data = Vec::new();
+///
+/// `partial` holds the body gathered so far. It survives an error (a read timeout between
+/// telegrams), so the next call resumes the same PDU, and is emptied once the PDU is complete.
+pub fn recv_and_strip(tcp: &mut IsoTcp, partial: &mut Vec<u8>) -> Result<Vec<u8>> {
     let mut version = 0x03u8;
-    let mut telegrams = 0usize;
     loop {
         let telegram = recv_response(tcp)?;
-        telegrams += 1;
-        if accumulate_chunks(&telegram, &mut data, &mut version)? {
+        if accumulate_chunks(&telegram, partial, &mut version)? {
             break; // saw the len==0 trailer → PDU complete
         }
-        if data.len() > crate::wire::pdu::MAX_TELEGRAM_LEN {
+        if partial.len() > crate::wire::pdu::MAX_TELEGRAM_LEN {
             return Err(Error::framing(
                 "legacy telegram exceeds the reassembly size cap",
             ));
         }
     }
-    log::debug!(
-        "legacy: reassembled {} bytes from {telegrams} telegram(s)",
-        data.len()
-    );
+    let data = std::mem::take(partial);
+    log::trace!("legacy: reassembled {} bytes", data.len());
     Ok(crate::wire::pdu::frame_single_pdu(version, &data))
 }
 
-/// Receive the next response, skipping unsolicited SystemEvent (`0xfe`) notifications.
+/// Receive the next response, skipping unsolicited SystemEvent (`0xfe`) keep-alives. A fatal
+/// SystemEvent (one carrying error data) ends the connection, as on the TLS path; it used to be
+/// skipped too, leaving the caller to wait for the read timeout.
 pub(crate) fn recv_response(tcp: &mut IsoTcp) -> Result<Vec<u8>> {
     loop {
         let t = tcp.recv_iso_packet()?;
         if t.get(1) == Some(&0xfe) {
+            if crate::proto::parse_system_event(&t).is_ok_and(|ev| ev.is_fatal()) {
+                return Err(Error::closed(
+                    "PLC sent a fatal SystemEvent; connection must be re-established",
+                ));
+            }
             log::debug!("legacy: skipped SystemEvent ({} bytes)", t.len());
             continue;
         }

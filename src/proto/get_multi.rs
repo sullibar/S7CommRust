@@ -81,6 +81,31 @@ impl GetMultiVariablesResponse {
             .find(|(n, _)| *n == item_no)
             .map(|(_, v)| v)
     }
+
+    /// One entry per requested item, in request order (`count` of them): the value, or the item's
+    /// return value when the PLC reported an error for it (`0` if it reported neither). Linear in
+    /// the response, where calling [`value`](Self::value) for every item is quadratic.
+    pub fn into_items(self, count: usize) -> Vec<std::result::Result<PValue, u64>> {
+        let mut out = vec![Err(0); count];
+        for (item_no, e) in self.errors {
+            if let Some(s) = item_slot(&mut out, item_no) {
+                *s = Err(e);
+            }
+        }
+        for (item_no, v) in self.values {
+            if let Some(s) = item_slot(&mut out, item_no) {
+                *s = Ok(v);
+            }
+        }
+        out
+    }
+}
+
+/// The entry for 1-based `item_no`, if it is in range.
+fn item_slot<T>(items: &mut [T], item_no: u32) -> Option<&mut T> {
+    (item_no as usize)
+        .checked_sub(1)
+        .and_then(|i| items.get_mut(i))
 }
 
 /// Parse a `GetMultiVariablesResponse` telegram.

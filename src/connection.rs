@@ -116,17 +116,17 @@ impl VarInfo {
 }
 
 /// A handle to an active subscription on the PLC. Poll it with [`Connection::next_notification`].
-/// The subscription lives until the connection is dropped.
+/// The subscription lives until [`Connection::delete_subscription`] or the connection is dropped;
+/// the connection tracks its credit, so the handle is a plain id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Subscription {
     /// The subscription object id the PLC allocated.
     pub object_id: u32,
-    /// The configured credit limit (`-1` = unlimited). When finite, [`Connection::next_notification`]
-    /// tops it up automatically before it expires.
-    credit_limit: i16,
-    /// The current credit target (grows on each auto-refresh).
-    next_credit_limit: i16,
 }
+
+/// Most notifications kept for subscriptions that are not being polled right now (see
+/// [`Connection::next_notification`]); past this the oldest is dropped.
+const MAX_QUEUED_NOTIFICATIONS: usize = 4096;
 
 /// Length of a legacy real-PLC public key (the bundled keys and [`Connection::connect_real_plc_with_key`]).
 const REAL_PLC_PUBLIC_KEY_LEN: usize = 40;
@@ -168,9 +168,15 @@ pub struct Connection {
     reconnect_target: ReconnectTarget,
     /// When set, read operations transparently reconnect + retry once on a lost connection.
     auto_reconnect: bool,
-    /// Notification telegrams received while awaiting a response (an active subscription pushes
-    /// them asynchronously); delivered in order by [`Connection::next_notification`].
-    pending_notifications: VecDeque<Vec<u8>>,
+    /// Notification telegrams (with their subscription id) received while waiting for something
+    /// else — a response, or another subscription's notification; delivered in order by
+    /// [`Connection::next_notification`].
+    pending_notifications: VecDeque<(u32, Vec<u8>)>,
+    /// Current credit limit of each finite-credit subscription, topped up as notifications arrive.
+    credit_limits: HashMap<u32, i16>,
+    /// Legacy transport: body of a telegram whose chunks are still arriving (kept across a read
+    /// timeout, like the TLS path's `rbuf`).
+    legacy_partial: Vec<u8>,
     /// Most items the PLC accepts in one GetMultiVariables (`SystemLimits`, read at connect).
     max_read_tags: usize,
     /// Most items the PLC accepts in one SetMultiVariables (`SystemLimits`, read at connect).
@@ -237,6 +243,8 @@ impl Connection {
             reconnect_target: ReconnectTarget::Tls { addrs, timeout },
             auto_reconnect: false,
             pending_notifications: VecDeque::new(),
+            credit_limits: HashMap::new(),
+            legacy_partial: Vec::new(),
             max_read_tags: DEFAULT_TAGS_PER_REQUEST,
             max_write_tags: DEFAULT_TAGS_PER_REQUEST,
         };
@@ -406,6 +414,8 @@ impl Connection {
             reconnect_target,
             auto_reconnect: false,
             pending_notifications: VecDeque::new(),
+            credit_limits: HashMap::new(),
+            legacy_partial: Vec::new(),
             max_read_tags: DEFAULT_TAGS_PER_REQUEST,
             max_write_tags: DEFAULT_TAGS_PER_REQUEST,
         };
@@ -628,7 +638,7 @@ impl Connection {
         addresses: &[ItemAddress],
     ) -> Result<GetMultiVariablesResponse> {
         match self.read_variables_once(addresses) {
-            Err(e) if self.auto_reconnect && e.is_connection_lost() => {
+            Err(_) if self.auto_reconnect && self.poisoned => {
                 self.reconnect()?;
                 self.read_variables_once(addresses)
             }
@@ -756,9 +766,9 @@ impl Connection {
     }
 
     /// Like [`Connection::subscribe`] but with an explicit route mode and credit limit (advanced;
-    /// see the reference route-mode/credit table). A finite credit limit requires topping the
-    /// credit up before it expires, which this driver does not yet automate — prefer the
-    /// unlimited default via [`Connection::subscribe`].
+    /// see the reference route-mode/credit table). With a finite credit limit the PLC stops
+    /// sending once the credit runs out; [`Connection::next_notification`] tops it up
+    /// automatically before that happens.
     pub fn subscribe_with(
         &mut self,
         items: &[proto::SubscriptionItem],
@@ -798,11 +808,15 @@ impl Connection {
             .first()
             .copied()
             .ok_or_else(|| Error::protocol("subscription create returned no object id"))?;
-        Ok(Subscription {
-            object_id,
-            credit_limit,
-            next_credit_limit: credit_limit,
-        })
+        Ok(self.register_subscription(object_id, credit_limit))
+    }
+
+    /// Track a new subscription's credit (only a finite one needs topping up).
+    fn register_subscription(&mut self, object_id: u32, credit_limit: i16) -> Subscription {
+        if credit_limit >= 0 {
+            self.credit_limits.insert(object_id, credit_limit);
+        }
+        Subscription { object_id }
     }
 
     /// Create an **alarm** subscription (program/system alarms). The PLC then pushes alarm
@@ -849,11 +863,7 @@ impl Connection {
             .first()
             .copied()
             .ok_or_else(|| Error::protocol("alarm subscription returned no object id"))?;
-        Ok(Subscription {
-            object_id,
-            credit_limit,
-            next_credit_limit: credit_limit,
-        })
+        Ok(self.register_subscription(object_id, credit_limit))
     }
 
     /// Delete a server object by id (e.g. tear down a subscription, freeing it on the PLC instead
@@ -881,6 +891,10 @@ impl Connection {
                 header.return_value
             )));
         }
+        // If it was a subscription, forget its credit and anything still queued for it.
+        self.credit_limits.remove(&object_id);
+        self.pending_notifications
+            .retain(|(id, _)| *id != object_id);
         Ok(())
     }
 
@@ -890,63 +904,114 @@ impl Connection {
         self.delete_object(sub.object_id)
     }
 
-    /// Block until the PLC pushes the next notification for `sub`, and parse it. Times out per the
-    /// connection's socket read timeout; for a cyclic subscription a notification arrives each
-    /// cycle, so a timeout means the PLC went silent (surfaced as a transport error, poisoning the
-    /// connection).
+    /// Block until the PLC pushes the next notification for `sub`, and parse it. Notifications for
+    /// other subscriptions that arrive meanwhile are kept for their own `next_notification` call
+    /// (or [`Connection::next_any_notification`]).
     ///
-    /// When `sub` was created with a *finite* credit limit, this tops the credit up (a no-response
+    /// Times out per the connection's socket read timeout. A timeout does **not** poison the
+    /// connection — even one in the middle of a telegram, whose bytes are kept for the next call —
+    /// so an event-driven (alarm) subscription can simply poll again. For a cyclic subscription a
+    /// notification arrives each cycle, so a timeout there means the PLC went silent.
+    ///
+    /// For a subscription with a *finite* credit limit this tops the credit up (a no-response
     /// `SetVariable`) before the credit tick reaches the limit, keeping the flow going. With the
-    /// default unlimited credit this is a no-op.
-    pub fn next_notification(&mut self, sub: &mut Subscription) -> Result<proto::Notification> {
+    /// default unlimited credit there is nothing to do.
+    pub fn next_notification(&mut self, sub: &Subscription) -> Result<proto::Notification> {
+        self.next_notification_for(Some(sub.object_id))
+    }
+
+    /// Like [`Connection::next_notification`], but returns the next notification of *any*
+    /// subscription on this connection (see [`proto::Notification::subscription_object_id`]), for
+    /// a single loop serving several subscriptions.
+    pub fn next_any_notification(&mut self) -> Result<proto::Notification> {
+        self.next_notification_for(None)
+    }
+
+    fn next_notification_for(&mut self, want: Option<u32>) -> Result<proto::Notification> {
         if self.poisoned {
             return Err(Error::closed(
                 "connection poisoned by an earlier transport failure; reconnect required",
             ));
         }
-        // Deliver any notifications buffered while awaiting a response before reading the socket.
-        let bytes = if let Some(b) = self.pending_notifications.pop_front() {
-            b
-        } else {
-            match self.recv_notification_telegram() {
-                Ok(b) => b,
-                Err(e) => {
-                    // A plain read timeout (no data yet) leaves the connection usable — don't
-                    // poison it, so event-driven (alarm) subscriptions can just poll again.
-                    if !e.is_timeout() {
-                        self.poisoned = true;
+        let wanted = |id: Option<u32>| want.is_none() || id.is_none() || id == want;
+        // Deliver notifications buffered while awaiting a response before reading the socket.
+        let queued = self
+            .pending_notifications
+            .iter()
+            .position(|(id, _)| wanted(Some(*id)));
+        let bytes = match queued.and_then(|i| self.pending_notifications.remove(i)) {
+            Some((_, bytes)) => bytes,
+            None => loop {
+                let bytes = match self.recv_notification_telegram() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        // The receive path keeps partial telegrams, so a timeout leaves the
+                        // connection usable.
+                        if !e.is_timeout() {
+                            self.poisoned = true;
+                        }
+                        return Err(e);
                     }
-                    return Err(e);
+                };
+                match notification_subscription_id(&bytes) {
+                    Some(id) if !wanted(Some(id)) => self.queue_notification(id, bytes),
+                    _ => break bytes,
                 }
-            }
+            },
         };
         let notif = proto::parse_notification(&bytes)?;
+        self.top_up_credit(&notif)?;
+        Ok(notif)
+    }
 
-        // Finite-credit auto-refresh: raise the limit one tick before it expires.
-        if sub.credit_limit >= 0 && i16::from(notif.credit_tick) >= sub.next_credit_limit - 1 {
-            const STEP: i16 = 5;
-            sub.next_credit_limit = ((sub.next_credit_limit + STEP) % 255).max(STEP);
-            let seq = self.next_sequence_number();
-            let with_integrity = self.with_integrity;
-            let integrity = if with_integrity {
-                self.next_integrity_id(functioncode::SET_VARIABLE)
-            } else {
-                0
-            };
-            let req = proto::subscription::build_credit_limit_request(
-                seq,
-                self.session_id,
-                sub.object_id,
-                with_integrity,
-                integrity,
-                sub.next_credit_limit,
-            )?;
-            if let Err(e) = self.send_no_response(&req) {
-                self.poisoned = true;
-                return Err(e);
+    /// Finite-credit auto-refresh: raise a subscription's credit limit one tick before it expires.
+    fn top_up_credit(&mut self, notif: &proto::Notification) -> Result<()> {
+        let object_id = notif.subscription_object_id;
+        let Some(&limit) = self.credit_limits.get(&object_id) else {
+            return Ok(()); // unlimited credit (or not one of ours)
+        };
+        if i16::from(notif.credit_tick) < limit - 1 {
+            return Ok(());
+        }
+        const STEP: i16 = 5;
+        let next = ((limit + STEP) % 255).max(STEP);
+        self.credit_limits.insert(object_id, next);
+        let seq = self.next_sequence_number();
+        let with_integrity = self.with_integrity;
+        let integrity = if with_integrity {
+            self.next_integrity_id(functioncode::SET_VARIABLE)
+        } else {
+            0
+        };
+        let req = proto::subscription::build_credit_limit_request(
+            seq,
+            self.session_id,
+            object_id,
+            with_integrity,
+            integrity,
+            next,
+        )?;
+        if let Err(e) = self.send_no_response(&req) {
+            self.poisoned = true;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Keep a notification for a later `next_notification` call. The queue is bounded: a
+    /// subscription nobody polls must not grow memory without limit, so past the cap the oldest
+    /// notification is dropped (and logged).
+    fn queue_notification(&mut self, subscription_id: u32, bytes: Vec<u8>) {
+        if self.pending_notifications.len() >= MAX_QUEUED_NOTIFICATIONS {
+            if let Some((id, _)) = self.pending_notifications.pop_front() {
+                log::warn!(
+                    "notification queue full ({MAX_QUEUED_NOTIFICATIONS}); dropped the oldest \
+                     (subscription 0x{id:08x}) — poll every subscription or delete unused ones"
+                );
             }
         }
-        Ok(notif)
+        self.pending_notifications
+            .push_back((subscription_id, bytes));
     }
 
     /// Send a framed request without waiting for a reply (for `0x74` "no response" requests like
@@ -1275,26 +1340,48 @@ impl Connection {
     /// Enumerate every readable leaf variable in the whole PLC program (all data blocks plus the
     /// M/Q/I areas) as a flat [`VarInfo`] list, descending into nested structs/FBs and expanding
     /// arrays (including arrays of structs) to their elements. Bulk-prefetches the type container
-    /// first. Blocks whose interface the PLC withholds (know-how protected) contribute nothing.
+    /// first. Blocks whose interface the PLC withholds (know-how protected) contribute nothing. A lost
+    /// connection is an error rather than a partial list.
     pub fn browse_vars(&mut self) -> Result<Vec<VarInfo>> {
         let dbs = self.datablock_list()?;
-        let _ = self.prefetch_type_container(); // best effort
+        if let Err(e) = self.prefetch_type_container() {
+            self.skip_unless_lost(e, "the type-info prefetch")?; // best effort
+        }
         let mut out = Vec::new();
         for db in dbs {
-            let _ = self.walk_type(
+            let prefix = quote_level(&db.name);
+            let walked = self.walk_type(
                 db.relid,
                 DB_VALUE_ACTUAL,
                 db.ti_relid,
-                &quote_level(&db.name),
+                &prefix,
                 &[],
                 0,
                 &mut out,
             );
+            if let Err(e) = walked {
+                self.skip_unless_lost(e, &prefix)?;
+            }
         }
-        for (rid, ti, _label) in CONTROLLER_AREAS {
-            let _ = self.walk_type(rid, CONTROLLER_AREA_VALUE_ACTUAL, ti, "", &[], 0, &mut out);
+        for (rid, ti, label) in CONTROLLER_AREAS {
+            let walked =
+                self.walk_type(rid, CONTROLLER_AREA_VALUE_ACTUAL, ti, "", &[], 0, &mut out);
+            if let Err(e) = walked {
+                self.skip_unless_lost(e, label)?;
+            }
         }
         Ok(out)
+    }
+
+    /// Browsing skips a part the PLC won't describe (a know-how-protected block, an empty area)
+    /// and goes on — unless the connection is gone, when continuing would only produce a partial
+    /// list that looks complete.
+    fn skip_unless_lost(&self, e: Error, what: &str) -> Result<()> {
+        if self.poisoned {
+            return Err(e);
+        }
+        log::debug!("browse: skipping {what}: {e}");
+        Ok(())
     }
 
     /// Enumerate the readable leaf variables of one data block (name prefixed by the DB name).
@@ -1392,7 +1479,11 @@ impl Connection {
                     if has_rel {
                         elids.push(1); // struct-array: extra id between index and member LID
                         if let Some(rel) = oi.relation_id {
-                            self.walk_type(area, sub_area, rel, &ename, &elids, depth + 1, out)?;
+                            let walked =
+                                self.walk_type(area, sub_area, rel, &ename, &elids, depth + 1, out);
+                            if let Err(e) = walked {
+                                self.skip_unless_lost(e, &ename)?;
+                            }
                         }
                     } else {
                         out.push(VarInfo {
@@ -1408,7 +1499,10 @@ impl Connection {
             } else if has_rel {
                 // Nested struct / FB / system-library type (IEC_TIMER, DTL, …): descend.
                 if let Some(rel) = oi.relation_id {
-                    self.walk_type(area, sub_area, rel, &name, &base, depth + 1, out)?;
+                    let walked = self.walk_type(area, sub_area, rel, &name, &base, depth + 1, out);
+                    if let Err(e) = walked {
+                        self.skip_unless_lost(e, &name)?;
+                    }
                 }
             } else {
                 out.push(VarInfo {
@@ -1460,8 +1554,10 @@ impl Connection {
         let addrs: Vec<ItemAddress> = chunk.iter().map(VarInfo::address).collect();
         match self.read_variables(&addrs) {
             Ok(resp) => {
-                let vals: Vec<Option<PValue>> = (0..chunk.len())
-                    .map(|i| resp.value((i + 1) as u32).cloned())
+                let vals: Vec<Option<PValue>> = resp
+                    .into_items(chunk.len())
+                    .into_iter()
+                    .map(std::result::Result::ok)
                     .collect();
                 if chunk.len() > 1 && vals.iter().all(Option::is_none) {
                     self.split_and_read(chunk, out)
@@ -1472,7 +1568,7 @@ impl Connection {
             }
             // A real transport loss must propagate; a protocol rejection of an over-cap batch is
             // recoverable by splitting. A single item that still fails is recorded as `None`.
-            Err(e) if e.is_connection_lost() => Err(e),
+            Err(e) if self.poisoned => Err(e),
             Err(_) if chunk.len() > 1 => self.split_and_read(chunk, out),
             Err(_) => {
                 out.push(None);
@@ -1543,7 +1639,7 @@ impl Connection {
                     // An area with no tags has no member list; it just can't hold the symbol.
                     let info = match self.type_info(ti) {
                         Ok(info) => info,
-                        Err(e) if e.is_connection_lost() => return Err(e),
+                        Err(e) if self.poisoned => return Err(e),
                         Err(_) => continue,
                     };
                     let present = info
@@ -1664,29 +1760,42 @@ impl Connection {
         self.write_resolved(symbol, addr, value)
     }
 
-    /// Read several tags by name in one `GetMultiVariables` round-trip. Returns one result per
-    /// symbol, in order; a per-item failure is `Err` for that entry (the others still succeed).
-    /// More efficient than repeated [`Connection::read_tag`] for a known set of tags.
+    /// Read several tags by name in one `GetMultiVariables` round-trip (several, past the PLC's
+    /// item limit). Returns one result per symbol, in order; a per-item failure — including a
+    /// symbol that doesn't resolve — is `Err` for that entry, and the others still succeed. Only
+    /// a failed request or a lost connection fails the whole call. More efficient than repeated
+    /// [`Connection::read_tag`] for a known set of tags.
     pub fn read_tags(&mut self, symbols: &[&str]) -> Result<Vec<Result<PValue>>> {
-        let mut addrs = Vec::with_capacity(symbols.len());
+        let mut resolved = Vec::with_capacity(symbols.len());
         for s in symbols {
-            addrs.push(self.resolve_symbol(s)?);
+            match self.resolve_symbol(s) {
+                Ok(addr) => resolved.push(Ok(addr)),
+                Err(e) if self.poisoned => return Err(e),
+                Err(e) => resolved.push(Err(e)),
+            }
         }
-        let resp = self.read_variables(&addrs)?;
-        Ok(symbols
+        let addrs: Vec<ItemAddress> = resolved
             .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                let item = (i + 1) as u32;
-                resp.value(item).cloned().ok_or_else(|| {
-                    let code = resp
-                        .errors
-                        .iter()
-                        .find(|(it, _)| *it == item)
-                        .map(|(_, e)| *e)
-                        .unwrap_or(0);
-                    Error::protocol(format!("read '{s}' failed (return_value=0x{code:016x})"))
-                })
+            .filter_map(|r| r.as_ref().ok().cloned())
+            .collect();
+        let mut items = if addrs.is_empty() {
+            Vec::new().into_iter()
+        } else {
+            self.read_variables(&addrs)?
+                .into_items(addrs.len())
+                .into_iter()
+        };
+        Ok(resolved
+            .into_iter()
+            .zip(symbols)
+            .map(|(addr, s)| {
+                addr?;
+                items
+                    .next()
+                    .expect("one item per resolved symbol")
+                    .map_err(|code| {
+                        Error::protocol(format!("read '{s}' failed (return_value=0x{code:016x})"))
+                    })
             })
             .collect())
     }
@@ -1859,6 +1968,9 @@ impl Connection {
 
     /// Send a framed request telegram and read the next response telegram. Uses TLS, or — for a
     /// legacy connection — the ProtocolVersion-0x03 per-PDU HMAC digest framing over plain COTP.
+    ///
+    /// Any failure poisons the connection (see [`Connection::is_poisoned`]); the error then
+    /// reports a lost connection ([`Error::is_connection_lost`]).
     pub fn request_response(&mut self, framed_request: &[u8]) -> Result<Vec<u8>> {
         if self.poisoned {
             return Err(Error::closed(
@@ -1867,11 +1979,25 @@ impl Connection {
         }
         // Any failure here leaves the sequence/integrity-id counters out of sync with the PLC,
         // so the connection can no longer be reused. Poison it and surface the error.
-        let result = self.request_response_inner(framed_request);
-        if result.is_err() {
+        self.request_response_inner(framed_request).map_err(|e| {
             self.poisoned = true;
-        }
-        result
+            if e.is_timeout() {
+                // The response may still arrive and would then be taken as the answer to the
+                // next request: unlike a quiet notification poll, this is not retryable.
+                Error::closed(format!(
+                    "no response within the timeout ({e}); reconnect required"
+                ))
+            } else {
+                e
+            }
+        })
+    }
+
+    /// Whether an earlier failure left the connection out of step with the PLC. Every request on
+    /// a poisoned connection fails with [`Error::Closed`]; [`Connection::reconnect`] (or a new
+    /// connection) is the only way on.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     fn request_response_inner(&mut self, framed_request: &[u8]) -> Result<Vec<u8>> {
@@ -1887,7 +2013,7 @@ impl Connection {
     /// Receive the next telegram for the active transport (TLS, or legacy V3-digest framing).
     fn recv_one_telegram(&mut self) -> Result<Vec<u8>> {
         if self.legacy_session_key.is_some() {
-            crate::legacy::session::recv_and_strip(&mut self.tcp)
+            crate::legacy::session::recv_and_strip(&mut self.tcp, &mut self.legacy_partial)
         } else {
             self.recv_telegram()
         }
@@ -1901,7 +2027,7 @@ impl Connection {
         }
         let ev = proto::parse_system_event(bytes)?;
         if ev.is_fatal() {
-            return Err(Error::protocol(
+            return Err(Error::closed(
                 "PLC sent a fatal SystemEvent; connection must be re-established",
             ));
         }
@@ -1921,8 +2047,8 @@ impl Connection {
             if self.skip_if_system_event(&bytes)? {
                 continue;
             }
-            if is_notification_telegram(&bytes) {
-                self.pending_notifications.push_back(bytes);
+            if let Some(id) = notification_subscription_id(&bytes) {
+                self.queue_notification(id, bytes);
                 continue;
             }
             return Ok(bytes);
@@ -1944,36 +2070,30 @@ impl Connection {
     /// multi-chunk framing (each chunk a `72 ver len` header; the telegram ends at the
     /// `72 ver 00 00` trailer). Returns the telegram re-wrapped as a single framed PDU so
     /// the `proto::parse_*` helpers can consume it directly.
+    ///
+    /// Nothing is consumed from `rbuf` until the whole telegram is there, so a read timeout
+    /// part-way through keeps every byte for the next call.
     fn recv_telegram(&mut self) -> Result<Vec<u8>> {
-        let mut data = Vec::new();
-        let version: u8;
         loop {
-            self.fill(4)?;
-            let header = self.take(4);
-            if header[0] != pdu::PROTOCOL_ID {
-                return Err(Error::protocol(format!(
-                    "bad S7CommPlus chunk header byte 0x{:02x}",
-                    header[0]
-                )));
+            if let Some((version, end, body_len)) = scan_telegram(&self.rbuf[self.rpos..])? {
+                let raw = &self.rbuf[self.rpos..self.rpos + end];
+                let mut data = Vec::with_capacity(body_len);
+                let mut i = 0;
+                while i + 4 < end {
+                    let len = usize::from(u16::from_be_bytes([raw[i + 2], raw[i + 3]]));
+                    data.extend_from_slice(&raw[i + 4..i + 4 + len]);
+                    i += 4 + len;
+                }
+                self.rpos += end;
+                if self.rpos == self.rbuf.len() {
+                    self.rbuf.clear();
+                    self.rpos = 0;
+                } else if self.rpos > self.rbuf.len() / 2 {
+                    self.rbuf.drain(..self.rpos);
+                    self.rpos = 0;
+                }
+                return Ok(pdu::frame_single_pdu(version, &data));
             }
-            let len = u16::from_be_bytes([header[2], header[3]]) as usize;
-            if len == 0 {
-                version = header[1]; // trailer => end of telegram
-                break;
-            }
-            if data.len() + len > pdu::MAX_TELEGRAM_LEN {
-                return Err(Error::framing("telegram exceeds the reassembly size cap"));
-            }
-            self.fill(len)?;
-            let chunk = self.take(len);
-            data.extend_from_slice(&chunk);
-        }
-        Ok(pdu::frame_single_pdu(version, &data))
-    }
-
-    /// Ensure at least `n` unconsumed bytes are buffered, pumping the TLS channel as needed.
-    fn fill(&mut self, n: usize) -> Result<()> {
-        while self.rbuf.len() - self.rpos < n {
             let chunk = self
                 .tls
                 .as_mut()
@@ -1984,30 +2104,47 @@ impl Connection {
             }
             self.rbuf.extend_from_slice(&chunk);
         }
-        Ok(())
-    }
-
-    /// Remove and return the next `n` buffered bytes (caller must have `fill`ed first). Advances a
-    /// read cursor instead of shifting the buffer; the buffer is cleared once fully consumed, so a
-    /// large multi-chunk telegram is deframed in O(size) rather than O(size²).
-    fn take(&mut self, n: usize) -> Vec<u8> {
-        let out = self.rbuf[self.rpos..self.rpos + n].to_vec();
-        self.rpos += n;
-        if self.rpos == self.rbuf.len() {
-            self.rbuf.clear();
-            self.rpos = 0;
-        }
-        out
     }
 }
 
-/// True if a framed telegram's opcode is a `Notification` (`0x33`).
-fn is_notification_telegram(buf: &[u8]) -> bool {
-    pdu::parse_header(buf)
-        .ok()
-        .and_then(|h| buf.get(h.body_offset).copied())
-        .map(|op| op == pdu::opcode::NOTIFICATION)
-        .unwrap_or(false)
+/// Find a complete telegram at the start of `buf`: `(trailer version, length including the
+/// trailer, total body length)`, or `None` if more bytes are needed. Only reads `buf`, so the
+/// caller can retry after the next read.
+fn scan_telegram(buf: &[u8]) -> Result<Option<(u8, usize, usize)>> {
+    let mut i = 0;
+    let mut body_len = 0;
+    while let Some(&[id, version, hi, lo]) = buf.get(i..i + 4) {
+        if id != pdu::PROTOCOL_ID {
+            return Err(Error::framing(format!(
+                "bad S7CommPlus chunk header byte 0x{id:02x}"
+            )));
+        }
+        let len = usize::from(u16::from_be_bytes([hi, lo]));
+        if len == 0 {
+            return Ok(Some((version, i + 4, body_len))); // trailer => end of telegram
+        }
+        body_len += len;
+        if body_len > pdu::MAX_TELEGRAM_LEN {
+            return Err(Error::framing("telegram exceeds the reassembly size cap"));
+        }
+        i += 4 + len;
+    }
+    Ok(None)
+}
+
+/// The subscription a framed telegram notifies about, if it is a `Notification` (`0x33`). A
+/// notification too short to carry the id reads as subscription 0 (and fails to parse later),
+/// so it is never mistaken for a response.
+fn notification_subscription_id(buf: &[u8]) -> Option<u32> {
+    let h = pdu::parse_header(buf).ok()?;
+    let body = buf.get(h.body_offset..)?;
+    if body.first() != Some(&pdu::opcode::NOTIFICATION) {
+        return None;
+    }
+    Some(
+        body.get(1..5)
+            .map_or(0, |id| u32::from_be_bytes(id.try_into().expect("4 bytes"))),
+    )
 }
 
 /// Split a symbol path into its levels, each a name plus any array indices:
@@ -2333,5 +2470,210 @@ mod tests {
                 ("[11,2]".into(), 3),
             ]
         );
+    }
+
+    /// A stand-in for a legacy (V3-digest) PLC on loopback. The client doesn't verify response
+    /// digests, so the mock frames replies with a zero digest and needs no crypto.
+    struct MockPlc {
+        stream: std::net::TcpStream,
+    }
+
+    impl MockPlc {
+        /// Read one request TSDU and return its V2 body (the `data` of the V3 frame).
+        fn recv_request(&mut self) -> Vec<u8> {
+            use std::io::Read;
+            let mut tsdu = Vec::new();
+            loop {
+                let mut hdr = [0u8; 4];
+                self.stream.read_exact(&mut hdr).unwrap();
+                let len = usize::from(u16::from_be_bytes([hdr[2], hdr[3]]));
+                let mut rest = vec![0u8; len - 4];
+                self.stream.read_exact(&mut rest).unwrap();
+                tsdu.extend_from_slice(&rest[3..]);
+                if rest[2] & 0x80 != 0 {
+                    break;
+                }
+            }
+            tsdu[4 + 33..tsdu.len() - 4].to_vec()
+        }
+
+        /// The V3 telegram carrying `body`, as one COTP DT frame.
+        fn frame(body: &[u8]) -> Vec<u8> {
+            let mut v3 = vec![0x72, 0x03];
+            v3.extend_from_slice(&((1 + 32 + body.len()) as u16).to_be_bytes());
+            v3.push(0x20);
+            v3.extend_from_slice(&[0u8; 32]);
+            v3.extend_from_slice(body);
+            v3.extend_from_slice(&[0x72, 0x03, 0, 0]);
+            let mut f = vec![3, 0];
+            f.extend_from_slice(&((7 + v3.len()) as u16).to_be_bytes());
+            f.extend_from_slice(&[2, 0xf0, 0x80]);
+            f.extend_from_slice(&v3);
+            f
+        }
+
+        fn send(&mut self, body: &[u8]) {
+            use std::io::Write;
+            self.stream.write_all(&Self::frame(body)).unwrap();
+        }
+
+        /// Answer the GetMultiVariables the client sends at connect for the request limits.
+        fn answer_limits(&mut self, max: i32) {
+            let req = self.recv_request();
+            assert_eq!(&req[3..5], &functioncode::GET_MULTI_VARIABLES.to_be_bytes());
+            let mut body = vec![pdu::opcode::RESPONSE, 0, 0];
+            body.extend_from_slice(&functioncode::GET_MULTI_VARIABLES.to_be_bytes());
+            body.extend_from_slice(&[0, 0, 0, 1, 0, 0]); // reserved, seq, flags, rv 0
+            for item in [1u8, 2] {
+                body.push(item);
+                PValue::DInt(max).serialize(&mut body).unwrap();
+            }
+            body.extend_from_slice(&[0, 0, 0]); // end of values, end of errors, integrity id
+            self.send(&body);
+        }
+    }
+
+    /// A notification telegram body for `subscription` with `credit_tick` and one DInt value.
+    fn notification(subscription: u32, credit_tick: u8) -> Vec<u8> {
+        let mut b = vec![pdu::opcode::NOTIFICATION];
+        b.extend_from_slice(&subscription.to_be_bytes());
+        b.extend_from_slice(&[0, 0, 0, 0, 0, 0, credit_tick, 1, 1]);
+        b.extend_from_slice(&[0x9b, 0x01]);
+        PValue::DInt(subscription as i32).serialize(&mut b).unwrap();
+        b.push(0);
+        b
+    }
+
+    /// A legacy `Connection` to a mock PLC that runs `script` after answering the limits read.
+    fn mock_connection(
+        timeout: Duration,
+        script: impl FnOnce(MockPlc) + Send + 'static,
+    ) -> (Connection, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let plc = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut cr = [0u8; 36];
+            stream.read_exact(&mut cr).unwrap();
+            stream
+                .write_all(&[3, 0, 0, 11, 6, 0xd0, 0, 1, 0, 1, 0])
+                .unwrap();
+            let mut plc = MockPlc { stream };
+            plc.answer_limits(100);
+            script(plc);
+        });
+        let tcp = IsoTcp::connect(addr, timeout).unwrap();
+        let target = ReconnectTarget::LegacyPlcsim {
+            addrs: vec![addr],
+            timeout,
+        };
+        let conn =
+            Connection::new_legacy(tcp, [0u8; 24], 0x7000_0001, 0x7000_0002, target).unwrap();
+        (conn, plc)
+    }
+
+    #[test]
+    fn connect_reads_the_request_limits() {
+        let (conn, plc) = mock_connection(Duration::from_secs(5), |_| {});
+        assert_eq!(conn.max_tags_per_read(), 100);
+        assert_eq!(conn.max_tags_per_write(), 100);
+        plc.join().unwrap();
+    }
+
+    #[test]
+    fn notifications_are_routed_to_their_subscription() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            plc.send(&notification(0xa, 0));
+            plc.send(&notification(0xb, 0));
+            plc.send(&notification(0xa, 0));
+        });
+        let a = Subscription { object_id: 0xa };
+        let b = Subscription { object_id: 0xb };
+        // B's notification is behind one of A's; A's is kept for its own call.
+        let first = conn.next_notification(&b).unwrap();
+        assert_eq!(first.subscription_object_id, 0xb);
+        let second = conn.next_notification(&a).unwrap();
+        assert_eq!(second.subscription_object_id, 0xa);
+        let third = conn.next_any_notification().unwrap();
+        assert_eq!(third.subscription_object_id, 0xa);
+        plc.join().unwrap();
+    }
+
+    #[test]
+    fn credit_is_topped_up_for_the_subscription_that_needs_it() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            // Unlimited B at a high tick needs nothing; finite A one tick before its limit does.
+            plc.send(&notification(0xb, 200));
+            plc.send(&notification(0xa, 9));
+            let req = plc.recv_request();
+            assert_eq!(&req[3..5], &functioncode::SET_VARIABLE.to_be_bytes());
+            assert_eq!(&req[14..18], &0xau32.to_be_bytes(), "top-up must target A");
+        });
+        let a = conn.register_subscription(0xa, 10);
+        let b = conn.register_subscription(0xb, -1);
+        conn.next_notification(&b).unwrap();
+        conn.next_notification(&a).unwrap();
+        assert_eq!(conn.credit_limits.get(&0xa), Some(&15));
+        plc.join().unwrap();
+    }
+
+    #[test]
+    fn a_request_timeout_poisons_the_connection() {
+        let (mut conn, plc) = mock_connection(Duration::from_millis(200), |mut plc| {
+            plc.recv_request(); // never answered
+            std::thread::sleep(Duration::from_millis(500));
+        });
+        let addr = ItemAddress {
+            symbol_crc: 0,
+            access_area: 1,
+            access_sub_area: 2,
+            lid: vec![3],
+        };
+        let e = conn.read_variables(std::slice::from_ref(&addr)).unwrap_err();
+        // A late response would be taken as the answer to the next request: not retryable.
+        assert!(!e.is_timeout(), "{e}");
+        assert!(e.is_connection_lost(), "{e}");
+        assert!(conn.is_poisoned());
+        assert!(matches!(
+            conn.read_variables(&[addr]),
+            Err(Error::Closed(_))
+        ));
+        plc.join().unwrap();
+    }
+
+    #[test]
+    fn a_notification_timeout_mid_telegram_resumes() {
+        let (mut conn, plc) = mock_connection(Duration::from_millis(150), |mut plc| {
+            use std::io::Write;
+            let frame = MockPlc::frame(&notification(0xa, 0));
+            plc.stream.write_all(&frame[..20]).unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+            plc.stream.write_all(&frame[20..]).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let a = Subscription { object_id: 0xa };
+        let e = conn.next_notification(&a).unwrap_err();
+        assert!(e.is_timeout(), "{e}");
+        assert!(!conn.is_poisoned());
+        let n = loop {
+            match conn.next_notification(&a) {
+                Ok(n) => break n,
+                Err(e) if e.is_timeout() => continue,
+                Err(e) => panic!("{e}"),
+            }
+        };
+        assert_eq!(n.values, vec![(1, PValue::DInt(0xa))]);
+        plc.join().unwrap();
+    }
+
+    #[test]
+    fn scan_telegram_waits_for_the_trailer() {
+        let t = [0x72, 2, 0, 2, 9, 9, 0x72, 2, 0, 1, 8, 0x72, 2, 0, 0];
+        for cut in 0..t.len() {
+            assert_eq!(scan_telegram(&t[..cut]).unwrap(), None, "cut {cut}");
+        }
+        assert_eq!(scan_telegram(&t).unwrap(), Some((2, t.len(), 3)));
+        assert!(scan_telegram(&[0x55, 2, 0, 0]).is_err());
     }
 }
