@@ -524,6 +524,24 @@ impl Connection {
         Ok(())
     }
 
+    /// End the session cleanly, as the reference driver's `Disconnect` does: delete the server
+    /// session object, so the PLC frees it (and its subscriptions) at once rather than when it
+    /// notices the closed socket, then close TLS and the socket. Dropping a `Connection` closes
+    /// the socket too, just without telling the PLC first. On a poisoned connection there is
+    /// nothing sensible left to say, so this only closes the socket.
+    pub fn close(mut self) -> Result<()> {
+        if self.poisoned {
+            return Ok(());
+        }
+        let deleted = self.delete_object(self.session_id);
+        if let Some(tls) = self.tls.as_mut() {
+            if !self.poisoned {
+                let _ = tls.close(&mut self.tcp); // best effort; the socket closes regardless
+            }
+        }
+        deleted
+    }
+
     /// Enable/disable transparent auto-reconnect for **read** operations (default off). When on, a
     /// read that fails with a lost connection reconnects (see [`Connection::reconnect`]) and retries
     /// once. Writes and subscriptions are never auto-retried — a write may already have been applied,

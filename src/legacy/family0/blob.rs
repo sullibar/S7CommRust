@@ -10,8 +10,8 @@
 //!
 //! The full blob is 180 bytes, laid out as `metadata(48)`, `seed(60)`, `IV(16)`,
 //! `enc-challenge(16)`, `enc-key2(16+8)`, `checksum(16)`. This module covers the metadata
-//! header (validated now) and the [`PublicKeyFamily`] flag table; the 60-byte EC seed and
-//! the AES/checksum encryption chain land once the curve layer is up.
+//! header and the [`PublicKeyFamily`] flag table; the 60-byte EC seed is built in
+//! [`super::seed`] and the encryption chain in [`super::auth`].
 //!
 //! Unlike the PLCSIM path ([`crate::legacy::blob`]), the metadata's symmetric key-id is
 //! derived from **key2** (not key1), and the family flags encode S7-1500 (`00:`) vs

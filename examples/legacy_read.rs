@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //! Read tags from a legacy (pre-TLS) PLC via the high-level `Connection` API.
 //!
-//! `S7_PLC_IP=192.168.0.1 cargo run -p s7commplus --example legacy_read`
+//! `S7_PLC_IP=192.168.0.1 cargo run -p s7commplus --example legacy_read` (`S7_PLC_PORT` and
+//! `S7_TAGS="a;b"` are optional).
 
 use std::time::Duration;
 
@@ -14,7 +15,11 @@ fn main() {
         std::process::exit(2);
     });
 
-    let mut conn = match Connection::connect_legacy((ip.as_str(), 102), Duration::from_secs(10)) {
+    let port: u16 = std::env::var("S7_PLC_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(102);
+    let mut conn = match Connection::connect_legacy((ip.as_str(), port), Duration::from_secs(10)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("legacy connect failed: {e}");
@@ -37,10 +42,11 @@ fn main() {
         Err(e) => println!("datablock_list error: {e}"),
     }
 
-    // Read the requested tags (overridable via S7_TAGS="a,b,c").
+    // Read the requested tags (overridable via S7_TAGS="a;b;c" — semicolons, since an
+    // M-dim index like `arr[0,3]` contains a comma).
     let tags =
-        std::env::var("S7_TAGS").unwrap_or_else(|_| "Data_block_1.toto,Data_block_1.titi".into());
-    for tag in tags.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        std::env::var("S7_TAGS").unwrap_or_else(|_| "Data_block_1.toto;Data_block_1.titi".into());
+    for tag in tags.split(';').map(str::trim).filter(|s| !s.is_empty()) {
         match conn.read_tag(tag) {
             Ok(v) => println!("{tag} = {v:?}"),
             Err(e) => println!("{tag} -> ERROR: {e}"),

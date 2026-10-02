@@ -111,12 +111,13 @@ fn run(cfg: Config) -> Result<()> {
     let mut conn = if cfg.real_plc {
         // S7_REAL_PLC_KEY=<hex 40-byte pubkey> forces an explicit key (for a PLC whose key
         // isn't in the bundled store); otherwise the key is auto-selected by fingerprint.
-        match std::env::var("S7_REAL_PLC_KEY").ok().map(|h| {
-            (0..h.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap())
-                .collect::<Vec<u8>>()
-        }) {
+        let key = match std::env::var("S7_REAL_PLC_KEY") {
+            Ok(hex) => Some(
+                parse_hex(&hex).map_err(|e| Error::Protocol(format!("S7_REAL_PLC_KEY: {e}")))?,
+            ),
+            Err(_) => None,
+        };
+        match key {
             Some(key) => {
                 Connection::connect_real_plc_with_key((cfg.ip.as_str(), cfg.port), timeout, &key)?
             }
@@ -130,10 +131,56 @@ fn run(cfg: Config) -> Result<()> {
     println!("connected — session_id = 0x{:08x}", conn.session_id());
 
     if cfg.command.is_empty() {
-        repl(&mut conn)
+        repl(&mut conn)?;
     } else {
-        dispatch(&mut conn, &cfg.command)
+        dispatch(&mut conn, &cfg.command)?;
     }
+    // End the session cleanly, so the PLC frees it right away.
+    conn.close()
+}
+
+/// Decode a hex string (a public key from the environment).
+fn parse_hex(hex: &str) -> std::result::Result<Vec<u8>, String> {
+    let hex = hex.trim();
+    if hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "expected an even number of hex digits, got {hex:?}"
+        ));
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|e| e.to_string()))
+        .collect()
+}
+
+/// Split a REPL line on whitespace, except inside double quotes, since TIA names such as
+/// `"My DB".x` may contain spaces. The quotes stay in the token: they are part of the symbol
+/// syntax (see [`unquote`] for plain arguments).
+fn split_line(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token: Option<String> = None;
+    let mut quoted = false;
+    for c in line.chars() {
+        if c.is_whitespace() && !quoted {
+            tokens.extend(token.take());
+            continue;
+        }
+        if c == '"' {
+            quoted = !quoted;
+        }
+        token.get_or_insert_with(String::new).push(c);
+    }
+    tokens.extend(token);
+    tokens
+}
+
+/// A plain argument without its surrounding quotes, so `legit "" pw` passes an empty user and
+/// `legit admin "two words"` a password with a space.
+fn unquote(arg: &str) -> &str {
+    arg.strip_prefix('"')
+        .and_then(|a| a.strip_suffix('"'))
+        .filter(|inner| !inner.contains('"'))
+        .unwrap_or(arg)
 }
 
 /// Read commands from stdin until EOF or `quit`, dispatching each. A failed command prints
@@ -150,7 +197,7 @@ fn repl(conn: &mut Connection) -> Result<()> {
             println!();
             break; // EOF (Ctrl-D / Ctrl-Z)
         }
-        let parts: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+        let parts = split_line(&line);
         match parts.first().map(String::as_str) {
             None => continue,
             Some("quit" | "exit" | "q") => break,
@@ -329,7 +376,7 @@ fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
                 );
                 return Ok(());
             }
-            conn.legitimate(&cmd[1], &cmd[2])?;
+            conn.legitimate(unquote(&cmd[1]), unquote(&cmd[2]))?;
             println!("legitimation accepted.");
             Ok(())
         }
@@ -798,8 +845,12 @@ fn print_usage() {
          CONNECTION (flags must precede the command):\n\
          \x20   -i, --ip <addr>     PLC address           (or env S7_PLC_IP)\n\
          \x20   -p, --port <n>      ISO-on-TCP port, def 102 (or env S7_PLC_PORT)\n\
-         \x20   -l, --legacy        use the legacy non-TLS transport (S7-1500 FW < 2.9,\n\
-         \x20                       TIA V16 and older)     (or env S7_LEGACY)\n\
+         \x20   -l, --legacy        legacy non-TLS transport, PLCSIM key family (03:),\n\
+         \x20                       e.g. PLCSIM Advanced FW < 2.9    (or env S7_LEGACY)\n\
+         \x20       --real-plc      legacy non-TLS transport for a physical S7-1200/1500 on\n\
+         \x20                       older firmware (00:/01:); the key is picked by its\n\
+         \x20                       fingerprint, or S7_REAL_PLC_KEY=<80 hex digits>\n\
+         \x20                       sets it                           (or env S7_REAL_PLC)\n\
          \n\
          With no COMMAND, s7tool connects and opens an interactive prompt.\n"
     );
@@ -814,7 +865,6 @@ fn print_usage() {
     );
 }
 
-/// Command list (stdout; shown for the `help` command inside the REPL).
 /// Inflate a compressed metadata blob (attr 2449 IdentES / 2546 LineComments) to its XML text.
 /// These carry a 4-byte dictionary-version prefix before the zlib stream on this firmware, but
 /// not universally — try `start_offset = 4` first, then fall back to 0.
@@ -826,6 +876,7 @@ fn inflate_metadata_blob(data: &[u8]) -> Result<String> {
     String::from_utf8(out).map_err(|e| Error::Protocol(format!("blob is not UTF-8: {e}")))
 }
 
+/// Command list (stdout; shown for the `help` command inside the REPL).
 fn print_help() {
     print!("{}", help_body());
 }
@@ -837,10 +888,42 @@ fn help_body() -> &'static str {
      \x20   read <sym>...       read one or more tags by symbol name\n\
      \x20   write <sym> <val>   write a tag (parsed per the tag's declared type)\n\
      \x20   level               show the effective protection level\n\
-     \x20   legit <user> <pw>   authenticate (legitimation; experimental)\n\
+     \x20   legit <user> <pw>   authenticate (legitimation); empty user: legit \"\" <pw>\n\
      \x20   xidents <relid>     decompress a DB's identity/comment XML (attr 2449/2546)\n\
      \x20   sub [n] [ms] [k] [c]  subscribe to n tags; print k notifications every ms (opt credit c)\n\
      \x20   alarms [polls]      subscribe to program/system alarms and poll for events\n\
      \x20   help                show this help\n\
      \x20   quit                exit (interactive mode)\n"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_line_keeps_quoted_names_whole() {
+        assert_eq!(
+            split_line("read \"My DB\".x  plain.y\n"),
+            ["read", "\"My DB\".x", "plain.y"]
+        );
+        assert_eq!(split_line("legit \"\" pw"), ["legit", "\"\"", "pw"]);
+        assert_eq!(split_line("   "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn unquote_strips_only_whole_token_quotes() {
+        assert_eq!(unquote("\"\""), "");
+        assert_eq!(unquote("\"two words\""), "two words");
+        assert_eq!(unquote("\"DB\".x"), "\"DB\".x");
+        assert_eq!(unquote("\"a\".\"b\""), "\"a\".\"b\"");
+        assert_eq!(unquote("plain"), "plain");
+    }
+
+    #[test]
+    fn parse_hex_rejects_bad_input_instead_of_panicking() {
+        assert_eq!(parse_hex("0aFF").unwrap(), vec![0x0a, 0xff]);
+        assert!(parse_hex("abc").is_err()); // odd length
+        assert!(parse_hex("zz").is_err());
+        assert!(parse_hex("é0").is_err()); // non-ASCII used to panic slicing a char
+    }
 }

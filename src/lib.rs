@@ -38,6 +38,7 @@
 //!
 //! - **Connect** — [`Connection::connect`] (TLS) or [`Connection::connect_legacy`]
 //!   (older firmware); the TLS handshake, session, and setup are handled internally.
+//!   [`Connection::close`] ends the session; after a failure, [`Connection::reconnect`].
 //! - **Browse** — [`Connection::datablock_list`], [`Connection::explore`], and
 //!   [`Connection::type_info`] walk the symbolic address space.
 //! - **Read / write tags by name** — [`Connection::read_tag`] /

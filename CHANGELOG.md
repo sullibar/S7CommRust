@@ -21,8 +21,35 @@ All notable changes to this project are documented here. The format is based on
   a usable challenge (PLCSIM Advanced FW V2.8 accepted every such challenge in live tests).
   Together with the previous entry, the crate source shrinks from about 99,000 to about 15,500
   lines.
+- `next_notification` takes `&Subscription` (passing `&mut sub` still compiles) and returns only
+  that subscription's notifications; others are kept for their own call or for the new
+  `next_any_notification`. The connection tracks each subscription's finite credit itself.
+- A request whose response doesn't arrive within the timeout now fails with `Error::Closed`: the
+  connection is out of step (a late response would answer the next request). `Error::is_timeout`
+  is now only returned by notification polls, which stay retryable. Framing errors and fatal
+  SystemEvents count as lost connections (`Error::is_connection_lost`), and a truncated or
+  malformed response is a protocol error rather than `Io(UnexpectedEof)`.
+- `ResponseHeader::is_ok` also treats a negative error code in the low 16 bits as a failure, as
+  `legitimate` already did (the reference treats any non-zero value as an error there).
+- `read_tags` returns an `Err` entry for a symbol that doesn't resolve instead of failing the
+  whole call.
+- Discovering the data blocks reads every block's type-info id in one batched request instead of
+  one round trip per block; resolved symbols are cached, so a repeated `read_tag` / `write_tag`
+  of a name skips the type-info walk; cached type info is shared instead of deep-copied per
+  lookup. A cached type-info object no longer carries its nested objects (each is cached under
+  its own relid).
 
 ### Added
+
+- The PLC's per-request item limits are read at connect (`max_tags_per_read` /
+  `max_tags_per_write`), and `read_variables` / `write_variables` — so also `read_tags` /
+  `write_tags` — split larger requests to fit.
+- `Connection::close` ends the session cleanly, deleting the server session (as the reference
+  driver's `Disconnect` does) and closing TLS.
+- `Connection::next_any_notification`, `is_poisoned` and `clear_caches`;
+  `proto::return_value_is_ok`; `GetMultiVariablesResponse::into_items`.
+- s7tool documents `--real-plc`, accepts quoted REPL arguments (`read "My DB".x`,
+  `legit "" <password>`), and closes the session on exit.
 
 - `Connection::read_wstring` / `write_wstring` for `WSTRING` tags, which read back as a UInt
   array `[max_len, actual_len, UTF-16 code units…]`, and a public `value::strings` module with
@@ -67,6 +94,37 @@ All notable changes to this project are documented here. The format is based on
   now taken from the current value's header.
 - s7tool no longer shows every USInt array as a `String` (a `Date_And_Time` displayed as
   `"\u{1}"`, for example).
+- A malformed response could abort the whole process. Deeply nested structs or objects
+  overflowed the stack, and array counts and lengths from the wire were allocated before
+  reading (a 7-byte array header asked for 171 GB). Nesting is now limited to 32 levels,
+  allocation follows the bytes that actually arrive, and reassembly is capped at 64 MiB. Panics
+  on malformed input are fixed too: a legacy chunk shorter than its digest, a truncated legacy
+  auth reply, a huge precision in an alarm text, a 64-bit value formatted as `TIME` /
+  `TIME_OF_DAY`, and a real-PLC public key that isn't 40 bytes.
+- Legacy connections no longer drop on requests over ~1 KB (reading more than ~80 tags at once,
+  or subscribing to many): the fix for TLS above didn't cover them. Every request is now
+  segmented to the COTP TPDU size the PLC confirms.
+- Reading more than the PLC's limit of tags per request (100 on PLCSIM) no longer returns an
+  empty response that looks successful.
+- A timeout while waiting for a notification no longer leaves the connection out of step when it
+  strikes in the middle of a telegram (e.g. while polling for alarms); the partial telegram is
+  kept and the next call resumes it.
+- `browse_vars` no longer returns a partial list as success after the connection drops, and a
+  know-how-protected nested block no longer hides the rest of its data block.
+- With several subscriptions (say, data and alarms), notifications no longer go to the wrong
+  one, and a finite credit limit no longer stalls.
+- Legacy connections report a fatal SystemEvent instead of waiting for the timeout.
+- Telegrams reassembled to more than 64 KiB (a large notification) parse completely.
+- One of the 19 preset dictionaries had a mistyped id copied from upstream (`0xfd9ac74` for
+  `0xfd69ac74`), so blobs compressed with it could not be inflated.
+- An unparseable array index (`DB.arr[x]`, `DB.arr[]`, `DB.arr[1`) is an error instead of
+  silently addressing the whole array.
+- Writing an array whose items don't match its element type (an `Int` in a `DInt` array) is
+  rejected instead of sending bytes that decode as a different value.
+- `WString` values with an invalid UTF-8 byte decode lossily (as in the reference) instead of
+  failing the whole response; `STRING` / `WSTRING` decoding clamps the actual length to the
+  maximum length.
+- s7tool no longer panics on a malformed `S7_REAL_PLC_KEY`.
 
 ## [0.1.0] - 2026-07-05
 
@@ -91,5 +149,6 @@ proprietary Siemens S7CommPlus protocol (S7-1200 / S7-1500).
   S7 date/time decoding, and optimized (zlib preset-dictionary) type-metadata blob inflate.
 - A `s7tool` CLI (browse/read/write by symbol) and an `export_csv` example (bulk browse → CSV).
 
+[Unreleased]: https://github.com/sullibar/S7CommRust/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/sullibar/S7CommRust/releases/tag/v0.1.0
 [`value::PValue`]: https://docs.rs/s7commplus/latest/s7commplus/value/enum.PValue.html

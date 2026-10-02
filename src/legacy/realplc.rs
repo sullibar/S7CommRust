@@ -14,10 +14,9 @@
 //! are the [`crate::legacy::family0`] crypto and the S7-1500/1200 request templates below.
 //!
 //! **Status:** the crypto + the request assembly are validated offline (byte-exact vs the
-//! `AuthenticateRealPlc` golden vectors and the reference request template), and the *live*
-//! handshake — auth plus symbolic browse — has been validated against physical S7-1200/1500
-//! hardware over the `00:`/`01:` public-key families. Only the optimized-blob DB layouts
-//! remain outstanding for real-hardware coverage.
+//! `AuthenticateRealPlc` golden vectors and the reference request template). The *live*
+//! handshake has not yet been tested against physical S7-1200/1500 hardware — no `00:`/`01:`
+//! unit has been available; only the PLCSIM (`03:`) legacy path is live-validated.
 
 use crate::error::{Error, Result};
 use crate::legacy::blob::derive_key_id;

@@ -2,8 +2,8 @@
 // Copyright (C) 2026 s7commplus-rs contributors
 //
 // Golden-vector tests over the public API. Byte vectors here are derived from the
-// reference protocol layout; expand this corpus with captures from the C# driver as
-// higher layers land (byte-exact protocol reproduction is the key risk).
+// reference protocol layout; expand this corpus with captures from the C# driver or a PLC
+// (byte-exact protocol reproduction is the key risk). Malformed input is in malformed.rs.
 
 use hex_literal::hex;
 
