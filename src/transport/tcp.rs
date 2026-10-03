@@ -68,10 +68,14 @@ impl IsoTcp {
         for sa in addr.to_socket_addrs()? {
             match TcpStream::connect_timeout(&sa, timeout) {
                 Ok(s) => {
+                    log::debug!("TCP connected to {sa}");
                     stream = Some(s);
                     break;
                 }
-                Err(e) => last_err = Some(e.into()),
+                Err(e) => {
+                    log::debug!("TCP connect to {sa} failed: {e}");
+                    last_err = Some(e.into());
+                }
             }
         }
         let stream = stream.ok_or_else(|| {

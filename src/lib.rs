@@ -83,3 +83,6 @@ pub use proto::{
     Alarm, AlarmState, AlarmText, Area, AssociatedValue, Notification, SubscriptionItem,
     SystemEvent,
 };
+
+/// This crate's version, for logs and bug reports.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

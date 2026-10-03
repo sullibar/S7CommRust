@@ -108,6 +108,23 @@ impl TlsChannel {
         Ok(())
     }
 
+    /// The negotiated protocol version, cipher suite and the PLC certificate's fingerprint, for logs.
+    pub fn describe(&self) -> String {
+        let fingerprint = self
+            .peer_certificate_sha256()
+            .map(|fp| fp.iter().map(|b| format!("{b:02x}")).collect::<String>())
+            .unwrap_or_else(|| "none".into());
+        let version = self
+            .conn
+            .protocol_version()
+            .map_or("?".into(), |v| format!("{v:?}"));
+        let suite = self
+            .conn
+            .negotiated_cipher_suite()
+            .map_or("?".into(), |s| format!("{:?}", s.suite()));
+        format!("{version}, {suite}, PLC certificate SHA-256 {fingerprint}")
+    }
+
     /// SHA-256 fingerprint of the certificate the PLC presented, once the handshake has run.
     pub fn peer_certificate_sha256(&self) -> Option<[u8; 32]> {
         self.conn

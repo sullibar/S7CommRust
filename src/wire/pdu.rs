@@ -242,9 +242,88 @@ pub fn parse_header(buf: &[u8]) -> crate::Result<PduHeader> {
     }
 }
 
+/// `(opcode, function code, sequence number)` from the header of a framed request or response
+/// (body bytes 0, 3..5 and 7..9), or `None` if it is too short to have one.
+pub(crate) fn header_fields(buf: &[u8]) -> Option<(u8, u16, u16)> {
+    let h = parse_header(buf).ok()?;
+    let b = buf.get(h.body_offset..h.body_offset + 9)?;
+    Some((
+        b[0],
+        u16::from_be_bytes([b[3], b[4]]),
+        u16::from_be_bytes([b[7], b[8]]),
+    ))
+}
+
+/// The name of a function code, for logs.
+pub fn function_name(code: u16) -> &'static str {
+    match code {
+        functioncode::EXPLORE => "Explore",
+        functioncode::CREATE_OBJECT => "CreateObject",
+        functioncode::DELETE_OBJECT => "DeleteObject",
+        functioncode::SET_VARIABLE => "SetVariable",
+        functioncode::GET_VARIABLE => "GetVariable",
+        functioncode::SET_MULTI_VARIABLES => "SetMultiVariables",
+        functioncode::GET_MULTI_VARIABLES => "GetMultiVariables",
+        functioncode::GET_VAR_SUBSTREAMED => "GetVarSubstreamed",
+        functioncode::SET_VAR_SUBSTREAMED => "SetVarSubstreamed",
+        functioncode::INIT_SSL => "InitSsl",
+        functioncode::ERROR => "Error",
+        _ => "unknown function",
+    }
+}
+
+/// Most bytes [`Hex`] shows; a reassembled Explore can run to hundreds of kilobytes.
+const HEX_DUMP_MAX: usize = 64 * 1024;
+
+/// Bytes as space-separated hex for logs, cut off after [`HEX_DUMP_MAX`] bytes. Formatting is
+/// lazy, so a `log::trace!("{}", Hex(..))` costs nothing while trace logging is off.
+pub(crate) struct Hex<'a>(pub &'a [u8]);
+
+impl std::fmt::Display for Hex<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let shown = &self.0[..self.0.len().min(HEX_DUMP_MAX)];
+        for (i, b) in shown.iter().enumerate() {
+            if i > 0 {
+                f.write_str(" ")?;
+            }
+            write!(f, "{b:02x}")?;
+        }
+        if shown.len() < self.0.len() {
+            write!(f, " … ({} more bytes)", self.0.len() - shown.len())?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hex_dumps_are_capped() {
+        assert_eq!(Hex(&[0x72, 0x02, 0xab]).to_string(), "72 02 ab");
+        assert_eq!(Hex(&[]).to_string(), "");
+        let long = vec![0u8; HEX_DUMP_MAX + 3];
+        assert!(Hex(&long).to_string().ends_with("00 … (3 more bytes)"));
+    }
+
+    #[test]
+    fn header_fields_and_names() {
+        let telegram = frame_single_pdu(
+            protocol_version::V2,
+            &[opcode::REQUEST, 0, 0, 0x05, 0x4c, 0, 0, 0, 7, 0, 0],
+        );
+        assert_eq!(
+            header_fields(&telegram),
+            Some((opcode::REQUEST, functioncode::GET_MULTI_VARIABLES, 7))
+        );
+        assert_eq!(header_fields(&telegram[..8]), None);
+        assert_eq!(
+            function_name(functioncode::GET_MULTI_VARIABLES),
+            "GetMultiVariables"
+        );
+        assert_eq!(function_name(0xffff), "unknown function");
+    }
 
     #[test]
     fn split_framed_pdu_keeps_small_telegrams_whole() {
