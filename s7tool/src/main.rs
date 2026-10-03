@@ -19,7 +19,9 @@ use std::time::Duration;
 
 use s7commplus::value::datatype::softdatatype as sdt;
 use s7commplus::value::{datetime, strings, PValue};
-use s7commplus::{Alarm, Area, Connection, CpuState, Error, Result, SubscriptionItem, VarInfo};
+use s7commplus::{
+    Alarm, Area, AssociatedValue, Connection, CpuState, Error, Result, SubscriptionItem, VarInfo,
+};
 
 const PROMPT: &str = "s7> ";
 
@@ -644,24 +646,23 @@ fn alarms_demo(conn: &mut Connection, polls: usize) -> Result<()> {
 
 /// Print one alarm event: its state and ids, its message text, and its associated values.
 fn print_alarm(a: &Alarm) {
-    let name = if a.type_name.is_empty() {
-        String::new()
-    } else {
-        format!(" [{}]", a.type_name)
-    };
+    // (`type_name` is a transient object name, such as `TempDai_1`, not the alarm's.)
     println!(
-        "  ALARM {:?} id=0x{:016x} domain={} msgtype={} seq={} @ {}{name}",
+        "  ALARM {:?} id=0x{:016x} domain={} msgtype={} seq={} @ {}",
         a.state, a.cpu_alarm_id, a.alarm_domain, a.message_type, a.sequence_counter, a.timestamp
     );
-    // Render the message text (prefer en-US = 1033, else the first language sent).
+    // Render the message text (prefer en-US = 1033, else the first language sent). A PLC sends a
+    // single space for an alarm without text.
     let text = a
         .message(1033)
         .or_else(|| a.texts.first().and_then(|t| a.message(t.language_id)));
-    if let Some(msg) = text.filter(|m| !m.is_empty()) {
+    if let Some(msg) = text.filter(|m| !m.trim().is_empty()) {
         println!("      text: {msg}");
     }
     for (i, v) in a.associated_values.iter().enumerate() {
-        println!("      SD_{} = {v}", i + 1);
+        if *v != AssociatedValue::Unused {
+            println!("      SD_{} = {v}", i + 1);
+        }
     }
 }
 

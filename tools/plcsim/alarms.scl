@@ -1,0 +1,41 @@
+FUNCTION_BLOCK "AlarmFB"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+   VAR_INPUT 
+      trig : Bool;
+      val : Int;
+   END_VAR
+
+   VAR 
+      alarm : Program_Alarm;
+   END_VAR
+
+BEGIN
+	#alarm(SIG := #trig, SD_1 := #val);
+END_FUNCTION_BLOCK
+
+DATA_BLOCK "AlarmDB"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+NON_RETAIN
+   VAR 
+      trig : Bool;
+      val : Int;
+   END_VAR
+
+BEGIN
+   val := 42;
+END_DATA_BLOCK
+
+DATA_BLOCK "AlarmFB_DB" "AlarmFB"
+BEGIN
+END_DATA_BLOCK
+
+ORGANIZATION_BLOCK "Main"
+TITLE = "Main Program Sweep (Cycle)"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+
+BEGIN
+	"AlarmFB_DB"(trig := "AlarmDB".trig, val := "AlarmDB".val);
+END_ORGANIZATION_BLOCK
