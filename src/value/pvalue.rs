@@ -16,10 +16,11 @@
 //! fixed-width and VLQ encodings (e.g. `UInt`/`Word` are fixed `u16`, but `UDInt` is a
 //! VLQ, while `DWord` is fixed `u32`).
 //!
-//! Scalar types, `Timestamp`/`Timespan`, `Blob`, `WString`, non-packed `Struct`, packed
-//! `Struct` (raw payload), and the array shapes (regular/address/sparse of scalar elements)
-//! are implemented and byte-tested. The remaining types — `Variant`, `S7String`, and arrays
-//! of variable-length element types — surface a clear error rather than silently mis-encoding.
+//! Scalar types, `Timestamp`/`Timespan`, `Blob` (including the typed forms with a root id
+//! above 1), `WString`, non-packed `Struct`, packed `Struct` (raw payload), and the array shapes
+//! (regular/address/sparse of scalar and `WString` elements, address arrays of non-packed
+//! structs) are implemented and byte-tested. The remaining types — `Variant`, `S7String`, and
+//! arrays of those — surface a clear error rather than silently mis-encoding.
 //! (`Variant` and `S7String` are `NotImplementedException` in the upstream C# reference too,
 //! so there is no wire format to port faithfully; they stay explicit errors by design.)
 //!
@@ -82,11 +83,25 @@ pub enum PValue {
     /// Timespan — signed VLQ `i64` (a duration in nanoseconds).
     Timespan(i64),
     /// Blob — a root id plus raw bytes.
+    ///
+    /// A root id above 1 marks the typed form (alarm associated values use a type-info id): on
+    /// the wire 8 reserved bytes and a blob type (`0x02`/`0x03`) sit between the root id and the
+    /// length. They are not kept, so such a blob decodes but does not serialize (the reference
+    /// never writes the typed form either).
     Blob {
         /// Type root id identifying the blob's schema.
         root_id: u32,
         /// Raw blob bytes.
         data: Vec<u8>,
+    },
+    /// A blob whose content is an ID/value list instead of bytes: a root id above 1, 8 reserved
+    /// (zero) bytes and blob type `0x00`, then `(element_id, value)` members as in a
+    /// [`PValue::Struct`]. The device tree (Explore of rid `0x22`) carries these.
+    BlobStruct {
+        /// Type root id identifying the blob's schema (always above 1).
+        root_id: u32,
+        /// Ordered `(element_id, value)` members.
+        elements: Vec<(u32, PValue)>,
     },
     /// Struct — a struct id and ordered `(element_id, value)` members (non-packed form).
     Struct {
@@ -94,6 +109,15 @@ pub enum PValue {
         id: u32,
         /// Ordered `(element_id, value)` members.
         elements: Vec<(u32, PValue)>,
+    },
+    /// An address array of non-packed structs: one struct id for every element, then each
+    /// element's `(element_id, value)` members. (Arrays of packed structs are
+    /// [`PValue::Array`]s of [`PValue::PackedStruct`].)
+    StructArray {
+        /// Struct type id shared by the elements (kept even when there are none).
+        id: u32,
+        /// Each element's ordered `(element_id, value)` members.
+        items: Vec<Vec<(u32, PValue)>>,
     },
     /// Packed (optimized) struct. The struct id falls in the packed ranges (see the
     /// `struct_is_packed` predicate); the member area is a raw byte block whose field offsets are
@@ -148,12 +172,22 @@ fn struct_is_packed(id: u32) -> bool {
 /// structs they are the element stride and the total byte length.
 const PACKED_STRUCT_COUNT2_PRESENT: u32 = 1 << 10;
 
+/// Blob types that follow a root id above 1 (with 8 reserved bytes in between): an ID/value list
+/// ([`PValue::BlobStruct`]), or a length and bytes as in the plain form (two values, no known
+/// difference). Wireshark's S7comm-plus dissector decodes all three; the reference only the latter.
+const BLOB_TYPE_VALUE_LIST: u8 = 0x00;
+const BLOB_TYPE_BYTES: u8 = 0x02;
+const BLOB_TYPE_BYTES_ALT: u8 = 0x03;
+
 /// An array element is written as a bare payload, so it must be a scalar of the array's declared
 /// element type: an `Int` in a `DInt` array would encode bytes that decode as something else.
 fn check_element(element_type: u8, item: &PValue) -> Result<()> {
     let nested = matches!(
         item,
-        PValue::Array { .. } | PValue::SparseArray { .. } | PValue::USIntArray(_)
+        PValue::Array { .. }
+            | PValue::SparseArray { .. }
+            | PValue::USIntArray(_)
+            | PValue::StructArray { .. }
     );
     if nested || item.datatype() != element_type {
         return Err(Error::protocol(format!(
@@ -202,6 +236,18 @@ fn serialize_packed_struct_array<W: Write>(w: &mut W, items: &[PValue]) -> Resul
     for data in blocks {
         n += p::encode_octets(w, data)?;
     }
+    Ok(n)
+}
+
+/// `(VLQ element id, value)` members, then the zero-id terminator: the body of a non-packed
+/// `Struct`, of a `BlobStruct`, and of each `StructArray` element.
+fn serialize_members<W: Write>(w: &mut W, elements: &[(u32, PValue)]) -> Result<usize> {
+    let mut n = 0;
+    for (key, value) in elements {
+        n += vlq::encode_u32(w, *key)?;
+        n += value.serialize(w)?;
+    }
+    n += p::encode_u8(w, 0x00)?; // terminator
     Ok(n)
 }
 
@@ -304,8 +350,8 @@ impl PValue {
             PValue::AID(_) => dt::AID,
             PValue::Timestamp(_) => dt::TIMESTAMP,
             PValue::Timespan(_) => dt::TIMESPAN,
-            PValue::Blob { .. } => dt::BLOB,
-            PValue::Struct { .. } => dt::STRUCT,
+            PValue::Blob { .. } | PValue::BlobStruct { .. } => dt::BLOB,
+            PValue::Struct { .. } | PValue::StructArray { .. } => dt::STRUCT,
             PValue::PackedStruct { .. } => dt::STRUCT,
             PValue::WString(_) => dt::WSTRING,
             PValue::USIntArray(_) => dt::USINT,
@@ -320,6 +366,7 @@ impl PValue {
             PValue::USIntArray(_) => flags::ARRAY,
             PValue::Array { flags, .. } => *flags,
             PValue::SparseArray { .. } => flags::SPARSE_ARRAY,
+            PValue::StructArray { .. } => flags::ADDRESS_ARRAY,
             _ => 0x00,
         }
     }
@@ -358,10 +405,30 @@ impl PValue {
             PValue::Timestamp(v) => p::encode_u64(w, *v),
             PValue::Timespan(v) => vlq::encode_i64(w, *v),
             PValue::Blob { root_id, data } => {
+                if *root_id > 1 {
+                    // The typed form's blob type (0x02 or 0x03) isn't kept, so it can't be
+                    // reproduced; no request carries such a blob.
+                    return Err(Error::protocol(format!(
+                        "blob with root id {root_id} (typed form) serialization not supported"
+                    )));
+                }
                 let mut n = 0;
                 n += vlq::encode_u32(w, *root_id)?;
                 n += vlq::encode_u32(w, data.len() as u32)?;
                 n += p::encode_octets(w, data)?;
+                Ok(n)
+            }
+            PValue::BlobStruct { root_id, elements } => {
+                if *root_id <= 1 {
+                    return Err(Error::protocol(format!(
+                        "BlobStruct needs a root id above 1 (got {root_id})"
+                    )));
+                }
+                let mut n = 0;
+                n += vlq::encode_u32(w, *root_id)?;
+                n += p::encode_u64(w, 0)?; // reserved
+                n += p::encode_u8(w, BLOB_TYPE_VALUE_LIST)?;
+                n += serialize_members(w, elements)?;
                 Ok(n)
             }
             PValue::Struct { id, elements } => {
@@ -372,11 +439,21 @@ impl PValue {
                 }
                 let mut n = 0;
                 n += p::encode_u32(w, *id)?; // struct id (fixed-width)
-                for (key, value) in elements {
-                    n += vlq::encode_u32(w, *key)?;
-                    n += value.serialize(w)?;
+                n += serialize_members(w, elements)?;
+                Ok(n)
+            }
+            PValue::StructArray { id, items } => {
+                if struct_is_packed(*id) {
+                    return Err(Error::protocol(format!(
+                        "StructArray needs a non-packed struct id (got 0x{id:08x})"
+                    )));
                 }
-                n += p::encode_u8(w, 0x00)?; // terminator
+                let mut n = 0;
+                n += p::encode_u32(w, *id)?; // struct id (fixed-width)
+                n += vlq::encode_u32(w, items.len() as u32)?;
+                for elements in items {
+                    n += serialize_members(w, elements)?;
+                }
                 Ok(n)
             }
             PValue::PackedStruct {
@@ -476,11 +553,11 @@ impl PValue {
     }
 
     /// Deserialize an array value. Regular and address arrays are a VLQ element count
-    /// followed by that many bare element payloads (supported for scalars and `Blob` — the
-    /// latter used by alarm associated-values). Sparse arrays are `(key, value)` pairs. Packed
-    /// `Struct` arrays have their own layout (see `deserialize_packed_struct_array`). The
-    /// remaining variable-length element types (`WString`/`Variant`/`S7String`) use an
-    /// address-array layout we don't decode yet and error clearly rather than desync.
+    /// followed by that many bare element payloads (supported for scalars, `Blob` — used by
+    /// alarm associated-values — and `WString`). Sparse arrays are `(key, value)` pairs. `Struct`
+    /// arrays have their own layouts (see `deserialize_struct_array`). The remaining
+    /// variable-length element types (`Variant`/`S7String`) use a layout we don't decode yet
+    /// and error clearly rather than desync.
     fn deserialize_array<R: Read>(
         r: &mut R,
         flags: u8,
@@ -503,8 +580,8 @@ impl PValue {
             });
         }
         match datatype {
-            dt::STRUCT => return Self::deserialize_packed_struct_array(r, flags),
-            dt::WSTRING | dt::VARIANT | dt::S7STRING => {
+            dt::STRUCT => return Self::deserialize_struct_array(r, flags, depth),
+            dt::VARIANT | dt::S7STRING => {
                 return Err(Error::protocol(format!(
                     "array of variable-length datatype 0x{datatype:02x} not yet supported (flags 0x{flags:02x})"
                 )));
@@ -534,18 +611,37 @@ impl PValue {
         })
     }
 
-    /// Deserialize an array of packed structs (an element, or the whole, of an `Array of UDT` /
-    /// `Array of Struct`). Unlike other arrays it carries no element count: it is a single
-    /// packed-struct header whose two lengths are the element stride and the total byte length,
-    /// followed by the elements' member blocks back to back. Each element becomes a
-    /// [`PValue::PackedStruct`] carrying the shared header.
-    fn deserialize_packed_struct_array<R: Read>(r: &mut R, flags: u8) -> Result<PValue> {
+    /// Deserialize an array of structs, which starts with the struct id. Packed structs: see
+    /// `deserialize_packed_struct_array`. An address array of non-packed structs is an element
+    /// count, then each element's members as in a `Struct` ([`PValue::StructArray`]); the
+    /// reference leaves arrays of structs unimplemented, this is the layout Wireshark's
+    /// S7comm-plus dissector decodes. Other arrays of non-packed structs are rejected.
+    fn deserialize_struct_array<R: Read>(r: &mut R, flags: u8, depth: usize) -> Result<PValue> {
         let id = p::decode_u32(r)?;
-        if !struct_is_packed(id) {
+        if struct_is_packed(id) {
+            return Self::deserialize_packed_struct_array(r, id, flags);
+        }
+        if flags != flags::ADDRESS_ARRAY {
             return Err(Error::protocol(format!(
                 "array of non-packed structs not yet supported (id 0x{id:08x}, flags 0x{flags:02x})"
             )));
         }
+        let count = vlq::decode_u32(r)? as usize;
+        // Every element ends in a terminator byte, so a bogus count fails at the end of the
+        // telegram; only the pre-allocation needs a cap.
+        let mut items = Vec::with_capacity(count.min(1024));
+        for _ in 0..count {
+            items.push(Self::deserialize_members(r, depth)?);
+        }
+        Ok(PValue::StructArray { id, items })
+    }
+
+    /// Deserialize an array of packed structs (an element, or the whole, of an `Array of UDT` /
+    /// `Array of Struct`) after its struct `id`. Unlike other arrays it carries no element count:
+    /// it is a single packed-struct header whose two lengths are the element stride and the total
+    /// byte length, followed by the elements' member blocks back to back. Each element becomes a
+    /// [`PValue::PackedStruct`] carrying the shared header.
+    fn deserialize_packed_struct_array<R: Read>(r: &mut R, id: u32, flags: u8) -> Result<PValue> {
         let interface_timestamp = p::decode_u64(r)?;
         let transport_flags = vlq::decode_u32(r)?;
         let stride = vlq::decode_u32(r)? as usize;
@@ -598,12 +694,7 @@ impl PValue {
             dt::AID => PValue::AID(vlq::decode_u32(r)?),
             dt::TIMESTAMP => PValue::Timestamp(p::decode_u64(r)?),
             dt::TIMESPAN => PValue::Timespan(vlq::decode_i64(r)?),
-            dt::BLOB => {
-                let root_id = vlq::decode_u32(r)?;
-                let len = vlq::decode_u32(r)? as usize;
-                let data = crate::wire::primitives::decode_octets(r, len)?;
-                PValue::Blob { root_id, data }
-            }
+            dt::BLOB => Self::deserialize_blob(r, depth)?,
             dt::WSTRING => {
                 let len = vlq::decode_u32(r)? as usize;
                 let bytes = crate::wire::primitives::decode_octets(r, len)?;
@@ -643,6 +734,40 @@ impl PValue {
                 data,
             });
         }
+        let elements = Self::deserialize_members(r, depth)?;
+        Ok(PValue::Struct { id, elements })
+    }
+
+    /// Deserialize a `Blob` payload (mirrors `ValueBlob.Deserialize`). A root id above 1 is
+    /// followed by 8 reserved bytes (zero in every capture; ignored, as in the reference) and a
+    /// blob type: `0x02`/`0x03` continue like the plain form (length, bytes), `0x00` with an
+    /// ID/value list ([`PValue::BlobStruct`]), which the reference leaves unimplemented.
+    fn deserialize_blob<R: Read>(r: &mut R, depth: usize) -> Result<PValue> {
+        let root_id = vlq::decode_u32(r)?;
+        if root_id > 1 {
+            p::decode_u64(r)?; // reserved
+            match p::decode_u8(r)? {
+                BLOB_TYPE_VALUE_LIST => {
+                    let elements = Self::deserialize_members(r, depth)?;
+                    return Ok(PValue::BlobStruct { root_id, elements });
+                }
+                BLOB_TYPE_BYTES | BLOB_TYPE_BYTES_ALT => {}
+                other => {
+                    return Err(Error::protocol(format!(
+                        "unknown blob type 0x{other:02x} (root id {root_id})"
+                    )))
+                }
+            }
+        }
+        let len = vlq::decode_u32(r)? as usize;
+        let data = crate::wire::primitives::decode_octets(r, len)?;
+        Ok(PValue::Blob { root_id, data })
+    }
+
+    /// Deserialize `(VLQ key, value)` members up to the zero-key terminator: the body of a
+    /// non-packed `Struct`, of a `BlobStruct`, and of each `StructArray` element. The members
+    /// nest one level deeper than their container.
+    fn deserialize_members<R: Read>(r: &mut R, depth: usize) -> Result<Vec<(u32, PValue)>> {
         let mut elements = Vec::new();
         let mut key = vlq::decode_u32(r)?;
         while key != 0 {
@@ -650,7 +775,7 @@ impl PValue {
             elements.push((key, value));
             key = vlq::decode_u32(r)?;
         }
-        Ok(PValue::Struct { id, elements })
+        Ok(elements)
     }
 }
 
@@ -766,10 +891,209 @@ mod tests {
 
     #[test]
     fn variable_length_arrays_rejected_for_now() {
-        // WString arrays use an address-array layout we don't decode yet — must error,
-        // not silently desync.
-        let buf = [flags::ADDRESS_ARRAY, dt::WSTRING, 0x01];
-        assert!(PValue::deserialize(&mut Cursor::new(buf)).is_err());
+        // Variant / S7String arrays use a layout we don't decode yet — must error, not
+        // silently desync.
+        for datatype in [dt::VARIANT, dt::S7STRING] {
+            let buf = [flags::ADDRESS_ARRAY, datatype, 0x01, 0x00, 0x00];
+            assert!(PValue::deserialize(&mut Cursor::new(buf)).is_err());
+        }
+    }
+
+    #[test]
+    fn wstring_address_array_golden() {
+        // Captured live (PLCSIM Advanced FW 2.8, release-management root, attribute 8342): count
+        // VLQ, then each string's byte length and UTF-8 bytes, as in the reference
+        // `ValueWStringArray`.
+        let mut buf = vec![flags::ADDRESS_ARRAY, dt::WSTRING, 0x03];
+        for s in ["V21.0.0.0", "21.0.0.0", "S7Legacy"] {
+            buf.push(s.len() as u8);
+            buf.extend_from_slice(s.as_bytes());
+        }
+        let v = PValue::deserialize(&mut Cursor::new(&buf)).unwrap();
+        assert_eq!(
+            v,
+            PValue::Array {
+                element_type: dt::WSTRING,
+                flags: flags::ADDRESS_ARRAY,
+                items: vec![
+                    PValue::WString("V21.0.0.0".into()),
+                    PValue::WString("21.0.0.0".into()),
+                    PValue::WString("S7Legacy".into()),
+                ],
+            }
+        );
+        let mut out = Vec::new();
+        v.serialize(&mut out).unwrap();
+        assert_eq!(out, buf);
+    }
+
+    #[test]
+    fn struct_address_array_roundtrips() {
+        // Struct id (fixed u32), element count VLQ, then each element's members and terminator.
+        let buf = [
+            flags::ADDRESS_ARRAY,
+            dt::STRUCT,
+            0x00,
+            0x00,
+            0x1e,
+            0x2e, // struct id 0x1e2e
+            0x02, // two elements
+            0x01,
+            0x00,
+            dt::UDINT,
+            0x05, // element 1: key 1, UDInt(5)
+            0x00, // end of element 1
+            0x00, // element 2: no members
+        ];
+        let v = PValue::deserialize(&mut Cursor::new(buf)).unwrap();
+        assert_eq!(
+            v,
+            PValue::StructArray {
+                id: 0x1e2e,
+                items: vec![vec![(1, PValue::UDInt(5))], vec![]],
+            }
+        );
+        let mut out = Vec::new();
+        v.serialize(&mut out).unwrap();
+        assert_eq!(out, buf);
+
+        // Captured live (PLCSIM Advanced FW 2.8, attribute 4568): an empty one keeps its id.
+        let empty = [
+            flags::ADDRESS_ARRAY,
+            dt::STRUCT,
+            0x00,
+            0x00,
+            0x1e,
+            0x2e,
+            0x00,
+        ];
+        let v = PValue::deserialize(&mut Cursor::new(empty)).unwrap();
+        assert_eq!(
+            v,
+            PValue::StructArray {
+                id: 0x1e2e,
+                items: vec![],
+            }
+        );
+        let mut out = Vec::new();
+        v.serialize(&mut out).unwrap();
+        assert_eq!(out, empty);
+
+        // Only the address-array layout of non-packed structs is known.
+        let regular = [flags::ARRAY, dt::STRUCT, 0x00, 0x00, 0x1e, 0x2e, 0x00];
+        assert!(PValue::deserialize(&mut Cursor::new(regular)).is_err());
+    }
+
+    #[test]
+    fn blob_struct_roundtrips() {
+        // Captured live (PLCSIM Advanced FW 2.8, device tree, attribute 8081; the 84 bytes of
+        // member 1850 shortened): root id 1848, 8 reserved bytes, blob type 0, then members.
+        let buf = [
+            0x00,
+            dt::BLOB,
+            0x8e,
+            0x38, // root id 1848
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00, // reserved
+            0x00, // blob type: ID/value list
+            0x8e,
+            0x39,
+            0x00,
+            dt::BLOB,
+            0x00,
+            0x00, // 1849: empty Blob
+            0x8e,
+            0x3a,
+            0x00,
+            dt::BLOB,
+            0x00,
+            0x02,
+            0xab,
+            0xcd, // 1850: Blob [ab cd]
+            0x00, // terminator
+        ];
+        let v = PValue::deserialize(&mut Cursor::new(buf)).unwrap();
+        assert_eq!(
+            v,
+            PValue::BlobStruct {
+                root_id: 1848,
+                elements: vec![
+                    (
+                        1849,
+                        PValue::Blob {
+                            root_id: 0,
+                            data: vec![]
+                        }
+                    ),
+                    (
+                        1850,
+                        PValue::Blob {
+                            root_id: 0,
+                            data: vec![0xab, 0xcd]
+                        }
+                    ),
+                ],
+            }
+        );
+        let mut out = Vec::new();
+        v.serialize(&mut out).unwrap();
+        assert_eq!(out, buf);
+
+        let low_root = PValue::BlobStruct {
+            root_id: 1,
+            elements: vec![],
+        };
+        assert!(low_root.serialize(&mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn typed_blob_decodes() {
+        // A root id above 1 carries 8 reserved bytes and a blob type before the length; types
+        // 0x02 and 0x03 hold bytes (alarm associated values: root id = type-info id).
+        for blob_type in [0x02, 0x03] {
+            let buf = [
+                0x00,
+                dt::BLOB,
+                0x90,
+                0x80,
+                0x80,
+                0x05, // root id 0x02000005
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00, // reserved
+                blob_type,
+                0x02,
+                0x00,
+                0x05, // length 2, bytes
+            ];
+            assert_eq!(
+                PValue::deserialize(&mut Cursor::new(buf)).unwrap(),
+                PValue::Blob {
+                    root_id: 0x0200_0005,
+                    data: vec![0x00, 0x05]
+                }
+            );
+        }
+        // An unknown blob type is an error, not a guess.
+        let unknown = [0x00, dt::BLOB, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x00];
+        assert!(PValue::deserialize(&mut Cursor::new(unknown)).is_err());
+        // The blob type isn't kept, so the typed form can't be written back.
+        let typed = PValue::Blob {
+            root_id: 2,
+            data: vec![1],
+        };
+        assert!(typed.serialize(&mut Vec::new()).is_err());
     }
 
     #[test]

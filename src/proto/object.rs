@@ -7,12 +7,13 @@
 //!
 //! Objects are a tag-delimited (TLV-ish) structure: an object opens with
 //! [`element_id::START_OF_OBJECT`], carries a fixed header (relation id, class id, class
-//! flags, attribute id), then a sequence of attributes (each a [`PValue`]), nested
-//! objects, and relations, and closes with [`element_id::TERMINATING_OBJECT`].
+//! flags, attribute id, and — only when the attribute id is non-zero — attribute id flags),
+//! then a sequence of attributes (each a [`PValue`]), nested objects, and relations, and
+//! closes with [`element_id::TERMINATING_OBJECT`].
 //!
-//! Serialization is a faithful port of `PObject.Serialize`. Deserialization of arbitrary
-//! response objects is not yet implemented (responses we currently need — e.g.
-//! CreateObject — expose what we want via their object-id list before the object body).
+//! Serialization is a port of `PObject.Serialize` and [`decode_object`] of `S7p.DecodeObject`,
+//! both plus the attribute id flags, which the reference doesn't handle (Wireshark's
+//! S7comm-plus dissector does; the device tree uses them).
 
 use std::io::{Cursor, Write};
 
@@ -43,6 +44,10 @@ pub struct PObject {
     pub class_flags: u32,
     /// Attribute id (AID) the object was addressed by.
     pub attribute_id: u32,
+    /// Attribute id flags. Only on the wire when `attribute_id` is non-zero (e.g. the device
+    /// tree object, rid 0x22); the reference driver doesn't decode them, Wireshark's
+    /// S7comm-plus dissector does.
+    pub attribute_id_flags: u32,
     /// Attributes in insertion order (`(attribute_id, value)`).
     pub attributes: Vec<(u32, PValue)>,
     /// Nested objects in insertion order.
@@ -102,6 +107,9 @@ impl PObject {
         n += vlq::encode_u32(w, self.class_id)?;
         n += vlq::encode_u32(w, self.class_flags)?;
         n += vlq::encode_u32(w, self.attribute_id)?;
+        if self.attribute_id != 0 {
+            n += vlq::encode_u32(w, self.attribute_id_flags)?;
+        }
 
         for (key, value) in &self.attributes {
             n += p::encode_u8(w, element_id::ATTRIBUTE)?;
@@ -183,11 +191,17 @@ fn decode_object_after_tag(cur: &mut Cursor<&[u8]>, depth: usize) -> Result<PObj
     let class_id = vlq::decode_u32(cur)?;
     let class_flags = vlq::decode_u32(cur)?;
     let attribute_id = vlq::decode_u32(cur)?;
+    let attribute_id_flags = if attribute_id != 0 {
+        vlq::decode_u32(cur)?
+    } else {
+        0
+    };
     let mut obj = PObject {
         relation_id,
         class_id,
         class_flags,
         attribute_id,
+        attribute_id_flags,
         ..Default::default()
     };
 
@@ -263,6 +277,37 @@ mod tests {
                 0x00, // attribute id 0 (VLQ)
                 0xa2, // TerminatingObject
             ]
+        );
+    }
+
+    #[test]
+    fn attribute_id_flags_follow_a_nonzero_attribute_id() {
+        // A device-tree module as PLCSIM sends it: attribute id 2393, attribute id flags 0x8000.
+        let bytes = [
+            0xa1, 0x00, 0x00, 0x00, 0x32, // header: SOO, rid 0x32
+            0x93, 0x04, // class id 2436 (VLQ)
+            0x30, // class flags
+            0x92, 0x59, // attribute id 2393 (VLQ)
+            0x82, 0x80, 0x00, // attribute id flags 0x8000 (VLQ)
+            0xa3, 0x81, 0x69, 0x00, 0x15, 0x01, b'x', // attribute 233 = WString("x")
+            0xa2, // TerminatingObject
+        ];
+        let obj = decode_object(&mut Cursor::new(&bytes[..])).unwrap();
+        assert_eq!(obj.attribute_id, 2393);
+        assert_eq!(obj.attribute_id_flags, 0x8000);
+        assert_eq!(obj.attribute(233), Some(&PValue::WString("x".into())));
+        let mut out = Vec::new();
+        obj.serialize(&mut out).unwrap();
+        assert_eq!(out, bytes);
+
+        // With attribute id 0 there are no flags on the wire, whatever the field holds.
+        let mut obj = PObject::new(211, 255, 0);
+        obj.attribute_id_flags = 7;
+        let mut out = Vec::new();
+        obj.serialize(&mut out).unwrap();
+        assert_eq!(
+            out,
+            [0xa1, 0x00, 0x00, 0x00, 0xd3, 0x81, 0x7f, 0x00, 0x00, 0xa2]
         );
     }
 

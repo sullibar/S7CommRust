@@ -3034,6 +3034,29 @@ mod tests {
         plc.join().unwrap();
     }
 
+    /// The reply to `cpu_state`'s Explore, captured from PLCSIM Advanced FW V2.8 (legacy) in RUN.
+    /// Its object header carries attribute id flags (`92 59 06`); byte 0x47 is the state code.
+    const CPU_STATE_RUN: &[u8] = include_bytes!("../tests/vectors/proto/explore_cpu_state_run.bin");
+
+    #[test]
+    fn cpu_state_from_a_plcsim_capture() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            // The PDU data, without the `72 03 len` header and the trailer.
+            let body = &CPU_STATE_RUN[4..CPU_STATE_RUN.len() - 4];
+            plc.recv_request();
+            plc.send(body);
+            // The same reply in STOP: the code is 4 there, the only change in this attribute.
+            let mut stop = body.to_vec();
+            assert_eq!(stop[0x47 - 4], 8);
+            stop[0x47 - 4] = 4;
+            plc.recv_request();
+            plc.send(&stop);
+        });
+        assert_eq!(conn.cpu_state().unwrap(), CpuState::Run);
+        assert_eq!(conn.cpu_state().unwrap(), CpuState::Stop);
+        plc.join().unwrap();
+    }
+
     #[test]
     fn scan_telegram_waits_for_the_trailer() {
         let t = [0x72, 2, 0, 2, 9, 9, 0x72, 2, 0, 1, 8, 0x72, 2, 0, 0];
