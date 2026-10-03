@@ -17,15 +17,15 @@ non-TLS "integrity-protected" scheme, so one API reaches both current and legacy
 > - **TLS path** (`connect`): COTP → `InitSsl` → TLS 1.3 handshake → session → browse
 >   (Explore) → read/write symbolic tags by name → subscriptions → alarms → legitimation.
 >   Validated end-to-end against a **PLCSIM Advanced V2.9** instance; legitimation is proven
->   both ways (correct password accepted, wrong password denied).
+>   both ways (correct password accepted, wrong password denied), and alarms are received from
+>   a firing `Program_Alarm` (subscription and pending-alarm snapshot).
 > - **Legacy path**: the non-TLS scheme for older firmware. `connect_legacy` (the PLCSIM key
 >   family) is validated end-to-end against a **PLCSIM Advanced FW V2.8** instance.
 >   `connect_real_plc` (physical S7-1200/1500 on older firmware) is validated offline against
 >   golden vectors but has **not yet been tested on hardware**.
 >
-> Known gaps: alarm *reception* is unit-tested but not yet confirmed against a program with
-> firing alarms; a few upstream-unimplemented value types (`Variant`, `S7String`) remain
-> explicit errors because there is no wire format to port.
+> Known gaps: a few upstream-unimplemented value types (`Variant`, `S7String`) remain explicit
+> errors because there is no wire format to port.
 
 ## Use as a library
 
