@@ -65,11 +65,17 @@ fn main() -> s7commplus::Result<()> {
   (which adds the tag's softdatatype, to interpret its value).
 - **Read / write by name** — `read_tag` / `write_tag`, batched `read_tags` / `write_tags`,
   and the string helpers `read_string` / `write_string` and `read_wstring` / `write_wstring`.
+- **Read / write by byte offset** — `read_area` / `write_area` on a standard (not optimized)
+  data block or the I/Q/M areas, as the classic S7 protocol does: `Area::Db(5)`,
+  `Area::Inputs`, `Area::Outputs`, `Area::Memory`. Batch several ranges by passing
+  `ItemAddress::raw` addresses to `read_variables`.
+- **CPU state** — `cpu_state` reports RUN, STOP, or another operating-state code.
 - **Subscribe** — `subscribe` / `subscribe_with` for cyclic value pushes, then
   `next_notification` (per subscription) or `next_any_notification` (one loop for all); a
   finite credit limit is auto-refreshed for you. `delete_subscription` frees it on the PLC.
-- **Alarms** — `subscribe_alarms`, then read `Notification::alarms()`; `Alarm::message()`
-  formats localized alarm text with substituted associated values.
+- **Alarms** — `active_alarms` lists the alarms pending now; `subscribe_alarms` pushes alarm
+  events, read with `Notification::alarms()`. `Alarm::message()` formats localized alarm text
+  with substituted associated values.
 - **Authenticate** — `legitimate(user, password)` against a password-protected program.
 - **Recover** — after a failed request the connection is *poisoned* (`is_poisoned`; the error
   reports `is_connection_lost`): call `reconnect`, or enable `set_auto_reconnect` to retry reads
@@ -92,6 +98,9 @@ cargo run -p s7tool -- --ip 192.168.0.1
 cargo run -p s7tool -- --ip 192.168.0.1 browse
 cargo run -p s7tool -- --ip 192.168.0.1 read Data_block_1.toto Data_block_1.titi
 cargo run -p s7tool -- --ip 192.168.0.1 write Data_block_1.titi 456
+cargo run -p s7tool -- --ip 192.168.0.1 rawread DB5 0 16    # bytes 0..16 of standard DB5
+cargo run -p s7tool -- --ip 192.168.0.1 state               # RUN / STOP
+cargo run -p s7tool -- --ip 192.168.0.1 pending             # alarms pending now
 
 # Older, non-TLS firmware: --legacy for PLCSIM, --real-plc for a physical S7-1200/1500.
 cargo run -p s7tool -- --ip 192.168.0.1 --legacy browse

@@ -26,6 +26,41 @@ const DAI_MESSAGE_TYPE: u32 = 4079;
 const DAI_HMI_INFO: u32 = 7813;
 const DAI_SEQUENCE_COUNTER: u32 = 7917;
 
+// The Explore of the pending alarms follows gijzelaerr/s7commplus `build_alarm_explore_request`.
+
+/// RID of the alarm subsystem (`NativeObjects.theAlarmSubsystem_Rid`).
+pub(crate) const ALARM_SUBSYSTEM_RID: u32 = 8;
+/// Explore request id under which the alarm subsystem lists its pending alarms
+/// (`AlarmSubsystem.itsUpdateRelevantDAI`).
+pub(crate) const UPDATE_RELEVANT_DAI: u32 = 2667;
+/// The attributes an Explore of the pending alarms asks for: what [`Alarm::from_object`] reads.
+pub(crate) const DAI_ATTRIBUTES: [u32; 10] = [
+    DAI_CPU_ALARM_ID,
+    DAI_ALL_STATES_INFO,
+    DAI_ALARM_DOMAIN,
+    DAI_COMING,
+    DAI_GOING,
+    DAI_MESSAGE_TYPE,
+    DAI_HMI_INFO,
+    OBJECT_VARIABLE_TYPE_NAME,
+    DAI_SEQUENCE_COUNTER,
+    DAI_ALARM_TEXTS,
+];
+
+/// The alarms among an Explore's `objects`: every object, at any depth, that carries a
+/// `CpuAlarmId`.
+pub(crate) fn alarms_in(objects: &[PObject]) -> Result<Vec<Alarm>> {
+    let mut alarms = Vec::new();
+    let mut pending: Vec<&PObject> = objects.iter().rev().collect();
+    while let Some(obj) = pending.pop() {
+        if obj.attribute(DAI_CPU_ALARM_ID).is_some() {
+            alarms.push(Alarm::from_object(obj)?);
+        }
+        pending.extend(obj.objects.iter().rev());
+    }
+    Ok(alarms)
+}
+
 // AS_CGS (the coming/going struct) member ids.
 const AS_CGS_ALL_STATES_INFO: u32 = 3474;
 const AS_CGS_TIMESTAMP: u32 = 3475;
@@ -548,6 +583,45 @@ mod tests {
         assert_eq!(a.associated_values, vec![AssociatedValue::Int(5)]);
         assert_eq!(a.message(1033).unwrap(), "Motor speed 5 rpm");
         assert!(a.message(1031).is_none()); // no de-DE text present
+    }
+
+    /// A pending alarm `id` as the alarm subsystem lists it: a DAI object with a coming state.
+    fn dai(id: u64) -> PObject {
+        let mut obj = PObject::new(0x8a7e_0000 + id as u32, 2681, 0);
+        obj.add_attribute(DAI_CPU_ALARM_ID, PValue::LWord(id));
+        obj.add_attribute(
+            DAI_COMING,
+            PValue::Struct {
+                id: 0,
+                elements: vec![(AS_CGS_TIMESTAMP, PValue::Timestamp(0))],
+            },
+        );
+        obj
+    }
+
+    #[test]
+    fn alarms_in_finds_alarms_at_any_depth() {
+        let mut subsystem = PObject::new(ALARM_SUBSYSTEM_RID, 2668, 0);
+        subsystem.objects.push(dai(2));
+        let mut nested = PObject::new(9, 1, 0);
+        nested.objects.push(dai(3));
+        subsystem.objects.push(nested);
+        let ids: Vec<u64> = alarms_in(&[dai(1), subsystem])
+            .unwrap()
+            .iter()
+            .map(|a| a.cpu_alarm_id)
+            .collect();
+        assert_eq!(ids, [1, 2, 3]);
+        assert!(alarms_in(&[PObject::new(ALARM_SUBSYSTEM_RID, 2668, 0)])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn alarms_in_reports_a_malformed_alarm() {
+        let mut broken = PObject::new(1, 2681, 0);
+        broken.add_attribute(DAI_CPU_ALARM_ID, PValue::LWord(1)); // neither coming nor going
+        assert!(alarms_in(&[dai(1), broken]).is_err());
     }
 
     #[test]

@@ -21,20 +21,17 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::legitimation::{build_legitimation_payload, crypto};
+use crate::proto::item_address::{CONTROLLER_AREA_VALUE_ACTUAL, DB_VALUE_ACTUAL};
 use crate::proto::object::PObject;
 use crate::proto::{
-    self, CreateObjectResponse, GetMultiVariablesResponse, GetVarSubstreamedResponse, ItemAddress,
-    SetMultiVariablesResponse, SetVariableResponse,
+    self, Area, CreateObjectResponse, GetMultiVariablesResponse, GetVarSubstreamedResponse,
+    ItemAddress, SetMultiVariablesResponse, SetVariableResponse,
 };
 use crate::transport::{IsoTcp, TlsChannel};
 use crate::value::strings::{decode_s7_string, decode_wstring, encode_s7_string, encode_wstring};
 use crate::value::PValue;
 use crate::wire::pdu::{self, functioncode, ids, protocol_version};
 
-/// `AccessSubArea` for data-block reads (`Ids.DB_ValueActual`).
-const DB_VALUE_ACTUAL: u32 = 2550;
-/// `AccessSubArea` for I/Q/M/timer/counter reads (`Ids.ControllerArea_ValueActual`).
-const CONTROLLER_AREA_VALUE_ACTUAL: u32 = 3736;
 /// Controller areas browsable by symbol: `(AccessArea RID, type-info relid, label)`, in the
 /// order the reference tries them (M, then Q, then I).
 const CONTROLLER_AREAS: [(u32, u32, &str); 3] = [
@@ -68,6 +65,24 @@ const READ_BATCH: usize = 48;
 /// Items per Get/SetMultiVariables request until the PLC's own limits are read (the reference's
 /// `CommRessources` default).
 const DEFAULT_TAGS_PER_REQUEST: usize = 20;
+/// RID of the CPU's execution unit (`NativeObjects.theCPUexecUnit_Rid`).
+const CPU_EXEC_UNIT_RID: u32 = 52;
+/// The execution unit's attribute holding its operating state (a struct).
+const CPU_OPERATING_STATE: u32 = 2237;
+/// The member of [`CPU_OPERATING_STATE`] holding the classic S7 operating-state code.
+const CPU_OPERATING_STATE_CODE: u32 = 3486;
+
+/// The CPU's operating state, from [`Connection::cpu_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuState {
+    /// RUN: the user program is executing.
+    Run,
+    /// STOP.
+    Stop,
+    /// Any other classic S7 operating-state code (a startup or hold state, for example), as the
+    /// PLC reported it.
+    Other(i32),
+}
 
 /// A discovered data block: its name, object relation id, number, and type-info relation id.
 #[derive(Debug, Clone)]
@@ -1122,6 +1137,19 @@ impl Connection {
         parents: u8,
         attrs: &[u32],
     ) -> Result<Vec<u8>> {
+        self.explore_request(explore_id, ids::NONE, recursive, parents, attrs)
+    }
+
+    /// [`Connection::explore_raw`] with an `ExploreRequestId`, which some objects use to select
+    /// what they list (the alarm subsystem's pending alarms, for one).
+    fn explore_request(
+        &mut self,
+        explore_id: u32,
+        request_id: u32,
+        recursive: u8,
+        parents: u8,
+        attrs: &[u32],
+    ) -> Result<Vec<u8>> {
         let seq = self.next_sequence_number();
         let with_integrity = self.with_integrity;
         let integrity = if with_integrity {
@@ -1134,7 +1162,7 @@ impl Connection {
             seq,
             self.session_id,
             explore_id,
-            ids::NONE,
+            request_id,
             recursive,
             parents,
             attrs,
@@ -1942,6 +1970,89 @@ impl Connection {
         Ok(())
     }
 
+    /// Read `len` bytes at byte offset `start` of `area`, as the classic S7 protocol does: a
+    /// standard (not optimized) data block, the inputs, outputs, or bit memory. To read several
+    /// ranges in one request, pass [`ItemAddress::raw`] addresses to
+    /// [`Connection::read_variables`].
+    pub fn read_area(&mut self, area: Area, start: u32, len: u32) -> Result<Vec<u8>> {
+        let resp = self.read_variables(&[ItemAddress::raw(area, start, len)])?;
+        match resp.into_items(1).pop() {
+            Some(Ok(PValue::Blob { data, .. })) => Ok(data),
+            Some(Ok(other)) => Err(Error::protocol(format!(
+                "{area:?} read did not return bytes (got {other:?})"
+            ))),
+            Some(Err(code)) => Err(raw_access_refused("reading", area, start, len, code)),
+            None => Err(Error::protocol(format!("{area:?} read returned no value"))),
+        }
+    }
+
+    /// Write `data` at byte offset `start` of `area` (see [`Connection::read_area`]).
+    pub fn write_area(&mut self, area: Area, start: u32, data: &[u8]) -> Result<()> {
+        let len = u32::try_from(data.len())
+            .map_err(|_| Error::protocol("write_area: data longer than 4 GiB"))?;
+        let value = PValue::Blob {
+            root_id: 0,
+            data: data.to_vec(),
+        };
+        let resp = self.write_variables(&[ItemAddress::raw(area, start, len)], &[value])?;
+        match resp.errors.first() {
+            Some(&(_, code)) => Err(raw_access_refused("writing", area, start, len, code)),
+            None => Ok(()),
+        }
+    }
+
+    /// Read the CPU's operating state.
+    ///
+    /// The CPU's execution unit reports it as the classic S7 operating-state code (8 = RUN,
+    /// 4 = STOP) in member 3486 of its attribute 2237, as found by switching PLCSIM Advanced
+    /// (FW V2.8 and V2.9) between RUN and STOP. Any other code is returned as
+    /// [`CpuState::Other`].
+    pub fn cpu_state(&mut self) -> Result<CpuState> {
+        let resp = self.explore(CPU_EXEC_UNIT_RID, 0, 0, &[CPU_OPERATING_STATE])?;
+        let state = resp
+            .objects
+            .iter()
+            .find(|o| o.relation_id == CPU_EXEC_UNIT_RID)
+            .and_then(|o| o.attribute(CPU_OPERATING_STATE));
+        let code = match state {
+            Some(PValue::Struct { elements, .. }) => elements
+                .iter()
+                .find(|(id, _)| *id == CPU_OPERATING_STATE_CODE)
+                .map(|(_, v)| v),
+            _ => None,
+        };
+        match code {
+            Some(PValue::DInt(8)) => Ok(CpuState::Run),
+            Some(PValue::DInt(4)) => Ok(CpuState::Stop),
+            Some(PValue::DInt(other)) => Ok(CpuState::Other(*other)),
+            _ => Err(Error::protocol(format!(
+                "CPU execution unit reported no operating state (got {state:?})"
+            ))),
+        }
+    }
+
+    /// Read the alarms pending on the PLC: a snapshot, with no subscription needed (it works
+    /// alongside one, too). Each [`Alarm`](crate::proto::Alarm) is as an alarm notification
+    /// delivers it.
+    pub fn active_alarms(&mut self) -> Result<Vec<proto::Alarm>> {
+        use proto::alarm::{ALARM_SUBSYSTEM_RID, DAI_ATTRIBUTES, UPDATE_RELEVANT_DAI};
+        let raw = self.explore_request(
+            ALARM_SUBSYSTEM_RID,
+            UPDATE_RELEVANT_DAI,
+            1,
+            0,
+            &DAI_ATTRIBUTES,
+        )?;
+        let resp = proto::parse_explore_response(&raw, self.with_integrity)?;
+        if !resp.header.is_ok() {
+            return Err(Error::protocol(format!(
+                "reading the pending alarms rejected: return_value=0x{:016x}",
+                resp.header.return_value
+            )));
+        }
+        proto::alarm::alarms_in(&resp.objects)
+    }
+
     /// Read the session's effective protection level (`EffectiveProtectionLevel`). `1` means
     /// full access (no legitimation needed); higher values mean access is restricted until
     /// [`Connection::legitimate`] succeeds.
@@ -2195,6 +2306,18 @@ fn type_objects(objects: Vec<PObject>) -> Vec<PObject> {
         }
     }
     out
+}
+
+/// The error for a byte-offset access the PLC refused. PLCSIM answers the same error code
+/// (-61) for a range past the area's end as for a data block that is optimized.
+fn raw_access_refused(verb: &str, area: Area, start: u32, len: u32, code: u64) -> Error {
+    let hint = match area {
+        Area::Db(_) => "past the block's end, or an optimized block",
+        _ => "past the area's end",
+    };
+    Error::protocol(format!(
+        "{verb} {len} bytes at {start} of {area:?} refused ({hint}?): return_value=0x{code:016x}"
+    ))
 }
 
 /// The subscription a framed telegram notifies about, if it is a `Notification` (`0x33`). A
@@ -2772,6 +2895,142 @@ mod tests {
             }
         };
         assert_eq!(n.values, vec![(1, PValue::DInt(0xa))]);
+        plc.join().unwrap();
+    }
+
+    /// A successful response body to `function`, followed by `rest`.
+    fn response(function: u16, rest: &[u8]) -> Vec<u8> {
+        let mut body = vec![pdu::opcode::RESPONSE, 0, 0];
+        body.extend_from_slice(&function.to_be_bytes());
+        body.extend_from_slice(&[0, 0, 0, 1, 0, 0]); // reserved, seq, flags, rv 0
+        body.extend_from_slice(rest);
+        body
+    }
+
+    /// Whether the request body `req` contains the serialized `addr`.
+    fn has_address(req: &[u8], addr: &ItemAddress) -> bool {
+        let mut bytes = Vec::new();
+        addr.serialize(&mut bytes).unwrap();
+        req.windows(bytes.len()).any(|w| w == bytes)
+    }
+
+    #[test]
+    fn read_area_reads_a_byte_range() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            let req = plc.recv_request();
+            assert_eq!(&req[3..5], &functioncode::GET_MULTI_VARIABLES.to_be_bytes());
+            assert!(has_address(&req, &ItemAddress::raw(Area::Memory, 10, 3)));
+            let mut rest = vec![1]; // item 1
+            let value = PValue::Blob {
+                root_id: 0,
+                data: vec![1, 2, 3],
+            };
+            value.serialize(&mut rest).unwrap();
+            rest.extend_from_slice(&[0, 0, 0]); // end of values, end of errors, integrity id
+            plc.send(&response(functioncode::GET_MULTI_VARIABLES, &rest));
+
+            // The same read, refused as PLCSIM refuses an optimized block.
+            plc.recv_request();
+            let mut rest = vec![0, 1]; // no values; an error for item 1
+            crate::wire::vlq::encode_u64(&mut rest, 0x8206_8d00_02bf_ffc3).unwrap();
+            rest.extend_from_slice(&[0, 0]);
+            plc.send(&response(functioncode::GET_MULTI_VARIABLES, &rest));
+        });
+        assert_eq!(conn.read_area(Area::Memory, 10, 3).unwrap(), [1, 2, 3]);
+        let e = conn.read_area(Area::Db(1), 0, 4).unwrap_err();
+        assert!(e.to_string().contains("optimized"), "{e}");
+        assert!(
+            !conn.is_poisoned(),
+            "an item error leaves the connection usable"
+        );
+        plc.join().unwrap();
+    }
+
+    #[test]
+    fn write_area_writes_the_bytes_as_a_blob() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            let req = plc.recv_request();
+            assert_eq!(&req[3..5], &functioncode::SET_MULTI_VARIABLES.to_be_bytes());
+            assert!(has_address(&req, &ItemAddress::raw(Area::Db(5), 2, 2)));
+            // Item 1's value: a Blob (flags 0, type 0x14, root id 0, length 2) of the bytes.
+            assert!(req.windows(7).any(|w| w == [1, 0, 0x14, 0, 2, 0xab, 0xcd]));
+            plc.send(&response(functioncode::SET_MULTI_VARIABLES, &[0, 0]));
+        });
+        conn.write_area(Area::Db(5), 2, &[0xab, 0xcd]).unwrap();
+        plc.join().unwrap();
+    }
+
+    /// An Explore response body listing `objects`.
+    fn explore_response(explore_id: u32, objects: &[PObject]) -> Vec<u8> {
+        let mut rest = explore_id.to_be_bytes().to_vec();
+        rest.push(0); // integrity id
+        for o in objects {
+            o.serialize(&mut rest).unwrap();
+        }
+        rest.extend_from_slice(&[0; 4]);
+        response(functioncode::EXPLORE, &rest)
+    }
+
+    /// The CPU execution unit reporting operating-state `code`, as PLCSIM does.
+    fn exec_unit(code: i32) -> PObject {
+        let mut unit = PObject::new(CPU_EXEC_UNIT_RID, 2179, 0);
+        unit.add_attribute(
+            CPU_OPERATING_STATE,
+            PValue::Struct {
+                id: 3481,
+                elements: vec![
+                    (3484, PValue::Word(1)),
+                    (CPU_OPERATING_STATE_CODE, PValue::DInt(code)),
+                ],
+            },
+        );
+        unit
+    }
+
+    #[test]
+    fn cpu_state_maps_the_operating_state_code() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            for code in [8, 4, 6] {
+                let req = plc.recv_request();
+                assert_eq!(&req[3..5], &functioncode::EXPLORE.to_be_bytes());
+                assert_eq!(&req[14..18], &CPU_EXEC_UNIT_RID.to_be_bytes());
+                plc.send(&explore_response(CPU_EXEC_UNIT_RID, &[exec_unit(code)]));
+            }
+            plc.recv_request();
+            let bare = PObject::new(CPU_EXEC_UNIT_RID, 2179, 0);
+            plc.send(&explore_response(CPU_EXEC_UNIT_RID, &[bare]));
+        });
+        assert_eq!(conn.cpu_state().unwrap(), CpuState::Run);
+        assert_eq!(conn.cpu_state().unwrap(), CpuState::Stop);
+        assert_eq!(conn.cpu_state().unwrap(), CpuState::Other(6));
+        assert!(conn.cpu_state().is_err());
+        plc.join().unwrap();
+    }
+
+    #[test]
+    fn active_alarms_explores_the_alarm_subsystem() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            let req = plc.recv_request();
+            assert_eq!(&req[3..5], &functioncode::EXPLORE.to_be_bytes());
+            // Explore id 8 (the alarm subsystem), request id 2667 (VLQ 94 6b), children.
+            assert_eq!(&req[14..21], &[0, 0, 0, 8, 0x94, 0x6b, 1]);
+            let mut alarm = PObject::new(0x8a7e_0001, 2681, 0);
+            alarm.add_attribute(2670, PValue::LWord(0x8a7e_0001_002a_0000)); // CpuAlarmId
+            alarm.add_attribute(
+                2673, // Coming
+                PValue::Struct {
+                    id: 0,
+                    elements: vec![(3475, PValue::Timestamp(0))],
+                },
+            );
+            let mut subsystem = PObject::new(8, 2668, 0);
+            subsystem.objects.push(alarm);
+            plc.send(&explore_response(8, &[subsystem]));
+        });
+        let alarms = conn.active_alarms().unwrap();
+        assert_eq!(alarms.len(), 1);
+        assert_eq!(alarms[0].cpu_alarm_id, 0x8a7e_0001_002a_0000);
+        assert_eq!(alarms[0].state, crate::proto::AlarmState::Coming);
         plc.join().unwrap();
     }
 

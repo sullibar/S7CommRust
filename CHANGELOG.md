@@ -49,6 +49,17 @@ All notable changes to this project are documented here. The format is based on
   FW V2.8, where every chunk of every response verifies. A chunk whose digest is wrong or
   missing fails with the new `Error::Integrity`, which counts as a lost connection
   (`is_connection_lost`) and poisons the connection.
+- Byte-offset access, as the classic S7 protocol has it: `Connection::read_area` /
+  `write_area` read and write a byte range of a standard (not optimized) data block or of the
+  inputs, outputs or bit memory (`Area::Db(n)`, `Inputs`, `Outputs`, `Memory`), and
+  `ItemAddress::raw` addresses such a range for batched `read_variables` / `write_variables`.
+  The addressing follows [gijzelaerr/s7commplus](https://github.com/gijzelaerr/s7commplus).
+- `Connection::cpu_state` reads the CPU's operating state (`CpuState::Run`, `Stop`, or another
+  classic S7 state code), from member 3486 of the CPU execution unit's attribute 2237,
+  identified by switching PLCSIM Advanced between RUN and STOP.
+- `Connection::active_alarms` reads the alarms pending on the PLC, without a subscription
+  (the alarm-subsystem Explore follows gijzelaerr/s7commplus).
+- s7tool: `rawread` / `rawwrite`, `state` and `pending`.
 - The PLC's per-request item limits are read at connect (`max_tags_per_read` /
   `max_tags_per_write`), and `read_variables` / `write_variables` — so also `read_tags` /
   `write_tags` — split larger requests to fit.
