@@ -41,6 +41,23 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- The driver logs what it does through the `log` crate: each connection step (TCP and COTP,
+  InitSsl, the TLS version, cipher suite and certificate fingerprint, the session, the legacy and
+  real-PLC auth steps with the key family, key id and echoed session-setup values, the request
+  limits) at info/debug level; each request, response and notification as a line with its
+  function, sequence number, return value and round-trip time at debug level; and their bytes in
+  hex at trace level. Passwords and key material are never logged: the legitimation request's
+  contents and the legacy auth requests are left out. A failure that poisons the connection is
+  logged as a warning.
+- `Connection::plc_description`: the PLC's description of itself from the session it opens
+  (`1;6ES7 SIM-01500-APLC;S4.1` on PLCSIM Advanced: a counter, order number and firmware);
+  `CreateObjectResponse::plc_description`; `wire::pdu::function_name`; `s7commplus::VERSION`.
+- s7tool writes a session log by default (`s7tool-<UTC time>.log`; `--log <file>`, `--no-log`):
+  the driver's records down to trace level, everything s7tool prints, and a header with the
+  versions, git commit, OS and command line (a `legit` password masked). New `info` (the CPU's
+  name, order number and firmware from the device tree, transport, limits, protection level,
+  RUN/STOP), `report` (every read-only command in turn, carrying on past a failing step) and
+  `--auto` (TLS, then the real-PLC legacy scheme, then PLCSIM's). README: testing on a real PLC.
 - A live test suite, `tests/live.rs` (ignored by default; see `tools/plcsim/README.md`), run
   against PLCSIM Advanced with either test project: browse round trips, reads past the item
   limit, writes, byte-offset access, CPU state, finite-credit subscriptions, a write on a

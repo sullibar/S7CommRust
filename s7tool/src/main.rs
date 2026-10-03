@@ -23,10 +23,24 @@ use s7commplus::{
     Alarm, Area, AssociatedValue, Connection, CpuState, Error, Result, SubscriptionItem, VarInfo,
 };
 
+/// Print a line, and record it in the session log.
+macro_rules! out {
+    () => {
+        out!("")
+    };
+    ($($arg:tt)*) => {{
+        let line = format!($($arg)*);
+        println!("{line}");
+        log::info!(target: "s7tool::out", "{line}");
+    }};
+}
+
+mod diag;
+mod logfile;
+
 const PROMPT: &str = "s7> ";
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let cfg = match Config::from_args() {
         Ok(cfg) => cfg,
         Err(msg) => {
@@ -35,10 +49,42 @@ fn main() {
             std::process::exit(2);
         }
     };
-    if let Err(e) = run(cfg) {
+    let log_path = match &cfg.log {
+        Log::Off => {
+            logfile::to_stderr();
+            None
+        }
+        Log::File(path) => match logfile::to_file(path.as_deref()) {
+            Ok(path) => {
+                eprintln!("session log: {}", path.display());
+                Some(path)
+            }
+            Err(e) => {
+                eprintln!("s7tool: can't create the session log: {e}");
+                std::process::exit(2);
+            }
+        },
+    };
+    logfile::header(&std::env::args().skip(1).collect::<Vec<_>>());
+    let result = run(cfg);
+    if let Err(e) = &result {
+        log::error!(target: "s7tool", "{e}");
         eprintln!("error: {e}");
+    }
+    if let Some(path) = &log_path {
+        eprintln!("session log written to {}", path.display());
+    }
+    if result.is_err() {
         std::process::exit(1);
     }
+}
+
+/// Where the session log goes.
+enum Log {
+    /// A file: the given path, or `s7tool-<UTC time>.log` in the current directory.
+    File(Option<std::path::PathBuf>),
+    /// No file: warnings to stderr only.
+    Off,
 }
 
 /// Connection target plus the (possibly empty) one-shot command.
@@ -51,6 +97,9 @@ struct Config {
     real_plc: bool,
     /// The PLC's pinned TLS certificate fingerprint (SHA-256), if any.
     pin: Option<[u8; 32]>,
+    /// Try TLS, then the legacy real-PLC and PLCSIM schemes, until one connects.
+    auto: bool,
+    log: Log,
     command: Vec<String>,
 }
 
@@ -66,6 +115,8 @@ impl Config {
         let mut legacy = std::env::var("S7_LEGACY").is_ok();
         let mut real_plc = std::env::var("S7_REAL_PLC").is_ok();
         let mut pin = std::env::var("S7_PLC_CERT_SHA256").ok();
+        let mut auto = false;
+        let mut log = Log::File(None);
         let mut command = Vec::new();
 
         let mut args = std::env::args().skip(1);
@@ -79,6 +130,9 @@ impl Config {
                 "--legacy" | "-l" => legacy = true,
                 "--real-plc" => real_plc = true,
                 "--pin" => pin = Some(args.next().ok_or("--pin needs a value")?),
+                "--auto" => auto = true,
+                "--log" => log = Log::File(Some(args.next().ok_or("--log needs a path")?.into())),
+                "--no-log" => log = Log::Off,
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -105,8 +159,11 @@ impl Config {
             ),
             None => None,
         };
-        if pin.is_some() && (legacy || real_plc) {
+        if pin.is_some() && (legacy || real_plc || auto) {
             return Err("--pin applies to TLS connections only".into());
+        }
+        if auto && (legacy || real_plc) {
+            return Err("--auto picks the path itself; drop --legacy / --real-plc".into());
         }
         Ok(Config {
             ip,
@@ -114,22 +171,28 @@ impl Config {
             legacy,
             real_plc,
             pin,
+            auto,
+            log,
             command,
         })
     }
 }
 
 fn run(cfg: Config) -> Result<()> {
-    let mode = if cfg.real_plc {
+    let mode = if cfg.auto {
+        "trying each path"
+    } else if cfg.real_plc {
         "legacy real-PLC (00:/01:)"
     } else if cfg.legacy {
         "legacy PLCSIM (03:)"
     } else {
         "TLS"
     };
-    println!("connecting to {}:{} ({mode}) ...", cfg.ip, cfg.port);
+    out!("connecting to {}:{} ({mode}) ...", cfg.ip, cfg.port);
     let timeout = Duration::from_secs(10);
-    let mut conn = if cfg.real_plc {
+    let mut conn = if cfg.auto {
+        connect_auto((cfg.ip.as_str(), cfg.port), timeout)?
+    } else if cfg.real_plc {
         // S7_REAL_PLC_KEY=<hex 40-byte pubkey> forces an explicit key (for a PLC whose key
         // isn't in the bundled store); otherwise the key is auto-selected by fingerprint.
         let key = match std::env::var("S7_REAL_PLC_KEY") {
@@ -156,10 +219,13 @@ fn run(cfg: Config) -> Result<()> {
         .peer_certificate_sha256()
         .map(|fp| format!(", certificate SHA-256 = {}", hex(&fp).replace(' ', "")))
         .unwrap_or_default();
-    println!(
+    out!(
         "connected — session_id = 0x{:08x}{certificate}",
         conn.session_id()
     );
+    if let Some(description) = conn.plc_description() {
+        out!("PLC describes itself as {description:?}");
+    }
 
     if cfg.command.is_empty() {
         repl(&mut conn)?;
@@ -168,6 +234,28 @@ fn run(cfg: Config) -> Result<()> {
     }
     // End the session cleanly, so the PLC frees it right away.
     conn.close()
+}
+
+/// Connect over whichever path the PLC speaks: TLS, then the legacy scheme of real S7-1200/1500
+/// CPUs, then PLCSIM's. Only a PLC refusing a path moves on to the next; any other failure (no
+/// route, no answer) ends the attempt.
+fn connect_auto(addr: (&str, u16), timeout: Duration) -> Result<Connection> {
+    out!("trying TLS ...");
+    match Connection::connect(addr, timeout) {
+        Ok(conn) => return Ok(conn),
+        Err(e) if e.to_string().contains("InitSsl rejected") => out!("  no TLS: {e}"),
+        Err(e) => return Err(e),
+    }
+    out!("trying the legacy scheme of real S7-1200/1500 CPUs ...");
+    match Connection::connect_real_plc(addr, timeout) {
+        Ok(conn) => return Ok(conn),
+        Err(e) if e.to_string().contains("no 00:/01: fingerprint") => {
+            out!("  not a real CPU's key family: {e}")
+        }
+        Err(e) => return Err(e),
+    }
+    out!("trying the legacy PLCSIM scheme ...");
+    Connection::connect_legacy(addr, timeout)
 }
 
 /// Decode a hex string (a public key from the environment).
@@ -217,7 +305,7 @@ fn unquote(arg: &str) -> &str {
 /// Read commands from stdin until EOF or `quit`, dispatching each. A failed command prints
 /// its error but keeps the session alive.
 fn repl(conn: &mut Connection) -> Result<()> {
-    println!("interactive mode — 'help' for commands, 'quit' to exit.");
+    out!("interactive mode — 'help' for commands, 'quit' to exit.");
     let stdin = io::stdin();
     loop {
         print!("{PROMPT}");
@@ -225,7 +313,7 @@ fn repl(conn: &mut Connection) -> Result<()> {
 
         let mut line = String::new();
         if stdin.read_line(&mut line)? == 0 {
-            println!();
+            out!();
             break; // EOF (Ctrl-D / Ctrl-Z)
         }
         let parts = split_line(&line);
@@ -234,6 +322,7 @@ fn repl(conn: &mut Connection) -> Result<()> {
             Some("quit" | "exit" | "q") => break,
             Some(_) => {
                 if let Err(e) = dispatch(conn, &parts) {
+                    log::error!(target: "s7tool", "{e}");
                     eprintln!("error: {e}");
                 }
             }
@@ -244,6 +333,7 @@ fn repl(conn: &mut Connection) -> Result<()> {
 
 /// Run one command (`cmd[0]` is the verb, the rest are arguments).
 fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
+    log::info!(target: "s7tool", "> {}", logfile::mask_secrets(cmd).join(" "));
     match cmd[0].as_str() {
         "help" | "?" => {
             print_help();
@@ -254,11 +344,11 @@ fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
             // xexplore <hexrelid> [recursive=1] [parents=0] [attr...] — diagnostic explore dump.
             // Trailing decimal ids restrict the requested attributes (e.g. 2544 = InterfaceDesc).
             if cmd.len() < 2 {
-                println!("usage: xexplore <hexrelid> [recursive] [parents] [attr_id...]");
+                out!("usage: xexplore <hexrelid> [recursive] [parents] [attr_id...]");
                 return Ok(());
             }
             let Ok(relid) = u32::from_str_radix(cmd[1].trim_start_matches("0x"), 16) else {
-                println!("bad hex relid: {}", cmd[1]);
+                out!("bad hex relid: {}", cmd[1]);
                 return Ok(());
             };
             let rec = cmd.get(2).and_then(|s| s.parse().ok()).unwrap_or(1u8);
@@ -275,15 +365,15 @@ fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
         "xblob" => {
             // xblob <hexrelid> <attr_decimal> <outfile> — save matching blob attribute(s) to a file.
             if cmd.len() != 4 {
-                println!("usage: xblob <hexrelid> <attr> <outfile>");
+                out!("usage: xblob <hexrelid> <attr> <outfile>");
                 return Ok(());
             }
             let Ok(relid) = u32::from_str_radix(cmd[1].trim_start_matches("0x"), 16) else {
-                println!("bad hex relid: {}", cmd[1]);
+                out!("bad hex relid: {}", cmd[1]);
                 return Ok(());
             };
             let Ok(attr) = cmd[2].parse::<u32>() else {
-                println!("bad attr: {}", cmd[2]);
+                out!("bad attr: {}", cmd[2]);
                 return Ok(());
             };
             let blobs = conn.explore_attr_blobs(relid, attr)?;
@@ -295,10 +385,10 @@ fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
                 };
                 std::fs::write(&path, data)
                     .map_err(|e| Error::Protocol(format!("write {path}: {e}")))?;
-                println!("wrote {} bytes (obj 0x{objrel:08x}) -> {path}", data.len());
+                out!("wrote {} bytes (obj 0x{objrel:08x}) -> {path}", data.len());
             }
             if blobs.is_empty() {
-                println!("no blob attribute {attr} found under 0x{relid:08x}");
+                out!("no blob attribute {attr} found under 0x{relid:08x}");
             }
             Ok(())
         }
@@ -308,11 +398,11 @@ fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
             // streams that use a preset dictionary (see s7commplus::decompress_blob). NOTE: this is
             // identity/comment metadata, NOT the member layout — firmware may withhold both.
             if cmd.len() < 2 {
-                println!("usage: xidents <hexrelid>   (a DB/object relid, e.g. from `dbs`)");
+                out!("usage: xidents <hexrelid>   (a DB/object relid, e.g. from `dbs`)");
                 return Ok(());
             }
             let Ok(relid) = u32::from_str_radix(cmd[1].trim_start_matches("0x"), 16) else {
-                println!("bad hex relid: {}", cmd[1]);
+                out!("bad hex relid: {}", cmd[1]);
                 return Ok(());
             };
             let mut any = false;
@@ -327,55 +417,25 @@ fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
                         data.len()
                     );
                     match inflate_metadata_blob(&data) {
-                        Ok(xml) => println!("\n{xml}\n"),
-                        Err(e) => println!(" <decompress failed: {e}>"),
+                        Ok(xml) => out!("\n{xml}\n"),
+                        Err(e) => out!(" <decompress failed: {e}>"),
                     }
                 }
             }
             if !any {
-                println!(
+                out!(
                     "no identity/comment blobs served for 0x{relid:08x} (firmware may withhold them)"
                 );
             }
             Ok(())
         }
-        "xverify" => {
-            // Cross-check: every browsed VarInfo's access sequence must equal what resolve_symbol
-            // computes from its name (two independent LID implementations agreeing = both correct).
-            let vars = conn.browse_vars()?;
-            let (mut ok, mut bad) = (0u32, 0u32);
-            for v in &vars {
-                match conn.resolve_symbol(&v.name) {
-                    Ok(addr)
-                        if addr.access_area == v.access_area
-                            && addr.access_sub_area == v.access_sub_area
-                            && addr.lid == v.lids =>
-                    {
-                        ok += 1
-                    }
-                    Ok(addr) => {
-                        bad += 1;
-                        println!(
-                            "MISMATCH {}: browse lids={:?} area=0x{:x}  resolve lids={:?} area=0x{:x}",
-                            v.name, v.lids, v.access_area, addr.lid, addr.access_area
-                        );
-                    }
-                    Err(e) => {
-                        bad += 1;
-                        println!("UNRESOLVED {}: {e}", v.name);
-                    }
-                }
-            }
-            println!(
-                "xverify: {ok} consistent, {bad} mismatched (of {} vars)",
-                vars.len()
-            );
-            Ok(())
-        }
+        "xverify" => xverify(conn),
+        "info" => diag::info(conn),
+        "report" => diag::report(conn),
         "browse" => browse(conn, cmd.get(1).map(String::as_str)),
         "read" => {
             if cmd.len() < 2 {
-                println!("usage: read <symbol> [<symbol> ...]");
+                out!("usage: read <symbol> [<symbol> ...]");
                 return Ok(());
             }
             for sym in &cmd[1..] {
@@ -385,7 +445,7 @@ fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
         }
         "write" => {
             if cmd.len() != 3 {
-                println!("usage: write <symbol> <value>");
+                out!("usage: write <symbol> <value>");
                 return Ok(());
             }
             write_one(conn, &cmd[1], &cmd[2])
@@ -397,18 +457,16 @@ fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
             } else {
                 "restricted — 'legit <user> <pass>' may be required"
             };
-            println!("effective protection level = {level} ({note})");
+            out!("effective protection level = {level} ({note})");
             Ok(())
         }
         "legit" => {
             if cmd.len() != 3 {
-                println!(
-                    "usage: legit <username> <password>   (empty user: legit \"\" <password>)"
-                );
+                out!("usage: legit <username> <password>   (empty user: legit \"\" <password>)");
                 return Ok(());
             }
             conn.legitimate(unquote(&cmd[1]), unquote(&cmd[2]))?;
-            println!("legitimation accepted.");
+            out!("legitimation accepted.");
             Ok(())
         }
         "sub" => {
@@ -426,17 +484,12 @@ fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
             let polls: usize = cmd.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
             alarms_demo(conn, polls)
         }
-        "pending" => {
-            let alarms = conn.active_alarms()?;
-            println!("{} pending alarm(s)", alarms.len());
-            alarms.iter().for_each(print_alarm);
-            Ok(())
-        }
+        "pending" => pending(conn),
         "state" => {
             match conn.cpu_state()? {
-                CpuState::Run => println!("RUN"),
-                CpuState::Stop => println!("STOP"),
-                CpuState::Other(code) => println!("operating state code {code}"),
+                CpuState::Run => out!("RUN"),
+                CpuState::Stop => out!("STOP"),
+                CpuState::Other(code) => out!("operating state code {code}"),
             }
             Ok(())
         }
@@ -447,10 +500,10 @@ fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
                 cmd.get(3).and_then(|s| s.parse().ok()),
                 cmd.len(),
             ) else {
-                println!("usage: rawread <DB<n>|I|Q|M> <start> <len>");
+                out!("usage: rawread <DB<n>|I|Q|M> <start> <len>");
                 return Ok(());
             };
-            println!("{}", hex(&conn.read_area(area, start, len)?));
+            out!("{}", hex(&conn.read_area(area, start, len)?));
             Ok(())
         }
         "rawwrite" => {
@@ -462,31 +515,80 @@ fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
                     .filter(|d| !d.is_empty()),
                 cmd.len(),
             ) else {
-                println!("usage: rawwrite <DB<n>|I|Q|M> <start> <hex bytes, e.g. 01ff>");
+                out!("usage: rawwrite <DB<n>|I|Q|M> <start> <hex bytes, e.g. 01ff>");
                 return Ok(());
             };
             conn.write_area(area, start, &data)?;
-            println!("wrote {} byte(s)", data.len());
+            out!("wrote {} byte(s)", data.len());
             Ok(())
         }
         other => {
-            println!("unknown command '{other}' — type 'help'");
+            out!("unknown command '{other}' — type 'help'");
             Ok(())
         }
     }
+}
+
+/// Cross-check: every browsed variable's address must equal what `resolve_symbol` computes from
+/// its name (two independent LID implementations agreeing means both are right).
+fn xverify(conn: &mut Connection) -> Result<()> {
+    let vars = conn.browse_vars()?;
+    let (mut ok, mut bad) = (0u32, 0u32);
+    for v in &vars {
+        match conn.resolve_symbol(&v.name) {
+            Ok(addr)
+                if addr.access_area == v.access_area
+                    && addr.access_sub_area == v.access_sub_area
+                    && addr.lid == v.lids =>
+            {
+                ok += 1
+            }
+            Ok(addr) => {
+                bad += 1;
+                out!(
+                    "MISMATCH {}: browse lids={:?} area=0x{:x}  resolve lids={:?} area=0x{:x}",
+                    v.name,
+                    v.lids,
+                    v.access_area,
+                    addr.lid,
+                    addr.access_area
+                );
+            }
+            Err(e) => {
+                bad += 1;
+                out!("UNRESOLVED {}: {e}", v.name);
+            }
+        }
+    }
+    out!(
+        "xverify: {ok} consistent, {bad} mismatched (of {} vars)",
+        vars.len()
+    );
+    Ok(())
+}
+
+/// List the alarms pending on the PLC.
+fn pending(conn: &mut Connection) -> Result<()> {
+    let alarms = conn.active_alarms()?;
+    out!("{} pending alarm(s)", alarms.len());
+    alarms.iter().for_each(print_alarm);
+    Ok(())
 }
 
 /// List the data blocks the driver discovers in the PLC program.
 fn list_dbs(conn: &mut Connection) -> Result<()> {
     let dbs = conn.datablock_list()?;
     if dbs.is_empty() {
-        println!("(no data blocks found)");
+        out!("(no data blocks found)");
         return Ok(());
     }
     for db in &dbs {
-        println!(
+        out!(
             "DB{:<5} {:<26} relid=0x{:08x}  ti=0x{:08x}",
-            db.number, db.name, db.relid, db.ti_relid
+            db.number,
+            db.name,
+            db.relid,
+            db.ti_relid
         );
     }
     Ok(())
@@ -505,19 +607,21 @@ fn browse(conn: &mut Connection, target: Option<&str>) -> Result<()> {
         if target.is_some_and(|t| !db.name.eq_ignore_ascii_case(t)) {
             continue;
         }
-        println!(
+        out!(
             "DB \"{}\" (DB{}, relid 0x{:08x}):",
-            db.name, db.number, db.relid
+            db.name,
+            db.number,
+            db.relid
         );
         match conn.browse_datablock(db.relid, db.ti_relid, &db.name) {
             Ok(vars) => print_values(conn, &vars, Some(&db.name)),
             // A DB whose interface the PLC withholds (TComSize=0, no VartypeList) is the signature
             // of a know-how-protected FB — not recoverable without the block's know-how password.
             Err(e) => {
-                println!("  (skipped — interface withheld by PLC, likely know-how protected: {e})")
+                out!("  (skipped — interface withheld by PLC, likely know-how protected: {e})")
             }
         }
-        println!();
+        out!();
     }
 
     // Controller areas (M/Q/I): tags addressed by bare name, no DB prefix.
@@ -536,9 +640,9 @@ fn browse(conn: &mut Connection, target: Option<&str>) -> Result<()> {
         if vars.is_empty() && target.is_none() {
             continue; // skip empty areas in a full dump
         }
-        println!("{label} ({} tags):", vars.len());
+        out!("{label} ({} tags):", vars.len());
         print_values(conn, &vars, None);
-        println!();
+        out!();
     }
     Ok(())
 }
@@ -549,7 +653,7 @@ fn print_values(conn: &mut Connection, vars: &[VarInfo], strip: Option<&str>) {
     let values = match conn.read_var_values(vars) {
         Ok(v) => v,
         Err(e) => {
-            println!("  (read failed: {e})");
+            out!("  (read failed: {e})");
             return;
         }
     };
@@ -566,8 +670,8 @@ fn print_values(conn: &mut Connection, vars: &[VarInfo], strip: Option<&str>) {
         };
         let tname = sdt_name(var.softdatatype);
         match val {
-            Some(v) => println!("  {disp} : {tname} = {}", fmt_typed(var.softdatatype, &v)),
-            None => println!("  {disp} : {tname} -> (no value / not readable)"),
+            Some(v) => out!("  {disp} : {tname} = {}", fmt_typed(var.softdatatype, &v)),
+            None => out!("  {disp} : {tname} -> (no value / not readable)"),
         }
     }
 }
@@ -591,7 +695,7 @@ fn subscribe_demo(
         .take(count)
         .collect();
     if chosen.is_empty() {
-        println!("no subscribable tags found");
+        out!("no subscribable tags found");
         return Ok(());
     }
     // reference id -> (name, softdatatype) so notifications can be printed by tag name.
@@ -613,7 +717,7 @@ fn subscribe_demo(
         Some(c) => conn.subscribe_with(&items, cycle_ms, 0x14, c)?,
         None => conn.subscribe(&items, cycle_ms)?,
     };
-    println!(
+    out!(
         "subscribed to {} tag(s), cycle {cycle_ms} ms, credit {} (object 0x{:08x}); waiting for {notifs} notification(s)...",
         items.len(),
         credit.map_or_else(|| "unlimited".to_string(), |c| c.to_string()),
@@ -621,7 +725,7 @@ fn subscribe_demo(
     );
     for i in 1..=notifs {
         let n = conn.next_notification(&sub)?;
-        println!(
+        out!(
             "notification #{i}: seq={} credit_tick={} values={} errors={}",
             n.sequence_number,
             n.credit_tick,
@@ -633,14 +737,14 @@ fn subscribe_demo(
                 .get(ref_id)
                 .cloned()
                 .unwrap_or_else(|| (format!("ref#{ref_id}"), 0));
-            println!("   {name} = {}", fmt_typed(sdt, val));
+            out!("   {name} = {}", fmt_typed(sdt, val));
         }
         for (ref_id, code) in &n.errors {
             let name = meta
                 .get(ref_id)
                 .map(|(n, _)| n.clone())
                 .unwrap_or_else(|| format!("ref#{ref_id}"));
-            println!("   {name} -> error 0x{code:02x}");
+            out!("   {name} -> error 0x{code:02x}");
         }
     }
     Ok(())
@@ -650,7 +754,7 @@ fn subscribe_demo(
 /// domain, timestamp). Timeouts (no alarm) are shown but don't abort — alarms are event-driven.
 fn alarms_demo(conn: &mut Connection, polls: usize) -> Result<()> {
     let sub = conn.subscribe_alarms()?;
-    println!(
+    out!(
         "alarm subscription created (object 0x{:08x}); polling {polls} time(s) for alarm events...",
         sub.object_id
     );
@@ -660,25 +764,30 @@ fn alarms_demo(conn: &mut Connection, polls: usize) -> Result<()> {
             Ok(n) => {
                 let alarms = n.alarms();
                 if alarms.is_empty() {
-                    println!("  poll #{i}: notification, no alarm objects");
+                    out!("  poll #{i}: notification, no alarm objects");
                 }
                 total += alarms.len();
                 alarms.iter().for_each(print_alarm);
             }
-            Err(e) if e.is_timeout() => println!("  poll #{i}: (no alarm within timeout)"),
+            Err(e) if e.is_timeout() => out!("  poll #{i}: (no alarm within timeout)"),
             Err(e) => return Err(e),
         }
     }
-    println!("done: {total} alarm event(s) received.");
+    out!("done: {total} alarm event(s) received.");
     Ok(())
 }
 
 /// Print one alarm event: its state and ids, its message text, and its associated values.
 fn print_alarm(a: &Alarm) {
     // (`type_name` is a transient object name, such as `TempDai_1`, not the alarm's.)
-    println!(
+    out!(
         "  ALARM {:?} id=0x{:016x} domain={} msgtype={} seq={} @ {}",
-        a.state, a.cpu_alarm_id, a.alarm_domain, a.message_type, a.sequence_counter, a.timestamp
+        a.state,
+        a.cpu_alarm_id,
+        a.alarm_domain,
+        a.message_type,
+        a.sequence_counter,
+        a.timestamp
     );
     // Render the message text (prefer en-US = 1033, else the first language sent). A PLC sends a
     // single space for an alarm without text.
@@ -686,11 +795,11 @@ fn print_alarm(a: &Alarm) {
         .message(1033)
         .or_else(|| a.texts.first().and_then(|t| a.message(t.language_id)));
     if let Some(msg) = text.filter(|m| !m.trim().is_empty()) {
-        println!("      text: {msg}");
+        out!("      text: {msg}");
     }
     for (i, v) in a.associated_values.iter().enumerate() {
         if *v != AssociatedValue::Unused {
-            println!("      SD_{} = {v}", i + 1);
+            out!("      SD_{} = {v}", i + 1);
         }
     }
 }
@@ -701,8 +810,8 @@ fn read_one(conn: &mut Connection, sym: &str) {
         .resolve_var(sym)
         .and_then(|var| Ok((var.softdatatype, conn.read_tag(sym)?)));
     match read {
-        Ok((ty, v)) => println!("  {sym} : {} = {}", sdt_name(ty), fmt_typed(ty, &v)),
-        Err(e) => println!("  {sym} -> ERROR: {e}"),
+        Ok((ty, v)) => out!("  {sym} : {} = {}", sdt_name(ty), fmt_typed(ty, &v)),
+        Err(e) => out!("  {sym} -> ERROR: {e}"),
     }
 }
 
@@ -740,7 +849,7 @@ fn write_one(conn: &mut Connection, sym: &str, input: &str) -> Result<()> {
             conn.write_tag(sym, value)?;
         }
     }
-    println!("  {sym} := {}", fmt_typed(ty, &conn.read_tag(sym)?));
+    out!("  {sym} := {}", fmt_typed(ty, &conn.read_tag(sym)?));
     Ok(())
 }
 
@@ -930,8 +1039,8 @@ fn print_usage() {
         "s7tool — minimal CLI for the s7commplus driver\n\
          \n\
          USAGE:\n\
-         \x20   s7tool [--ip <addr>] [--port <n>] [--legacy | --real-plc | --pin <sha256>]\n\
-         \x20          [COMMAND ...]\n\
+         \x20   s7tool [--ip <addr>] [--port <n>] [--auto | --legacy | --real-plc | --pin <sha256>]\n\
+         \x20          [--log <file> | --no-log] [COMMAND ...]\n\
          \n\
          CONNECTION (flags must precede the command):\n\
          \x20   -i, --ip <addr>     PLC address           (or env S7_PLC_IP)\n\
@@ -945,6 +1054,14 @@ fn print_usage() {
          \x20       --pin <sha256>  TLS: accept only the PLC whose certificate has this\n\
          \x20                       SHA-256 (64 hex digits, shown on connect)\n\
          \x20                                                  (or env S7_PLC_CERT_SHA256)\n\
+         \x20       --auto          try TLS, then --real-plc, then --legacy: for a PLC whose\n\
+         \x20                       path you don't know\n\
+         \n\
+         SESSION LOG:\n\
+         \x20   Every run writes s7tool-<UTC time>.log in the current directory: each request\n\
+         \x20   and response with its bytes, and everything s7tool prints. No passwords or keys.\n\
+         \x20       --log <file>    write it to <file> instead\n\
+         \x20       --no-log        don't write one\n\
          \n\
          With no COMMAND, s7tool connects and opens an interactive prompt.\n"
     );
@@ -955,7 +1072,8 @@ fn print_usage() {
          \x20   s7tool --ip 192.168.0.1 browse\n\
          \x20   s7tool --ip 192.168.0.1 read Data_block_1.toto Data_block_1.titi\n\
          \x20   s7tool --ip 192.168.0.1 write Data_block_1.titi 456\n\
-         \x20   s7tool --ip 192.168.0.1 --legacy read Data_block_1.toto"
+         \x20   s7tool --ip 192.168.0.1 --legacy read Data_block_1.toto\n\
+         \x20   s7tool --ip 192.168.0.1 --auto report     # everything, read-only, for a bug report"
     );
 }
 
@@ -977,6 +1095,8 @@ fn print_help() {
 
 fn help_body() -> &'static str {
     "COMMANDS:\n\
+     \x20   info                what the PLC is (order number, firmware) and the session\n\
+     \x20   report              run every read-only command below in turn, for the log\n\
      \x20   browse [DB|M|Q|I]   recursively list tags with their current values\n\
      \x20   dbs                 list the data blocks\n\
      \x20   read <sym>...       read one or more tags by symbol name\n\

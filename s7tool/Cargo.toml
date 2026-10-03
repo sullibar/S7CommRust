@@ -12,7 +12,8 @@ publish = false
 # Depend on the driver by path — this is exactly how an external app would consume it
 # (swap the path for a `git`/registry source). Nothing else here is driver-specific.
 s7commplus = { path = ".." }
-env_logger = "0.11" # so RUST_LOG=debug surfaces the driver's `log` output
+env_logger = "0.11" # writes the driver's `log` output to the session log (or stderr)
+log = "0.4"
 
 [[bin]]
 name = "s7tool"

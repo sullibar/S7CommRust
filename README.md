@@ -114,6 +114,33 @@ cargo run -p s7tool -- --ip 192.168.0.1 --real-plc browse
 right thing whether `x` is a Bool, Int, Real, or String. The PLC address can also come from
 the `S7_PLC_IP` / `S7_PLC_PORT` environment variables.
 
+Every run writes a **session log**, `s7tool-<UTC time>.log` in the current directory (`--log
+<file>` to choose it, `--no-log` for none): everything s7tool prints, and everything the driver
+does, timestamped — the connection steps, the PLC's description of itself, and each request and
+response with its timing and its bytes in hex. Passwords and key material are left out (the
+legitimation request's contents and the legacy auth request aren't logged, and a password on
+the command line is masked); tag names and values are in.
+
+### Testing on a real PLC
+
+This project has only been run against PLCSIM, so a log from real hardware is worth a lot,
+especially from a CPU on older firmware, whose `--real-plc` path has never met a physical PLC.
+On a machine that reaches the PLC:
+
+```sh
+cargo build --release -p s7tool          # target/release/s7tool(.exe) runs on its own
+s7tool --ip <plc address> --auto report  # read-only; writes s7tool-<time>.log
+```
+
+`--auto` tries TLS, then the legacy scheme of real S7-1200/1500 CPUs, then PLCSIM's, so you don't
+need to know which one the PLC speaks. `report` runs, read-only: `info` (the CPU's name, order
+number and firmware, the transport, request limits, protection level and RUN/STOP), the data
+blocks, every tag with its value, a check of every browsed name, a short subscription, the pending
+alarms and the device tree. A failing step is noted and the rest still run. Send the log file
+with an issue. It names the program's tags and their values, so check it before sharing; if the
+PLC is password-protected, start s7tool without a command and type `legit <user> <password>`,
+then `report`, at its prompt (the password stays out of the log).
+
 ## Firmware and connection paths
 
 A PLC speaks one of two dialects, and firmware alone doesn't decide which: the TIA Portal

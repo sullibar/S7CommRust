@@ -544,6 +544,7 @@ name = "s7tool"
 version = "0.0.1"
 dependencies = [
  "env_logger",
+ "log",
  "s7commplus",
 ]
 
