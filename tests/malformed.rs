@@ -15,11 +15,17 @@ use s7commplus::wire::pdu::{self, functioncode, opcode, protocol_version};
 use s7commplus::wire::vlq;
 
 /// Real Explore responses captured from PLCSIM Advanced (legacy FW 2.8): a DB's type info with
-/// arrays and nested structs, a plain DB's type info, and the program browse for data blocks.
-const EXPLORE_CAPTURES: [&[u8]; 3] = [
+/// arrays and nested structs, a plain DB's type info, the program browse for data blocks, and
+/// the device tree and objects with BlobStructs, struct and WString address arrays (see codec.rs).
+const EXPLORE_CAPTURES: [&[u8]; 8] = [
     include_bytes!("vectors/proto/explore_ti_92000001.bin"),
     include_bytes!("vectors/proto/explore_ti_92000002.bin"),
     include_bytes!("vectors/proto/explore_program.bin"),
+    include_bytes!("vectors/proto/explore_device_tree_root.bin"),
+    include_bytes!("vectors/proto/explore_device_tree.bin"),
+    include_bytes!("vectors/proto/explore_blob_struct.bin"),
+    include_bytes!("vectors/proto/explore_struct_address_array.bin"),
+    include_bytes!("vectors/proto/explore_wstring_address_array.bin"),
 ];
 
 /// Run `f` on a thread with a 1 MiB stack — the size of the Windows main thread, the smallest a
@@ -60,8 +66,12 @@ fn sample_values() -> Vec<PValue> {
         PValue::Timestamp(0x0011_2233_4455_6677),
         PValue::Timespan(-1),
         PValue::Blob {
-            root_id: 3,
+            root_id: 1,
             data: vec![1, 2, 3],
+        },
+        PValue::BlobStruct {
+            root_id: 1848,
+            elements: vec![(1849, PValue::UDInt(7))],
         },
         PValue::WString("Grüße".into()),
         PValue::USIntArray(vec![10, 3, b'a', b'b', b'c']),
@@ -69,6 +79,15 @@ fn sample_values() -> Vec<PValue> {
             element_type: dt::UINT,
             flags: s7commplus::value::datatype::flags::ARRAY,
             items: vec![PValue::UInt(4), PValue::UInt(2), PValue::UInt(0x41)],
+        },
+        PValue::Array {
+            element_type: dt::WSTRING,
+            flags: s7commplus::value::datatype::flags::ADDRESS_ARRAY,
+            items: vec![PValue::WString("a".into()), PValue::WString("bc".into())],
+        },
+        PValue::StructArray {
+            id: 0x1e2e,
+            items: vec![vec![(1, PValue::Int(-2))], vec![]],
         },
         PValue::Struct {
             id: 1,
@@ -285,11 +304,46 @@ fn mutated_telegrams_never_panic() {
     });
 }
 
-/// `depth` nested non-packed structs, each holding the next as member 1, around a `DInt`.
-fn nested_struct(depth: usize) -> Vec<u8> {
+/// The opening bytes of one nesting level of each value that holds members, up to member key 1;
+/// a `0x00` member-list terminator closes each. Each recurses through different decoder frames.
+const NESTING_LEVELS: [(&str, &[u8]); 4] = [
+    // Struct id 1.
+    ("Struct", &[0x00, dt::STRUCT, 0, 0, 0, 1, 0x01]),
+    // Blob root id 2, 8 reserved bytes, blob type 0.
+    (
+        "BlobStruct",
+        &[0x00, dt::BLOB, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x01],
+    ),
+    // Address array of struct id 1 with one element.
+    ("StructArray", &[0x20, dt::STRUCT, 0, 0, 0, 1, 0x01, 0x01]),
+    // Array of one blob, which is a BlobStruct.
+    (
+        "array of BlobStruct",
+        &[
+            0x10,
+            dt::BLOB,
+            0x01,
+            0x02,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0x00,
+            0x01,
+        ],
+    ),
+];
+
+/// `depth` nested levels of `level` (see [`NESTING_LEVELS`]), each holding the next as member 1,
+/// around a `DInt`.
+fn nested_value(level: &[u8], depth: usize) -> Vec<u8> {
     let mut b = Vec::new();
     for _ in 0..depth {
-        b.extend_from_slice(&[0x00, dt::STRUCT, 0, 0, 0, 1, 0x01]); // struct id 1, member key 1
+        b.extend_from_slice(level);
     }
     PValue::DInt(1).serialize(&mut b).unwrap();
     b.extend(std::iter::repeat_n(0x00, depth)); // member-list terminators
@@ -313,10 +367,20 @@ fn nested_objects(depth: usize, attribute: Option<&[u8]>) -> Vec<u8> {
 #[test]
 fn deep_struct_nesting_is_an_error_not_a_stack_overflow() {
     on_small_stack(|| {
-        // 2000 levels (14 KB) used to overflow the stack and abort the process.
-        assert!(PValue::deserialize(&mut Cursor::new(nested_struct(2000))).is_err());
-        // Real values nest a few levels and still decode.
-        assert!(PValue::deserialize(&mut Cursor::new(nested_struct(8))).is_ok());
+        for (name, level) in NESTING_LEVELS {
+            // 2000 levels (14 KB of structs) used to overflow the stack and abort the process.
+            let deep = nested_value(level, 2000);
+            assert!(
+                PValue::deserialize(&mut Cursor::new(deep)).is_err(),
+                "{name}"
+            );
+            // Real values nest a few levels and still decode.
+            let shallow = nested_value(level, 8);
+            assert!(
+                PValue::deserialize(&mut Cursor::new(shallow)).is_ok(),
+                "{name}"
+            );
+        }
     });
 }
 
@@ -335,10 +399,12 @@ fn deepest_accepted_nesting_fits_a_small_stack() {
     // The worst case the limits allow — maximally nested objects whose innermost attribute is a
     // maximally nested value — must still fit, even in a debug build.
     on_small_stack(|| {
-        let value = nested_struct(s7commplus::value::pvalue::MAX_VALUE_NESTING);
-        let objects = nested_objects(33, Some(&value));
-        let list = decode_object_list(&mut Cursor::new(&objects[..])).unwrap();
-        assert_eq!(list.len(), 1);
+        for (name, level) in NESTING_LEVELS {
+            let value = nested_value(level, s7commplus::value::pvalue::MAX_VALUE_NESTING);
+            let objects = nested_objects(33, Some(&value));
+            let list = decode_object_list(&mut Cursor::new(&objects[..])).unwrap();
+            assert_eq!(list.len(), 1, "{name}");
+        }
     });
 }
 
@@ -359,6 +425,21 @@ fn huge_element_counts_do_not_allocate_up_front() {
     assert!(
         PValue::deserialize(&mut Cursor::new(&[0x10, dt::NULL, 0x8f, 0xff, 0xff, 0x7f])).is_err()
     );
+    // An address array of 0xFFFFFFFF structs (id 1) with nothing behind it.
+    assert!(PValue::deserialize(&mut Cursor::new(&[
+        0x20,
+        dt::STRUCT,
+        0,
+        0,
+        0,
+        1,
+        0x8f,
+        0xff,
+        0xff,
+        0xff,
+        0x7f
+    ]))
+    .is_err());
     // A 4 GiB Blob / WString / byte array length with nothing behind it.
     for datatype in [dt::BLOB, dt::WSTRING] {
         let mut b = vec![0x00, datatype];

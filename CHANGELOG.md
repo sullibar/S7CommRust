@@ -146,6 +146,18 @@ All notable changes to this project are documented here. The format is based on
 - s7tool no longer panics on a malformed `S7_REAL_PLC_KEY`.
 - Requires rustls 0.23.45 or later, which fixes RUSTSEC-2026-0285 (TLS 1.3 handshake messages
   accepted across encryption-level boundaries).
+- Exploring the object root or the device tree (`explore` of `0xc9`, `1` or `0x22`) no longer
+  fails with "decode_object: unexpected element tag 0x00 (rid=34, clsid=2137)", over TLS or
+  legacy connections. The device tree uses four encodings the decoder didn't know: attribute id
+  flags after a non-zero attribute id in an object header (new `PObject::attribute_id_flags`),
+  blobs holding an ID/value list instead of bytes (new `PValue::BlobStruct`), address arrays of
+  non-packed structs (new `PValue::StructArray`) and address arrays of `WString`s (a
+  `PValue::Array`). Where the reference driver doesn't decode these, the layouts follow
+  Wireshark's S7comm-plus dissector.
+- A `Blob` with a root id above 1, as in alarm associated values, is decoded past the 8 reserved
+  bytes and the blob type that precede its length, as the reference does; they used to be read
+  as the length. Serializing such a `Blob` is now an error rather than a form the PLC reads
+  differently.
 
 ## [0.1.0] - 2026-07-05
 
