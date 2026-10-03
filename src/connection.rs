@@ -203,6 +203,11 @@ pub struct Connection {
     max_read_tags: usize,
     /// Most items the PLC accepts in one SetMultiVariables (`SystemLimits`, read at connect).
     max_write_tags: usize,
+    /// The PLC's description of itself in its `ServerSessionVersion` (see
+    /// [`Connection::plc_description`]).
+    plc_description: Option<String>,
+    /// Keep the next request's contents out of the log (it carries credentials).
+    redact_next_request: bool,
 }
 
 /// Captures how a [`Connection`] was created so it can be re-established after a network drop.
@@ -264,8 +269,11 @@ impl Connection {
 
         // Step 2: unencrypted InitSsl bootstrap (sequence number 1).
         let init_req = proto::init_ssl_request_default();
+        log::debug!("→ InitSsl ({} bytes)", init_req.len());
+        log::trace!("→ {}", pdu::Hex(&init_req));
         tcp.send_iso_packet(&init_req)?;
         let init_resp_bytes = tcp.recv_iso_packet()?;
+        log::trace!("← {}", pdu::Hex(&init_resp_bytes));
         let init_resp = proto::parse_init_ssl_response(&init_resp_bytes)?;
         if !init_resp.is_ok() {
             return Err(Error::protocol(format!(
@@ -277,6 +285,7 @@ impl Connection {
         // Step 3: TLS handshake.
         let mut tls = TlsChannel::new(pin)?;
         tls.handshake(&mut tcp)?;
+        log::info!("TLS: {}", tls.describe());
 
         let mut conn = Connection {
             tcp,
@@ -305,10 +314,22 @@ impl Connection {
             legacy_partial: Default::default(),
             max_read_tags: DEFAULT_TAGS_PER_REQUEST,
             max_write_tags: DEFAULT_TAGS_PER_REQUEST,
+            plc_description: None,
+            redact_next_request: false,
         };
 
         // Step 4: CreateObject → session.
         let create_resp = conn.create_session()?;
+        conn.plc_description = create_resp.plc_description();
+        log::info!(
+            "session 0x{:08x}; PLC describes itself as {:?}",
+            conn.session_id,
+            conn.plc_description
+        );
+        log::debug!(
+            "ServerSessionVersion: {:?}",
+            create_resp.server_session_version()
+        );
         // Step 4b: SetMultiVariables session setup — echo ServerSessionVersion (306) back.
         // The PLC rejects later requests (Explore, reads) until this completes.
         let server_session_version =
@@ -334,12 +355,11 @@ impl Connection {
     pub fn connect_legacy<A: ToSocketAddrs>(addr: A, timeout: Duration) -> Result<Self> {
         let addrs: Vec<std::net::SocketAddr> = addr.to_socket_addrs()?.collect();
         let mut tcp = IsoTcp::connect(addrs.as_slice(), timeout)?;
-        let (session_key, session_id, session_id2) =
-            crate::legacy::session::handshake(&mut tcp, &mut |b| {
-                getrandom::getrandom(b).expect("OS CSPRNG")
-            })?;
+        let session = crate::legacy::session::handshake(&mut tcp, &mut |b| {
+            getrandom::getrandom(b).expect("OS CSPRNG")
+        })?;
         let target = ReconnectTarget::LegacyPlcsim { addrs, timeout };
-        Self::new_legacy(tcp, session_key, session_id, session_id2, target)
+        Self::new_legacy(tcp, session, target)
     }
 
     /// Connect to a **real** S7-1200/1500 on legacy (pre-TLS) firmware. The key family (`00:`
@@ -385,17 +405,13 @@ impl Connection {
         // Phase 1: try the explicit/auto-looked-up key; discover the family if none is bundled.
         let mut tcp = IsoTcp::connect(addrs.as_slice(), timeout)?;
         let family = match real_plc_handshake(&mut tcp, public_key, &mut rng)? {
-            RealPlcOutcome::Authenticated {
-                session_key,
-                session_id,
-                session_id2,
-            } => {
+            RealPlcOutcome::Authenticated(session) => {
                 let target = ReconnectTarget::RealPlc {
                     addrs: addrs.clone(),
                     timeout,
                     key: public_key.map(<[u8]>::to_vec),
                 };
-                return Self::new_legacy(tcp, session_key, session_id, session_id2, target);
+                return Self::new_legacy(tcp, session, target);
             }
             RealPlcOutcome::KeyNotBundled { family } => family,
         };
@@ -416,11 +432,7 @@ impl Connection {
                 }
             };
             match real_plc_handshake(&mut t, Some(key), &mut rng) {
-                Ok(RealPlcOutcome::Authenticated {
-                    session_key,
-                    session_id,
-                    session_id2,
-                }) => {
+                Ok(RealPlcOutcome::Authenticated(session)) => {
                     log::info!(
                         "real-PLC: authenticated with bundled key {}/{}",
                         i + 1,
@@ -431,7 +443,7 @@ impl Connection {
                         timeout,
                         key: Some(key.to_vec()), // the bundled key that worked
                     };
-                    return Self::new_legacy(t, session_key, session_id, session_id2, target);
+                    return Self::new_legacy(t, session, target);
                 }
                 Ok(RealPlcOutcome::KeyNotBundled { .. }) => {} // unreachable with a key
                 Err(e) => last_err = Some(e), // wrong key → PLC reset; try the next candidate
@@ -449,11 +461,15 @@ impl Connection {
     /// read the PLC's request limits.
     fn new_legacy(
         tcp: IsoTcp,
-        session_key: [u8; 24],
-        session_id: u32,
-        session_id2: u32,
+        session: crate::legacy::session::LegacySession,
         reconnect_target: ReconnectTarget,
     ) -> Result<Self> {
+        let crate::legacy::session::LegacySession {
+            session_key,
+            session_id,
+            session_id2,
+            plc_description,
+        } = session;
         let mut conn = Connection {
             tcp,
             tls: None,
@@ -477,6 +493,8 @@ impl Connection {
             legacy_partial: Default::default(),
             max_read_tags: DEFAULT_TAGS_PER_REQUEST,
             max_write_tags: DEFAULT_TAGS_PER_REQUEST,
+            plc_description,
+            redact_next_request: false,
         };
         conn.read_request_limits()?;
         Ok(conn)
@@ -516,7 +534,7 @@ impl Connection {
         if let Some(n) = read(2) {
             self.max_write_tags = n;
         }
-        log::debug!(
+        log::info!(
             "PLC request limits: {} items per read, {} per write",
             self.max_read_tags,
             self.max_write_tags
@@ -534,6 +552,13 @@ impl Connection {
     /// didn't). [`Connection::write_variables`] splits larger writes to fit.
     pub fn max_tags_per_write(&self) -> usize {
         self.max_write_tags
+    }
+
+    /// The PLC's description of itself, sent when the session opens: on PLCSIM Advanced
+    /// `1;6ES7 SIM-01500-APLC;S4.1` (a counter, the order number and the firmware version, it
+    /// seems). `None` if the PLC sent none.
+    pub fn plc_description(&self) -> Option<&str> {
+        self.plc_description.as_deref()
     }
 
     /// SHA-256 fingerprint of the TLS certificate the PLC presented, to pin with
@@ -1104,6 +1129,13 @@ impl Connection {
     /// Send a framed request without waiting for a reply (for `0x74` "no response" requests like
     /// the subscription credit top-up). Transport-aware (legacy V3 digest vs TLS).
     fn send_no_response(&mut self, framed: &[u8]) -> Result<()> {
+        let (_, function, seq) = pdu::header_fields(framed).unwrap_or_default();
+        log::debug!(
+            "→ {} seq={seq} ({} bytes, no response expected)",
+            pdu::function_name(function),
+            framed.len()
+        );
+        log::trace!("→ {}", pdu::Hex(framed));
         if let Some(key) = self.legacy_session_key {
             let v3 = crate::legacy::session::frame_v3(&key, framed)?;
             self.tcp.send_iso_packet(&v3)
@@ -1433,7 +1465,16 @@ impl Connection {
                 }
             }
         }
+        let found = dbs.len();
         dbs.retain(|d| d.ti_relid != 0);
+        log::debug!(
+            "data blocks: {} ({} without readable type info skipped): {:?}",
+            dbs.len(),
+            found - dbs.len(),
+            dbs.iter()
+                .map(|d| (d.number, d.name.as_str()))
+                .collect::<Vec<_>>()
+        );
         let list: Arc<[DataBlock]> = dbs.into();
         self.db_list = Some(Arc::clone(&list));
         Ok(list)
@@ -1731,6 +1772,13 @@ impl Connection {
             return Ok(hit.clone());
         }
         let resolved = self.resolve_uncached(symbol)?;
+        let addr = &resolved.0;
+        log::debug!(
+            "resolved {symbol} → area 0x{:08x}, sub-area {}, LIDs {:?}",
+            addr.access_area,
+            addr.access_sub_area,
+            addr.lid
+        );
         self.symbol_cache
             .insert(symbol.to_owned(), resolved.clone());
         Ok(resolved)
@@ -2148,7 +2196,8 @@ impl Connection {
         build_legitimation_payload(username, password).serialize(&mut payload)?;
         let ciphertext = crypto::encrypt_aes256_cbc_pkcs7(&key, iv, &payload)?;
 
-        // 3. Submit the encrypted response.
+        // 3. Submit the encrypted response, keeping it out of the log.
+        self.redact_next_request = true;
         let resp = self.set_variable(
             ids::LEGITIMATE,
             &PValue::Blob {
@@ -2178,20 +2227,49 @@ impl Connection {
                 "connection poisoned by an earlier transport failure; reconnect required",
             ));
         }
-        // Any failure here leaves the sequence/integrity-id counters out of sync with the PLC,
-        // so the connection can no longer be reused. Poison it and surface the error.
-        self.request_response_inner(framed_request).map_err(|e| {
-            self.poisoned = true;
-            if e.is_timeout() {
-                // The response may still arrive and would then be taken as the answer to the
-                // next request: unlike a quiet notification poll, this is not retryable.
-                Error::closed(format!(
-                    "no response within the timeout ({e}); reconnect required"
-                ))
-            } else {
-                e
+        let redact = std::mem::take(&mut self.redact_next_request);
+        let (_, function, seq) = pdu::header_fields(framed_request).unwrap_or_default();
+        let name = pdu::function_name(function);
+        log::debug!("→ {name} seq={seq} ({} bytes)", framed_request.len());
+        if redact {
+            log::trace!("→ (contents not logged: they carry credentials)");
+        } else {
+            log::trace!("→ {}", pdu::Hex(framed_request));
+        }
+        let started = std::time::Instant::now();
+        let result = self.request_response_inner(framed_request);
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        match result {
+            Ok(response) => {
+                match return_value(&response).filter(|&rv| rv != 0) {
+                    Some(rv) => log::debug!(
+                        "← {name} seq={seq} return_value=0x{rv:016x} ({} bytes, {ms:.1} ms)",
+                        response.len()
+                    ),
+                    None => {
+                        log::debug!("← {name} seq={seq} ({} bytes, {ms:.1} ms)", response.len())
+                    }
+                }
+                log::trace!("← {}", pdu::Hex(&response));
+                Ok(response)
             }
-        })
+            // Any failure here leaves the sequence/integrity-id counters out of sync with the
+            // PLC, so the connection can no longer be reused. Poison it and surface the error.
+            Err(e) => {
+                self.poisoned = true;
+                let e = if e.is_timeout() {
+                    // The response may still arrive and would then be taken as the answer to the
+                    // next request: unlike a quiet notification poll, this is not retryable.
+                    Error::closed(format!(
+                        "no response within the timeout ({e}); reconnect required"
+                    ))
+                } else {
+                    e
+                };
+                log::warn!("{name} seq={seq} failed after {ms:.1} ms, connection poisoned: {e}");
+                Err(e)
+            }
+        }
     }
 
     /// Whether an earlier failure left the connection out of step with the PLC. Every request on
@@ -2251,6 +2329,7 @@ impl Connection {
                 continue;
             }
             if let Some(id) = notification_subscription_id(&bytes) {
+                log_notification(id, &bytes, "queued while awaiting a response");
                 self.queue_notification(id, bytes);
                 continue;
             }
@@ -2264,6 +2343,16 @@ impl Connection {
             let bytes = self.recv_one_telegram()?;
             if self.skip_if_system_event(&bytes)? {
                 continue;
+            }
+            match notification_subscription_id(&bytes) {
+                Some(id) => log_notification(id, &bytes, ""),
+                None => {
+                    log::debug!(
+                        "← unexpected telegram while awaiting a notification ({} bytes)",
+                        bytes.len()
+                    );
+                    log::trace!("← {}", pdu::Hex(&bytes));
+                }
             }
             return Ok(bytes);
         }
@@ -2367,24 +2456,35 @@ fn raw_access_refused(verb: &str, area: Area, start: u32, len: u32, code: u64) -
     ))
 }
 
+/// The return value of a framed response (the VLQ after its 10-byte header), for logs.
+fn return_value(response: &[u8]) -> Option<u64> {
+    let h = pdu::parse_header(response).ok()?;
+    let mut cur = std::io::Cursor::new(response.get(h.body_offset + 10..)?);
+    crate::wire::vlq::decode_u64(&mut cur).ok()
+}
+
+/// Log a received notification telegram for subscription `id`.
+fn log_notification(id: u32, bytes: &[u8], note: &str) {
+    let note = if note.is_empty() {
+        String::new()
+    } else {
+        format!(", {note}")
+    };
+    log::debug!(
+        "← Notification for subscription 0x{id:08x} ({} bytes{note})",
+        bytes.len()
+    );
+    log::trace!("← {}", pdu::Hex(bytes));
+}
+
 /// Check that the framed `response` answers the framed `request`: a Response with the request's
 /// sequence number and function code, or the generic Error function a PLC may answer any failed
 /// request with. Anything else means the telegram stream is out of step with our requests, which
 /// no later request can recover from.
 fn check_response_header(request: &[u8], response: &[u8]) -> Result<()> {
-    // Opcode, function code and sequence number: body bytes 0, 3..5 and 7..9 of either.
-    let fields = |buf: &[u8]| {
-        let h = pdu::parse_header(buf).ok()?;
-        let b = buf.get(h.body_offset..h.body_offset + 9)?;
-        Some((
-            b[0],
-            u16::from_be_bytes([b[3], b[4]]),
-            u16::from_be_bytes([b[7], b[8]]),
-        ))
-    };
-    let (_, function, sequence) =
-        fields(request).ok_or_else(|| Error::protocol("request too short for its header"))?;
-    let Some((got_opcode, got_function, got_sequence)) = fields(response) else {
+    let (_, function, sequence) = pdu::header_fields(request)
+        .ok_or_else(|| Error::protocol("request too short for its header"))?;
+    let Some((got_opcode, got_function, got_sequence)) = pdu::header_fields(response) else {
         return Err(Error::protocol("response too short for its header"));
     };
     let answers = got_opcode == pdu::opcode::RESPONSE
@@ -2839,6 +2939,16 @@ mod tests {
         b
     }
 
+    /// The session the mock PLC's handshake would leave: the all-zero key [`MockPlc`] signs with.
+    fn mock_session() -> crate::legacy::session::LegacySession {
+        crate::legacy::session::LegacySession {
+            session_key: [0; 24],
+            session_id: 0x7000_0001,
+            session_id2: 0x7000_0002,
+            plc_description: Some("1;6ES7 MOCK;V0.0".into()),
+        }
+    }
+
     /// A legacy `Connection` to a mock PLC that runs `script` after answering the limits read.
     fn mock_connection(
         timeout: Duration,
@@ -2863,8 +2973,7 @@ mod tests {
             addrs: vec![addr],
             timeout,
         };
-        let conn =
-            Connection::new_legacy(tcp, [0u8; 24], 0x7000_0001, 0x7000_0002, target).unwrap();
+        let conn = Connection::new_legacy(tcp, mock_session(), target).unwrap();
         (conn, plc)
     }
 

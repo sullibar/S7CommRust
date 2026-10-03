@@ -114,14 +114,42 @@ cargo run -p s7tool -- --ip 192.168.0.1 --real-plc browse
 right thing whether `x` is a Bool, Int, Real, or String. The PLC address can also come from
 the `S7_PLC_IP` / `S7_PLC_PORT` environment variables.
 
+Every run writes a **session log**, `s7tool-<UTC time>.log` in the current directory (`--log
+<file>` to choose it, `--no-log` for none): everything s7tool prints, and everything the driver
+does, timestamped — the connection steps, the PLC's description of itself, and each request and
+response with its timing and its bytes in hex. Passwords and key material are left out (the
+legitimation request's contents and the legacy auth request aren't logged, and a password on
+the command line is masked); tag names and values are in.
+
+### Testing on a real PLC
+
+This project has only been run against PLCSIM, so a log from real hardware is worth a lot,
+especially from a CPU on older firmware, whose `--real-plc` path has never met a physical PLC.
+On a machine that reaches the PLC:
+
+```sh
+cargo build --release -p s7tool          # target/release/s7tool(.exe) runs on its own
+s7tool --ip <plc address> --auto report  # read-only; writes s7tool-<time>.log
+```
+
+`--auto` tries TLS, then the legacy scheme of real S7-1200/1500 CPUs, then PLCSIM's, so you don't
+need to know which one the PLC speaks. `report` runs, read-only: `info` (the CPU's name, order
+number and firmware, the transport, request limits, protection level and RUN/STOP), the data
+blocks, every tag with its value, a check of every browsed name, a short subscription, the pending
+alarms and the device tree. A failing step is noted and the rest still run. Send the log file
+with an issue. It names the program's tags and their values, so check it before sharing; if the
+PLC is password-protected, start s7tool without a command and type `legit <user> <password>`,
+then `report`, at its prompt (the password stays out of the log).
+
 ## Firmware and connection paths
 
 A PLC speaks one of two dialects, and firmware alone doesn't decide which: the TIA Portal
 project matters too.
 
 - **TLS** (`connect`): the modern dialect, introduced with S7-1500 firmware V2.9, S7-1200
-  firmware V4.3 and TIA Portal V17. Whether a PLC uses it also depends on its project: the
-  firmware version the project targets, and its PG/PC and HMI communication settings.
+  firmware V4.5 and TIA Portal V17, as "secure PG/PC and HMI communication" (on by default for
+  CPUs added in V17 or later). Whether a PLC uses it also depends on its project: the firmware
+  version the project targets, and its PG/PC and HMI communication settings.
 - **Legacy, non-TLS** (`connect_legacy` for PLCSIM, `connect_real_plc` for hardware): the
   "integrity-protected" scheme of older firmware, which a PLC on newer firmware can still
   use. This path is **not** part of upstream `S7CommPlusDriver`; its cryptography is ported
@@ -129,10 +157,10 @@ project matters too.
 
 The hardware reports collected by
 [gijzelaerr/s7commplus](https://github.com/gijzelaerr/s7commplus) include an S7-1515-2 PN on
-V2.9 using the legacy scheme and an S7-1200 on V4.1 using TLS. So when one path fails at the
-start (`connect`: "InitSsl rejected"; `connect_legacy`: "CreateObject returned no session id"),
-try the other. Validated here: PLCSIM Advanced with a FW V2.9 TLS project and a FW V2.8 legacy
-project.
+V2.9 using the legacy scheme, and S7-1200s on V4.1, V4.5 and V4.7.3 using TLS. So when one path
+fails at the start (`connect`: "InitSsl rejected"; `connect_legacy`: "CreateObject returned no
+session id"), try the other, or let `s7tool --auto` do it. Validated here: PLCSIM Advanced with a
+FW V2.9 TLS project and a FW V2.8 legacy project.
 
 ## Build & test
 

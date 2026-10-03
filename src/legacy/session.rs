@@ -82,22 +82,39 @@ const AUTH_SETMULTI_TEMPLATE: [u8; 433] = [
     0x00,
 ];
 
+/// An authenticated legacy session, as a handshake leaves it.
+pub(crate) struct LegacySession {
+    /// The derived session key (never logged).
+    pub session_key: [u8; 24],
+    pub session_id: u32,
+    pub session_id2: u32,
+    /// See [`crate::proto::CreateObjectResponse::plc_description`].
+    pub plc_description: Option<String>,
+}
+
 /// Perform the legacy handshake on an already COTP-connected socket: plaintext `CreateObject`
 /// (full `ServerSession`) → PlcSim challenge-response auth (with the real-PLC session-setup fix).
-/// Returns `(session_key, session_id, session_id2)`.
 /// `fill_random` supplies the auth's ephemeral key material.
-pub fn handshake(
+pub(crate) fn handshake(
     tcp: &mut IsoTcp,
     fill_random: &mut dyn FnMut(&mut [u8]),
-) -> Result<([u8; 24], u32, u32)> {
+) -> Result<LegacySession> {
     // 1. Plaintext CreateObject → session id + per-session challenge (attribute 303).
+    log::debug!("legacy: → CreateObject (PLCSIM key family)");
     tcp.send_iso_packet(&CREATE_OBJECT_POC[7..])?;
     let resp = recv_response(tcp)?;
+    log::trace!("legacy: ← {}", crate::wire::pdu::Hex(&resp));
     let create = crate::proto::parse_create_object_response(&resp)?;
     let session_id = create
         .session_id()
         .ok_or_else(|| Error::protocol("legacy CreateObject returned no session id"))?;
     let session_id2 = create.session_id2().unwrap_or(0);
+    let plc_description = create.plc_description();
+    log::info!(
+        "legacy: session 0x{session_id:08x}; PLC describes itself as {plc_description:?}; \
+         fingerprints {:?}",
+        crate::legacy::realplc::scan_fingerprints(&resp)
+    );
     let challenge = find_challenge(&resp)
         .ok_or_else(|| Error::protocol("legacy CreateObject: challenge (attr 303) not found"))?;
 
@@ -127,8 +144,14 @@ pub fn handshake(
     );
 
     // 3. Send the auth and require ReturnValue == 0 (otherwise the session is not authenticated).
+    // (Not logged as hex: the request carries the encrypted session key material.)
+    log::debug!(
+        "legacy: → auth SetMultiVariables ({} bytes)",
+        frame.len() - 7
+    );
     tcp.send_iso_packet(&frame[7..])?;
     let r = recv_response(tcp)?;
+    log::trace!("legacy: ← {}", crate::wire::pdu::Hex(&r));
     let rv = r.get(14..).map_or(u64::MAX, decode_vlq_u64);
     if rv != 0 {
         return Err(Error::protocol(format!(
@@ -136,7 +159,13 @@ pub fn handshake(
             rv as u16 as i16
         )));
     }
-    Ok((session_key, session_id, session_id2))
+    log::info!("legacy: auth accepted");
+    Ok(LegacySession {
+        session_key,
+        session_id,
+        session_id2,
+        plc_description,
+    })
 }
 
 /// Assemble an auth `SetMultiVariables` request from a captured `template` (TPKT included):

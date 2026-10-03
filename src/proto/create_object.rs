@@ -113,7 +113,23 @@ impl CreateObjectResponse {
             .find(|(id, _)| *id == ids::SERVER_SESSION_VERSION)
             .map(|(_, value)| value)
     }
+
+    /// The PLC's description of itself: member 319 of its `ServerSessionVersion`, such as
+    /// `1;6ES7 SIM-01500-APLC;S4.1` from PLCSIM Advanced (a counter, the order number and the
+    /// firmware version, it seems).
+    pub fn plc_description(&self) -> Option<String> {
+        match self.server_session_version()? {
+            PValue::Struct { elements, .. } => elements.iter().find_map(|(id, v)| match v {
+                PValue::WString(s) if *id == SERVER_SESSION_DESCRIPTION => Some(s.clone()),
+                _ => None,
+            }),
+            _ => None,
+        }
+    }
 }
+
+/// The member of `ServerSessionVersion` with the PLC's description of itself.
+const SERVER_SESSION_DESCRIPTION: u32 = 319;
 
 /// Parse a `CreateObjectResponse` telegram.
 ///

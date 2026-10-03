@@ -25,9 +25,10 @@ use crate::legacy::family0::blob::{PublicKeyFamily, REALPLC_BLOB_LEN};
 use crate::legacy::pubkey_store;
 use crate::legacy::session::{
     build_auth_request, decode_vlq_u64, find_challenge, recv_response, set_auth_request_lengths,
-    CREATE_OBJECT_POC,
+    LegacySession, CREATE_OBJECT_POC,
 };
 use crate::transport::IsoTcp;
+use crate::wire::pdu::Hex;
 
 // The two auth `SetMultiVariables` templates (S71500_AUTH_TEMPLATE / S71200_AUTH_TEMPLATE),
 // captured from HarpoS7's PoC; each embeds a sample blob we overwrite.
@@ -67,8 +68,17 @@ fn extract_setup_value(buf: &[u8], attr: u8) -> Option<Vec<u8>> {
 /// response `resp`) into the auth request `frame`, and fix its lengths.
 fn echo_setup_values(frame: &mut Vec<u8>, resp: &[u8]) {
     for attr in [0x3bu8, 0x3c, 0x3d, 0x3e] {
-        if let Some(v) = extract_setup_value(resp, attr) {
-            splice_setup_value(frame, attr, &v);
+        match extract_setup_value(resp, attr) {
+            Some(v) => {
+                log::debug!(
+                    "real-PLC: echoing session-setup value {attr:#04x} = {}",
+                    Hex(&v)
+                );
+                splice_setup_value(frame, attr, &v);
+            }
+            None => {
+                log::debug!("real-PLC: no session-setup value {attr:#04x}; keeping the template's")
+            }
         }
     }
     set_auth_request_lengths(frame);
@@ -146,14 +156,9 @@ pub fn detect_real_plc(resp: &[u8]) -> Option<(PublicKeyFamily, String)> {
 }
 
 /// The result of [`real_plc_handshake`].
-pub enum RealPlcOutcome {
-    /// Auth succeeded: the derived 24-byte session key and the session ids (the second is the
-    /// server-session container, used as the RequestId for subsequent object creation).
-    Authenticated {
-        session_key: [u8; 24],
-        session_id: u32,
-        session_id2: u32,
-    },
+pub(crate) enum RealPlcOutcome {
+    /// Auth succeeded.
+    Authenticated(LegacySession),
     /// The PLC's family was detected but it advertised no key-id fingerprint we could match, and
     /// no key was passed. The caller can retry with each bundled key for `family`.
     KeyNotBundled { family: PublicKeyFamily },
@@ -166,27 +171,29 @@ pub enum RealPlcOutcome {
 /// pass `None` to look it up from the bundled [`pubkey_store`] by fingerprint — if that lookup
 /// fails, this returns [`RealPlcOutcome::KeyNotBundled`] (not an error) so the caller can auto-try
 /// the family's bundled keys.
-pub fn real_plc_handshake(
+pub(crate) fn real_plc_handshake(
     tcp: &mut IsoTcp,
     public_key: Option<&[u8]>,
     fill_random: &mut dyn FnMut(&mut [u8]),
 ) -> Result<RealPlcOutcome> {
+    log::debug!("real-PLC: → CreateObject");
     tcp.send_iso_packet(&CREATE_OBJECT_POC[7..])?;
     let resp = recv_response(tcp)?;
+    log::trace!("real-PLC: ← {}", Hex(&resp));
     let create = crate::proto::parse_create_object_response(&resp)?;
     let session_id = create
         .session_id()
         .ok_or_else(|| Error::protocol("real-PLC CreateObject returned no session id"))?;
     let session_id2 = create.session_id2().unwrap_or(0);
+    let plc_description = create.plc_description();
     let challenge = find_challenge(&resp)
         .ok_or_else(|| Error::protocol("real-PLC CreateObject: challenge (attr 303) not found"))?;
 
     log::info!(
-        "real-PLC CreateObject ok: session=0x{session_id:08x}, {} bytes, fingerprints={:?}",
-        resp.len(),
+        "real-PLC: session 0x{session_id:08x}; PLC describes itself as {plc_description:?}; \
+         fingerprints {:?}",
         scan_fingerprints(&resp)
     );
-    log::debug!("real-PLC CreateObject response = {resp:02x?}");
     let (family, fingerprint) = detect_real_plc(&resp).ok_or_else(|| {
         Error::protocol(format!(
             "real-PLC: no 00:/01: fingerprint (not a legacy S7-1200/1500?); \
@@ -195,11 +202,22 @@ pub fn real_plc_handshake(
         ))
     })?;
     let public_key: &[u8] = match public_key {
-        Some(k) => k,
+        Some(k) => {
+            log::info!("real-PLC: family {family:?}, key id {fingerprint:?}; using the key given");
+            k
+        }
         None => match pubkey_store::lookup(family, &fingerprint) {
-            Some(k) => k,
+            Some(k) => {
+                log::info!("real-PLC: family {family:?}, key id {fingerprint:?}; key bundled");
+                k
+            }
             // Family known but key-id not advertised/bundled — let the caller auto-try the family.
-            None => return Ok(RealPlcOutcome::KeyNotBundled { family }),
+            None => {
+                log::info!(
+                    "real-PLC: family {family:?}, key id {fingerprint:?}; no bundled key matches"
+                );
+                return Ok(RealPlcOutcome::KeyNotBundled { family });
+            }
         },
     };
 
@@ -227,8 +245,14 @@ pub fn real_plc_handshake(
     // and cause an internal -258 rejection.
     echo_setup_values(&mut frame, &resp);
 
+    // (Not logged as hex: the request carries the encrypted session key material.)
+    log::debug!(
+        "real-PLC: → auth SetMultiVariables ({} bytes)",
+        frame.len() - 7
+    );
     tcp.send_iso_packet(&frame[7..])?;
     let r = recv_response(tcp)?;
+    log::trace!("real-PLC: ← {}", Hex(&r));
     let rv = r.get(14..).map_or(u64::MAX, decode_vlq_u64);
     if rv != 0 {
         return Err(Error::protocol(format!(
@@ -236,11 +260,13 @@ pub fn real_plc_handshake(
             rv as u16 as i16
         )));
     }
-    Ok(RealPlcOutcome::Authenticated {
+    log::info!("real-PLC: auth accepted");
+    Ok(RealPlcOutcome::Authenticated(LegacySession {
         session_key,
         session_id,
         session_id2,
-    })
+        plc_description,
+    }))
 }
 
 #[cfg(test)]
