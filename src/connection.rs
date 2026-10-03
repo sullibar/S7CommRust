@@ -2163,7 +2163,9 @@ impl Connection {
         } else {
             self.send_tls(framed_request)?;
         }
-        self.recv_response()
+        let response = self.recv_response()?;
+        check_response_header(framed_request, &response)?;
+        Ok(response)
     }
 
     /// Receive the next telegram for the active transport (TLS, or legacy V3-digest framing).
@@ -2318,6 +2320,39 @@ fn raw_access_refused(verb: &str, area: Area, start: u32, len: u32, code: u64) -
     Error::protocol(format!(
         "{verb} {len} bytes at {start} of {area:?} refused ({hint}?): return_value=0x{code:016x}"
     ))
+}
+
+/// Check that the framed `response` answers the framed `request`: a Response with the request's
+/// sequence number and function code, or the generic Error function a PLC may answer any failed
+/// request with. Anything else means the telegram stream is out of step with our requests, which
+/// no later request can recover from.
+fn check_response_header(request: &[u8], response: &[u8]) -> Result<()> {
+    // Opcode, function code and sequence number: body bytes 0, 3..5 and 7..9 of either.
+    let fields = |buf: &[u8]| {
+        let h = pdu::parse_header(buf).ok()?;
+        let b = buf.get(h.body_offset..h.body_offset + 9)?;
+        Some((
+            b[0],
+            u16::from_be_bytes([b[3], b[4]]),
+            u16::from_be_bytes([b[7], b[8]]),
+        ))
+    };
+    let (_, function, sequence) =
+        fields(request).ok_or_else(|| Error::protocol("request too short for its header"))?;
+    let Some((got_opcode, got_function, got_sequence)) = fields(response) else {
+        return Err(Error::protocol("response too short for its header"));
+    };
+    let answers = got_opcode == pdu::opcode::RESPONSE
+        && got_sequence == sequence
+        && (got_function == function || got_function == functioncode::ERROR);
+    if !answers {
+        return Err(Error::closed(format!(
+            "telegram out of step: expected the response to function 0x{function:04x} sequence \
+             {sequence}, got opcode 0x{got_opcode:02x} function 0x{got_function:04x} sequence \
+             {got_sequence}; reconnect required"
+        )));
+    }
+    Ok(())
 }
 
 /// The subscription a framed telegram notifies about, if it is a `Notification` (`0x33`). A
@@ -2665,6 +2700,8 @@ mod tests {
     /// plain [`packet_digest`](crate::legacy::digest::packet_digest).
     struct MockPlc {
         stream: std::net::TcpStream,
+        /// Sequence number of the last request received, which a response must echo.
+        seq: u16,
     }
 
     impl MockPlc {
@@ -2683,7 +2720,32 @@ mod tests {
                     break;
                 }
             }
-            tsdu[4 + 33..tsdu.len() - 4].to_vec()
+            let body = tsdu[4 + 33..tsdu.len() - 4].to_vec();
+            self.seq = u16::from_be_bytes([body[7], body[8]]);
+            body
+        }
+
+        /// A successful response body to `function`, answering the last request, followed by
+        /// `rest`.
+        fn response(&self, function: u16, rest: &[u8]) -> Vec<u8> {
+            let mut body = vec![pdu::opcode::RESPONSE, 0, 0];
+            body.extend_from_slice(&function.to_be_bytes());
+            body.extend_from_slice(&[0, 0]); // reserved
+            body.extend_from_slice(&self.seq.to_be_bytes());
+            body.extend_from_slice(&[0, 0]); // transport flags, return value 0
+            body.extend_from_slice(rest);
+            body
+        }
+
+        /// An Explore response body listing `objects`, answering the last request.
+        fn explore_response(&self, explore_id: u32, objects: &[PObject]) -> Vec<u8> {
+            let mut rest = explore_id.to_be_bytes().to_vec();
+            rest.push(0); // integrity id
+            for o in objects {
+                o.serialize(&mut rest).unwrap();
+            }
+            rest.extend_from_slice(&[0; 4]);
+            self.response(functioncode::EXPLORE, &rest)
         }
 
         /// The V3 telegram carrying `body`, as one COTP DT frame.
@@ -2710,14 +2772,13 @@ mod tests {
         fn answer_limits(&mut self, max: i32) {
             let req = self.recv_request();
             assert_eq!(&req[3..5], &functioncode::GET_MULTI_VARIABLES.to_be_bytes());
-            let mut body = vec![pdu::opcode::RESPONSE, 0, 0];
-            body.extend_from_slice(&functioncode::GET_MULTI_VARIABLES.to_be_bytes());
-            body.extend_from_slice(&[0, 0, 0, 1, 0, 0]); // reserved, seq, flags, rv 0
+            let mut rest = Vec::new();
             for item in [1u8, 2] {
-                body.push(item);
-                PValue::DInt(max).serialize(&mut body).unwrap();
+                rest.push(item);
+                PValue::DInt(max).serialize(&mut rest).unwrap();
             }
-            body.extend_from_slice(&[0, 0, 0]); // end of values, end of errors, integrity id
+            rest.extend_from_slice(&[0, 0, 0]); // end of values, end of errors, integrity id
+            let body = self.response(functioncode::GET_MULTI_VARIABLES, &rest);
             self.send(&body);
         }
     }
@@ -2748,7 +2809,7 @@ mod tests {
             stream
                 .write_all(&[3, 0, 0, 11, 6, 0xd0, 0, 1, 0, 1, 0])
                 .unwrap();
-            let mut plc = MockPlc { stream };
+            let mut plc = MockPlc { stream, seq: 0 };
             plc.answer_limits(100);
             script(plc);
         });
@@ -2898,15 +2959,6 @@ mod tests {
         plc.join().unwrap();
     }
 
-    /// A successful response body to `function`, followed by `rest`.
-    fn response(function: u16, rest: &[u8]) -> Vec<u8> {
-        let mut body = vec![pdu::opcode::RESPONSE, 0, 0];
-        body.extend_from_slice(&function.to_be_bytes());
-        body.extend_from_slice(&[0, 0, 0, 1, 0, 0]); // reserved, seq, flags, rv 0
-        body.extend_from_slice(rest);
-        body
-    }
-
     /// Whether the request body `req` contains the serialized `addr`.
     fn has_address(req: &[u8], addr: &ItemAddress) -> bool {
         let mut bytes = Vec::new();
@@ -2927,14 +2979,14 @@ mod tests {
             };
             value.serialize(&mut rest).unwrap();
             rest.extend_from_slice(&[0, 0, 0]); // end of values, end of errors, integrity id
-            plc.send(&response(functioncode::GET_MULTI_VARIABLES, &rest));
+            plc.send(&plc.response(functioncode::GET_MULTI_VARIABLES, &rest));
 
             // The same read, refused as PLCSIM refuses an optimized block.
             plc.recv_request();
             let mut rest = vec![0, 1]; // no values; an error for item 1
             crate::wire::vlq::encode_u64(&mut rest, 0x8206_8d00_02bf_ffc3).unwrap();
             rest.extend_from_slice(&[0, 0]);
-            plc.send(&response(functioncode::GET_MULTI_VARIABLES, &rest));
+            plc.send(&plc.response(functioncode::GET_MULTI_VARIABLES, &rest));
         });
         assert_eq!(conn.read_area(Area::Memory, 10, 3).unwrap(), [1, 2, 3]);
         let e = conn.read_area(Area::Db(1), 0, 4).unwrap_err();
@@ -2954,21 +3006,10 @@ mod tests {
             assert!(has_address(&req, &ItemAddress::raw(Area::Db(5), 2, 2)));
             // Item 1's value: a Blob (flags 0, type 0x14, root id 0, length 2) of the bytes.
             assert!(req.windows(7).any(|w| w == [1, 0, 0x14, 0, 2, 0xab, 0xcd]));
-            plc.send(&response(functioncode::SET_MULTI_VARIABLES, &[0, 0]));
+            plc.send(&plc.response(functioncode::SET_MULTI_VARIABLES, &[0, 0]));
         });
         conn.write_area(Area::Db(5), 2, &[0xab, 0xcd]).unwrap();
         plc.join().unwrap();
-    }
-
-    /// An Explore response body listing `objects`.
-    fn explore_response(explore_id: u32, objects: &[PObject]) -> Vec<u8> {
-        let mut rest = explore_id.to_be_bytes().to_vec();
-        rest.push(0); // integrity id
-        for o in objects {
-            o.serialize(&mut rest).unwrap();
-        }
-        rest.extend_from_slice(&[0; 4]);
-        response(functioncode::EXPLORE, &rest)
     }
 
     /// The CPU execution unit reporting operating-state `code`, as PLCSIM does.
@@ -2994,11 +3035,11 @@ mod tests {
                 let req = plc.recv_request();
                 assert_eq!(&req[3..5], &functioncode::EXPLORE.to_be_bytes());
                 assert_eq!(&req[14..18], &CPU_EXEC_UNIT_RID.to_be_bytes());
-                plc.send(&explore_response(CPU_EXEC_UNIT_RID, &[exec_unit(code)]));
+                plc.send(&plc.explore_response(CPU_EXEC_UNIT_RID, &[exec_unit(code)]));
             }
             plc.recv_request();
             let bare = PObject::new(CPU_EXEC_UNIT_RID, 2179, 0);
-            plc.send(&explore_response(CPU_EXEC_UNIT_RID, &[bare]));
+            plc.send(&plc.explore_response(CPU_EXEC_UNIT_RID, &[bare]));
         });
         assert_eq!(conn.cpu_state().unwrap(), CpuState::Run);
         assert_eq!(conn.cpu_state().unwrap(), CpuState::Stop);
@@ -3025,7 +3066,7 @@ mod tests {
             );
             let mut subsystem = PObject::new(8, 2668, 0);
             subsystem.objects.push(alarm);
-            plc.send(&explore_response(8, &[subsystem]));
+            plc.send(&plc.explore_response(8, &[subsystem]));
         });
         let alarms = conn.active_alarms().unwrap();
         assert_eq!(alarms.len(), 1);
@@ -3041,19 +3082,64 @@ mod tests {
     #[test]
     fn cpu_state_from_a_plcsim_capture() {
         let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
-            // The PDU data, without the `72 03 len` header and the trailer.
-            let body = &CPU_STATE_RUN[4..CPU_STATE_RUN.len() - 4];
+            // The PDU data, without the `72 03 len` header and the trailer, answering the
+            // request's sequence number rather than the captured one.
+            let mut body = CPU_STATE_RUN[4..CPU_STATE_RUN.len() - 4].to_vec();
             plc.recv_request();
-            plc.send(body);
+            body[7..9].copy_from_slice(&plc.seq.to_be_bytes());
+            plc.send(&body);
             // The same reply in STOP: the code is 4 there, the only change in this attribute.
-            let mut stop = body.to_vec();
-            assert_eq!(stop[0x47 - 4], 8);
-            stop[0x47 - 4] = 4;
+            assert_eq!(body[0x47 - 4], 8);
+            body[0x47 - 4] = 4;
             plc.recv_request();
-            plc.send(&stop);
+            body[7..9].copy_from_slice(&plc.seq.to_be_bytes());
+            plc.send(&body);
         });
         assert_eq!(conn.cpu_state().unwrap(), CpuState::Run);
         assert_eq!(conn.cpu_state().unwrap(), CpuState::Stop);
+        plc.join().unwrap();
+    }
+
+    /// A framed telegram: opcode, function code and sequence number in the header, rest zero.
+    fn telegram(opcode: u8, function: u16, sequence: u16) -> Vec<u8> {
+        let mut body = vec![opcode, 0, 0];
+        body.extend_from_slice(&function.to_be_bytes());
+        body.extend_from_slice(&[0, 0]);
+        body.extend_from_slice(&sequence.to_be_bytes());
+        body.extend_from_slice(&[0; 6]);
+        pdu::frame_single_pdu(protocol_version::V2, &body)
+    }
+
+    #[test]
+    fn a_response_must_answer_its_request() {
+        use functioncode::{ERROR, EXPLORE, GET_MULTI_VARIABLES};
+        use pdu::opcode::{NOTIFICATION, REQUEST, RESPONSE};
+        let request = telegram(REQUEST, GET_MULTI_VARIABLES, 7);
+        let check = |response: Vec<u8>| check_response_header(&request, &response);
+        check(telegram(RESPONSE, GET_MULTI_VARIABLES, 7)).unwrap();
+        check(telegram(RESPONSE, ERROR, 7)).unwrap(); // a failed request, answered generically
+        for (opcode, function, sequence) in [
+            (RESPONSE, GET_MULTI_VARIABLES, 6), // the answer to an earlier request
+            (RESPONSE, EXPLORE, 7),             // the answer to another request
+            (NOTIFICATION, GET_MULTI_VARIABLES, 7),
+        ] {
+            let e = check(telegram(opcode, function, sequence)).unwrap_err();
+            assert!(matches!(e, Error::Closed(_)), "{e}");
+        }
+        assert!(check(telegram(RESPONSE, GET_MULTI_VARIABLES, 7)[..10].to_vec()).is_err());
+    }
+
+    #[test]
+    fn a_response_to_another_request_poisons_the_connection() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            plc.recv_request();
+            plc.seq = plc.seq.wrapping_sub(1); // answer the previous request instead
+            plc.send(&plc.response(functioncode::GET_MULTI_VARIABLES, &[0, 0, 0]));
+        });
+        let e = conn.read_area(Area::Memory, 0, 1).unwrap_err();
+        assert!(matches!(e, Error::Closed(_)), "{e}");
+        assert!(e.is_connection_lost());
+        assert!(conn.is_poisoned());
         plc.join().unwrap();
     }
 

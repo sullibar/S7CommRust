@@ -94,6 +94,14 @@ All notable changes to this project are documented here. The format is based on
 - Legacy connections no longer fail about 1 time in 256 with "legacy auth rejected (errorcode
   -255)". The key ids in the auth request are variable-length, and a short one left a stale
   template byte behind it; they are now spliced in and the frame lengths recomputed.
+- The real-PLC legacy handshake (`connect_real_plc`) echoes the PLC's own session-setup values
+  into its auth request whatever their encoded length. A value that didn't encode to as many
+  octets as the request template's (2 or 4) was skipped, leaving the template's value from a
+  different unit, which the PLC rejects (errorcode -258). Not yet tested on hardware.
+- A response must now answer the request it is read for: the request's sequence number, and its
+  function code or the generic Error function. Any other telegram (the answer to another request)
+  fails with `Error::Closed` and poisons the connection, instead of being decoded as this
+  request's answer.
 - Requests larger than about 1 KB no longer make the PLC drop the connection (e.g. a
   subscription to more than ~50 tags). They were sent as one TLS record, exceeding the
   1024-byte COTP TPDU size negotiated with the PLC; they are now split into S7CommPlus chunks
