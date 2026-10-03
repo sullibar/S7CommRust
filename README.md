@@ -59,6 +59,9 @@ fn main() -> s7commplus::Result<()> {
 ### What you can do
 
 - **Connect** — `connect` (TLS), or `connect_legacy` / `connect_real_plc` (older firmware).
+  Over TLS the PLC's self-signed certificate is accepted as is; `connect_pinned` accepts only
+  the certificate with a given SHA-256 fingerprint (see `peer_certificate_sha256`), which
+  keeps a man in the middle from impersonating the PLC.
   The PLC's per-request item limit is read at connect, and larger reads and writes are split
   to fit (`max_tags_per_read` / `max_tags_per_write`). `close` ends the session cleanly.
 - **Browse** — `datablock_list`, `explore`, `type_info`, `resolve_symbol`, and `resolve_var`
@@ -111,15 +114,25 @@ cargo run -p s7tool -- --ip 192.168.0.1 --real-plc browse
 right thing whether `x` is a Bool, Int, Real, or String. The PLC address can also come from
 the `S7_PLC_IP` / `S7_PLC_PORT` environment variables.
 
-## Firmware requirements
+## Firmware and connection paths
 
-The **TLS** path (`connect`) targets the modern S7CommPlus dialect:
+A PLC speaks one of two dialects, and firmware alone doesn't decide which: the TIA Portal
+project matters too.
 
-- S7-1500 firmware ≥ V2.9, S7-1200 firmware ≥ V4.3, engineered with TIA Portal ≥ V17.
+- **TLS** (`connect`): the modern dialect, introduced with S7-1500 firmware V2.9, S7-1200
+  firmware V4.3 and TIA Portal V17. Whether a PLC uses it also depends on its project: the
+  firmware version the project targets, and its PG/PC and HMI communication settings.
+- **Legacy, non-TLS** (`connect_legacy` for PLCSIM, `connect_real_plc` for hardware): the
+  "integrity-protected" scheme of older firmware, which a PLC on newer firmware can still
+  use. This path is **not** part of upstream `S7CommPlusDriver`; its cryptography is ported
+  from [HarpoS7](https://github.com/bonk-dev/HarpoS7) (MIT — see `LICENSE-HarpoS7`).
 
-Older firmware speaks a different, non-TLS "integrity-protected" scheme. That path
-(`connect_legacy`) is **not** part of upstream `S7CommPlusDriver`; its cryptography is ported
-from [HarpoS7](https://github.com/bonk-dev/HarpoS7) (MIT — see `LICENSE-HarpoS7`).
+The hardware reports collected by
+[gijzelaerr/s7commplus](https://github.com/gijzelaerr/s7commplus) include an S7-1515-2 PN on
+V2.9 using the legacy scheme and an S7-1200 on V4.1 using TLS. So when one path fails at the
+start (`connect`: "InitSsl rejected"; `connect_legacy`: "CreateObject returned no session id"),
+try the other. Validated here: PLCSIM Advanced with a FW V2.9 TLS project and a FW V2.8 legacy
+project.
 
 ## Build & test
 
