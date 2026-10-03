@@ -147,8 +147,9 @@ A PLC speaks one of two dialects, and firmware alone doesn't decide which: the T
 project matters too.
 
 - **TLS** (`connect`): the modern dialect, introduced with S7-1500 firmware V2.9, S7-1200
-  firmware V4.3 and TIA Portal V17. Whether a PLC uses it also depends on its project: the
-  firmware version the project targets, and its PG/PC and HMI communication settings.
+  firmware V4.5 and TIA Portal V17, as "secure PG/PC and HMI communication" (on by default for
+  CPUs added in V17 or later). Whether a PLC uses it also depends on its project: the firmware
+  version the project targets, and its PG/PC and HMI communication settings.
 - **Legacy, non-TLS** (`connect_legacy` for PLCSIM, `connect_real_plc` for hardware): the
   "integrity-protected" scheme of older firmware, which a PLC on newer firmware can still
   use. This path is **not** part of upstream `S7CommPlusDriver`; its cryptography is ported
@@ -156,10 +157,10 @@ project matters too.
 
 The hardware reports collected by
 [gijzelaerr/s7commplus](https://github.com/gijzelaerr/s7commplus) include an S7-1515-2 PN on
-V2.9 using the legacy scheme and an S7-1200 on V4.1 using TLS. So when one path fails at the
-start (`connect`: "InitSsl rejected"; `connect_legacy`: "CreateObject returned no session id"),
-try the other. Validated here: PLCSIM Advanced with a FW V2.9 TLS project and a FW V2.8 legacy
-project.
+V2.9 using the legacy scheme, and S7-1200s on V4.1, V4.5 and V4.7.3 using TLS. So when one path
+fails at the start (`connect`: "InitSsl rejected"; `connect_legacy`: "CreateObject returned no
+session id"), try the other, or let `s7tool --auto` do it. Validated here: PLCSIM Advanced with a
+FW V2.9 TLS project and a FW V2.8 legacy project.
 
 ## Build & test
 
