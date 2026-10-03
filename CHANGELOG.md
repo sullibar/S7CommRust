@@ -97,6 +97,12 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- An alarm's unused associated-value slots are `AssociatedValue::Unused` (new) instead of
+  `Unsupported`: the PLC sends all ten SD slots, the unused ones empty. Found with a firing
+  `Program_Alarm` on PLCSIM, the first live test of alarm reception: the subscription and
+  `active_alarms` both decode it, coming and going, with its SD value. `Alarm::type_name` is
+  documented as what it turned out to be, a transient object name (`TempDai_1`), not the
+  alarm's name. s7tool no longer prints unused SDs, that name, or a blank alarm text.
 - Legacy connections no longer fail about 1 time in 256 with "legacy auth rejected (errorcode
   -255)". The key ids in the auth request are variable-length, and a short one left a stale
   template byte behind it; they are now spliced in and the frame lengths recomputed.

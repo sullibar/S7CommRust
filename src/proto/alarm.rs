@@ -111,6 +111,8 @@ pub enum AssociatedValue {
     Text(String),
     /// A value whose type-info id wasn't recognized (kept so SD indices stay aligned).
     Unsupported,
+    /// A slot the alarm doesn't use: the PLC sends all ten, the unused ones empty.
+    Unused,
 }
 
 impl fmt::Display for AssociatedValue {
@@ -120,7 +122,7 @@ impl fmt::Display for AssociatedValue {
             AssociatedValue::Int(v) => write!(f, "{v}"),
             AssociatedValue::Real(v) => write!(f, "{v}"),
             AssociatedValue::Text(s) => write!(f, "{s}"),
-            AssociatedValue::Unsupported => Ok(()),
+            AssociatedValue::Unsupported | AssociatedValue::Unused => Ok(()),
         }
     }
 }
@@ -141,7 +143,9 @@ pub struct AlarmText {
 /// A decoded alarm event from an alarm-subscription notification.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Alarm {
-    /// The alarm object's type name (e.g. the alarm block's symbolic name).
+    /// The name of the object that carried the alarm (`ObjectVariableTypeName`). Not the alarm's
+    /// own name: PLCSIM sends transient names such as `TempDai_1` in notifications and
+    /// `ExplDai_2` in [`Connection::active_alarms`](crate::Connection::active_alarms).
     pub type_name: String,
     /// The CPU-assigned unique alarm id.
     pub cpu_alarm_id: u64,
@@ -161,7 +165,8 @@ pub struct Alarm {
     pub timestamp: S7DateTime,
     /// When the alarm was acknowledged (epoch/zero if not acknowledged).
     pub ack_timestamp: S7DateTime,
-    /// Associated values SD_1..SD_10 (index 0 = SD_1), decoded to typed values.
+    /// Associated values SD_1..SD_10 (index 0 = SD_1), decoded to typed values; the slots the
+    /// alarm doesn't use are [`AssociatedValue::Unused`].
     pub associated_values: Vec<AssociatedValue>,
     /// Localized alarm texts (one entry per language present in the notification).
     pub texts: Vec<AlarmText>,
@@ -288,6 +293,10 @@ fn decode_associated_value(v: &PValue) -> AssociatedValue {
     let PValue::Blob { root_id, data } = v else {
         return AssociatedValue::Unsupported;
     };
+    if data.is_empty() {
+        // Every type the PLC can send carries at least one byte.
+        return AssociatedValue::Unused;
+    }
     let b = data.as_slice();
     let i16be = |o: usize| b.get(o..o + 2).map(|s| i16::from_be_bytes([s[0], s[1]]));
     let u16be = |o: usize| b.get(o..o + 2).map(|s| u16::from_be_bytes([s[0], s[1]]));
@@ -629,6 +638,71 @@ mod tests {
         let mut obj = PObject::new(0, 0, 0);
         obj.add_attribute(DAI_CPU_ALARM_ID, PValue::LWord(1));
         assert!(Alarm::from_object(&obj).is_err());
+    }
+
+    #[test]
+    fn an_empty_slot_is_unused() {
+        let unused = blob(1, Vec::new());
+        assert_eq!(decode_associated_value(&unused), AssociatedValue::Unused);
+        assert_eq!(AssociatedValue::Unused.to_string(), "");
+        // An empty string still carries its length header, so it is a value.
+        let empty_string = blob(TI_STRING_START + 10, vec![10, 0]);
+        assert_eq!(
+            decode_associated_value(&empty_string),
+            AssociatedValue::Text(String::new())
+        );
+    }
+
+    // Captured from PLCSIM Advanced V2.9 (TLS) with a `Program_Alarm` whose SIG is a DB bool and
+    // whose SD_1 is an Int, no alarm text configured (tools/plcsim/alarms.scl).
+
+    /// The alarms pending (`Connection::active_alarms`): the alarm as it came with SD_1 = 7. (SD_1
+    /// had been changed to 42 since, but an alarm keeps the values it came with.)
+    const PENDING: &[u8] = include_bytes!("../../tests/vectors/proto/alarm_explore_pending.bin");
+    /// The alarm going (SD_1 still 42), then coming again with SD_1 = -7, from an alarm
+    /// subscription.
+    const GOING: &[u8] = include_bytes!("../../tests/vectors/proto/alarm_notification_going.bin");
+    const COMING: &[u8] = include_bytes!("../../tests/vectors/proto/alarm_notification_coming.bin");
+
+    /// SD_1 as an Int and the nine slots the alarm doesn't use.
+    fn assert_one_int_value(alarm: &Alarm, sd_1: i64) {
+        assert_eq!(alarm.associated_values.len(), 10);
+        assert_eq!(alarm.associated_values[0], AssociatedValue::Int(sd_1));
+        assert!(alarm.associated_values[1..]
+            .iter()
+            .all(|v| *v == AssociatedValue::Unused));
+    }
+
+    #[test]
+    fn a_pending_alarm_captured_from_plcsim() {
+        let resp = crate::proto::parse_explore_response(PENDING, true).unwrap();
+        assert!(resp.header.is_ok());
+        let alarms = alarms_in(&resp.objects).unwrap();
+        assert_eq!(alarms.len(), 1);
+        let a = &alarms[0];
+        assert_eq!(a.state, AlarmState::Coming);
+        assert_eq!(a.cpu_alarm_id, 0x8a0e_000a_0001_0000);
+        assert_eq!(a.alarm_domain, 256);
+        assert_one_int_value(a, 7);
+        assert_eq!(a.texts.len(), 1);
+        assert_eq!(a.texts[0].language_id, 1033);
+        assert_eq!(a.message(1033).as_deref(), Some(" ")); // no text configured
+    }
+
+    #[test]
+    fn going_and_coming_notifications_captured_from_plcsim() {
+        let going = crate::proto::parse_notification(GOING).unwrap().alarms();
+        let coming = crate::proto::parse_notification(COMING).unwrap().alarms();
+        assert_eq!((going.len(), coming.len()), (1, 1));
+        let (going, coming) = (&going[0], &coming[0]);
+        assert_eq!(going.state, AlarmState::Going);
+        assert_eq!(coming.state, AlarmState::Coming);
+        assert_eq!(going.cpu_alarm_id, coming.cpu_alarm_id);
+        assert_one_int_value(going, 42);
+        assert_one_int_value(coming, -7);
+        assert_eq!(coming.sequence_counter, going.sequence_counter + 1);
+        let at = |a: &Alarm| a.timestamp.to_string();
+        assert!(at(going) < at(coming), "{} {}", at(going), at(coming));
     }
 
     #[test]
