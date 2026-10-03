@@ -64,6 +64,9 @@ pub mod functioncode {
     pub const SET_VAR_SUBSTREAMED: u16 = 0x057c;
     /// InitSsl — the plaintext bootstrap that switches the connection to TLS.
     pub const INIT_SSL: u16 = 0x05b3;
+    /// Error — the function code a PLC may answer any failed request with (keeping the request's
+    /// sequence number).
+    pub const ERROR: u16 = 0x04b1;
 }
 
 /// Well-known object IDs.

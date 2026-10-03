@@ -165,13 +165,16 @@ pub(crate) fn build_auth_request(
     // The session id appears twice: the request header and the SetMultiVariables object id.
     frame[0x14..0x18].copy_from_slice(&session_id.to_be_bytes());
     frame[0x19..0x1d].copy_from_slice(&session_id.to_be_bytes());
+    set_auth_request_lengths(&mut frame);
+    frame
+}
 
-    // TPKT length (whole frame) and PDU data length (7-byte TPKT/COTP, `72 02 <len>` header and
-    // `72 02 00 00` trailer excluded).
+/// Set an auth request's TPKT length (whole frame) and PDU data length (7-byte TPKT/COTP,
+/// `72 02 <len>` header and `72 02 00 00` trailer excluded) after values were spliced in.
+pub(crate) fn set_auth_request_lengths(frame: &mut [u8]) {
     let tpkt_len = u16::try_from(frame.len()).expect("auth request fits a TPKT");
     frame[2..4].copy_from_slice(&tpkt_len.to_be_bytes());
     frame[9..11].copy_from_slice(&(tpkt_len - 15).to_be_bytes());
-    frame
 }
 
 /// Length in octets of the S7p `UInt64` VLQ at the start of `b` (1–9; see [`decode_vlq_u64`]).

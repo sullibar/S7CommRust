@@ -24,7 +24,8 @@ use crate::legacy::family0::auth::authenticate_real_plc;
 use crate::legacy::family0::blob::{PublicKeyFamily, REALPLC_BLOB_LEN};
 use crate::legacy::pubkey_store;
 use crate::legacy::session::{
-    build_auth_request, decode_vlq_u64, find_challenge, recv_response, CREATE_OBJECT_POC,
+    build_auth_request, decode_vlq_u64, find_challenge, recv_response, set_auth_request_lengths,
+    CREATE_OBJECT_POC,
 };
 use crate::transport::IsoTcp;
 
@@ -62,21 +63,35 @@ fn extract_setup_value(buf: &[u8], attr: u8) -> Option<Vec<u8>> {
     buf.get(start..end).map(<[u8]>::to_vec)
 }
 
-/// Overwrite session-setup attribute `attr`'s value in `frame` with `value`, in place (only if the
-/// existing value has the same VLQ length — the S7-1200/1500 setup values are all 2 or 4 bytes).
-fn patch_setup_value(frame: &mut [u8], attr: u8, value: &[u8]) {
-    let marker = [0x82, attr, 0x00, 0x04];
-    if let Some(p) = frame.windows(4).position(|w| w == marker) {
-        let start = p + 4;
-        let mut end = start;
-        while end < frame.len() && frame[end] & 0x80 != 0 {
-            end += 1;
-        }
-        end += 1;
-        if end - start == value.len() {
-            frame[start..end].copy_from_slice(value);
+/// Copy the PLC's session-setup values (members 0x3b–0x3e of attribute 306 in its `CreateObject`
+/// response `resp`) into the auth request `frame`, and fix its lengths.
+fn echo_setup_values(frame: &mut Vec<u8>, resp: &[u8]) {
+    for attr in [0x3bu8, 0x3c, 0x3d, 0x3e] {
+        if let Some(v) = extract_setup_value(resp, attr) {
+            splice_setup_value(frame, attr, &v);
         }
     }
+    set_auth_request_lengths(frame);
+}
+
+/// Replace session-setup attribute `attr`'s value in the auth request `frame` with `value`, a VLQ
+/// of any length: the PLC's value need not encode to as many octets as the template's (2 or 4).
+/// It used to be skipped when it didn't, leaving the template's value from a different unit,
+/// which the PLC rejects (-258). The caller recomputes the frame lengths. The last marker is
+/// the one taken: the setup values follow the encrypted-key blob, whose random bytes could hold
+/// the marker by chance. Returns whether the attribute was found.
+fn splice_setup_value(frame: &mut Vec<u8>, attr: u8, value: &[u8]) -> bool {
+    let marker = [0x82, attr, 0x00, 0x04];
+    let Some(p) = frame.windows(4).rposition(|w| w == marker) else {
+        return false;
+    };
+    let start = p + 4;
+    let end = frame[start..]
+        .iter()
+        .position(|o| o & 0x80 == 0)
+        .map_or(frame.len(), |i| start + i + 1);
+    frame.splice(start..end, value.iter().copied());
+    true
 }
 
 /// Scan a response for fingerprint-like ASCII strings (`hh:<hex...>`) — a diagnostic aid when
@@ -210,11 +225,7 @@ pub fn real_plc_handshake(
     // Echo the PLC's own session-setup values (attr-306 members 0x3b-0x3e from the CreateObject
     // response) into the auth request; the template's captured values are from a different unit
     // and cause an internal -258 rejection.
-    for attr in [0x3bu8, 0x3c, 0x3d, 0x3e] {
-        if let Some(v) = extract_setup_value(&resp, attr) {
-            patch_setup_value(&mut frame, attr, &v);
-        }
-    }
+    echo_setup_values(&mut frame, &resp);
 
     tcp.send_iso_packet(&frame[7..])?;
     let r = recv_response(tcp)?;
@@ -278,6 +289,115 @@ mod tests {
             include_bytes!("../../tests/vectors/family0/auth/s71200b-blob.bin"),
             include_bytes!("../../tests/vectors/family0/auth/s71200b-req.bin"),
         );
+    }
+
+    /// The S7-1500 golden auth request, before the setup values are echoed into it.
+    fn s71500_request(blob: &[u8]) -> Vec<u8> {
+        let public_key =
+            hex("8456A26996122216C921C571FF11E0BEFAFDB1D70B5D4BC8390F5B0CC273EC142A03F2A04E6F1593");
+        let sk = include_bytes!("../../tests/vectors/family0/auth/s71500-sk.bin");
+        build_real_plc_request(
+            PublicKeyFamily::S71500,
+            &derive_key_id(&public_key),
+            &derive_key_id(sk),
+            blob,
+            0x7000_103D,
+        )
+    }
+
+    /// A `CreateObject` response stand-in carrying session-setup `values` as `(attr, vlq)`.
+    fn setup_response(values: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut resp = vec![0xa3, 0x82, 0x32, 0x00, 0x17]; // attribute 306, a struct
+        for (attr, v) in values {
+            resp.extend_from_slice(&[0x82, *attr, 0x00, 0x04]);
+            resp.extend_from_slice(v);
+        }
+        resp.push(0);
+        resp
+    }
+
+    fn assert_lengths_consistent(frame: &[u8]) {
+        assert_eq!(
+            usize::from(u16::from_be_bytes([frame[2], frame[3]])),
+            frame.len()
+        );
+        assert_eq!(
+            usize::from(u16::from_be_bytes([frame[9], frame[10]])),
+            frame.len() - 15
+        );
+        assert_eq!(&frame[frame.len() - 4..], &[0x72, 0x02, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn setup_values_of_any_vlq_length_are_echoed() {
+        let blob = include_bytes!("../../tests/vectors/family0/auth/s71500-blob.bin");
+        let template = s71500_request(blob);
+        // The template holds 2- and 4-octet values; the PLC's may encode to 1, 3 or 5 octets.
+        let values: [(u8, &[u8]); 4] = [
+            (0x3b, &[0x05]),
+            (0x3c, &[0x81, 0x80, 0x00]),
+            (0x3d, &[0x8f, 0xff, 0xff, 0xff, 0x7f]),
+            (0x3e, &[0x84, 0x00]),
+        ];
+        let mut frame = template.clone();
+        echo_setup_values(&mut frame, &setup_response(&values));
+        for (attr, v) in values {
+            assert_eq!(
+                extract_setup_value(&frame, attr).as_deref(),
+                Some(v),
+                "attr {attr:#x}"
+            );
+        }
+        assert_lengths_consistent(&frame);
+        assert_eq!(
+            frame.len() + (2 + 2 + 4 + 4),
+            template.len() + (1 + 3 + 5 + 2)
+        );
+        // Everything between the length fields and the first setup value is untouched, the blob
+        // included.
+        let first = template.windows(2).position(|w| w == [0x82, 0x3b]).unwrap();
+        assert_eq!(&frame[11..first], &template[11..first]);
+    }
+
+    #[test]
+    fn a_setup_value_the_plc_omits_keeps_the_template_value() {
+        let blob = include_bytes!("../../tests/vectors/family0/auth/s71500-blob.bin");
+        let template = s71500_request(blob);
+        let mut frame = template.clone();
+        echo_setup_values(&mut frame, &setup_response(&[(0x3c, &[0x84, 0x01])]));
+        assert_eq!(
+            extract_setup_value(&frame, 0x3b),
+            extract_setup_value(&template, 0x3b)
+        );
+        assert_eq!(
+            extract_setup_value(&frame, 0x3c).as_deref(),
+            Some(&[0x84, 0x01][..])
+        );
+        assert_eq!(frame.len(), template.len());
+        assert_lengths_consistent(&frame);
+    }
+
+    #[test]
+    fn a_setup_marker_inside_the_blob_is_left_alone() {
+        // The blob is random; one holding the marker by chance must not be patched.
+        let mut blob = *include_bytes!("../../tests/vectors/family0/auth/s71500-blob.bin");
+        blob[10..15].copy_from_slice(&[0x82, 0x3b, 0x00, 0x04, 0x07]);
+        let template = s71500_request(&blob);
+        let mut frame = template.clone();
+        echo_setup_values(&mut frame, &setup_response(&[(0x3b, &[0x09])]));
+        let at = template
+            .windows(5)
+            .position(|w| w == [0x82, 0x3b, 0x00, 0x04, 0x07])
+            .unwrap();
+        assert_eq!(&frame[at..at + 5], &[0x82, 0x3b, 0x00, 0x04, 0x07]);
+        assert_eq!(
+            frame
+                .windows(5)
+                .filter(|w| *w == [0x82, 0x3b, 0x00, 0x04, 0x09])
+                .count(),
+            1
+        );
+        assert_lengths_consistent(&frame);
     }
 
     fn hex(s: &str) -> Vec<u8> {
