@@ -41,6 +41,16 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- A live test suite, `tests/live.rs` (ignored by default; see `tools/plcsim/README.md`), run
+  against PLCSIM Advanced with either test project: browse round trips, reads past the item
+  limit, writes, byte-offset access, CPU state, finite-credit subscriptions, a write on a
+  subscribed connection (notified, no reset), a large recursive Explore, reconnect, a connection
+  soak, and on the TLS project the standard block, certificate pinning and a raised and cleared
+  alarm. `tools/plcsim` holds the test projects' SCL sources and the TIA Openness scripts that
+  build them and switch the simulator between them.
+- Tests against TIA Portal's own traffic (`tests/golden_tia.rs`, frames from a capture shared via
+  gijzelaerr/s7commplus): the device-tree Explore request is byte-identical to TIA's, and TIA's
+  CPU-state and diagnostic-event notifications decode.
 - TLS certificate pinning: `Connection::connect_pinned` accepts only the PLC whose certificate
   has the given SHA-256 fingerprint and which signs the handshake with that certificate's key;
   anything else fails the handshake with `Error::Tls`. `Connection::peer_certificate_sha256`

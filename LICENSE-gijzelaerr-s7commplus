@@ -5,8 +5,9 @@ gijzelaerr/s7commplus (https://github.com/gijzelaerr/s7commplus,
 x-only ECDH and a PRESENT-80 variant, and its fingerprint as a fixed SPN. The chained
 response digests in `src/legacy/digest.rs` (`ResponseDigests`) and their OpenSSL test
 vectors follow its `s7commplus/_fragment_hmac.py` and
-`tests/fixtures/s7commplus/legacy_fragment_hmac.json`. That work is used under the MIT
-License; the original notice is reproduced below, as required.
+`tests/fixtures/s7commplus/legacy_fragment_hmac.json`. The TIA Portal frames in
+`tests/golden_tia.rs` come from its `tests/fixtures/golden_tia_online_session_20260915.py`.
+That work is used under the MIT License; the original notice is reproduced below, as required.
 
 ----------------------------------------------------------------------------------------
 

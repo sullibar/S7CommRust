@@ -142,6 +142,14 @@ cargo test       # codec + protocol unit tests run without hardware
 cargo clippy --all-targets
 ```
 
+`cargo test` also checks the parsers against frames captured from PLCSIM and from TIA Portal.
+A live suite (`tests/live.rs`, ignored by default) exercises a PLCSIM Advanced instance running
+one of the test projects in [`tools/plcsim`](tools/plcsim/README.md):
+
+```sh
+S7_PLC_IP=169.254.130.10 cargo test --test live -- --ignored   # add S7_LEGACY=1 for the legacy project
+```
+
 The `examples/` directory contains runnable probes (`read`, `write`, `browse`, `mq`,
 `legitimate`, `legacy_read`, …) that expect a reachable PLC; point them at one with
 `S7_PLC_IP=<addr>`. Set `SSLKEYLOGFILE=<path>` to dump TLS secrets for Wireshark analysis — the

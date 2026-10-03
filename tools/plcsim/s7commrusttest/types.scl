@@ -1,0 +1,29 @@
+﻿TYPE "UDT.1"
+VERSION : 0.1
+   STRUCT
+      a : Int;
+      "b.c" : Real;
+      flags : Array[0..2] of Bool;
+   END_STRUCT;
+END_TYPE
+
+FUNCTION_BLOCK "FB.1"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+   VAR_INPUT
+      in1 : Bool;
+   END_VAR
+   VAR_OUTPUT
+      out1 : Int;
+   END_VAR
+   VAR_IN_OUT
+      io1 : Int;
+   END_VAR
+   VAR
+      s : "UDT.1";
+      t1 : TON_TIME;
+      cnt : DInt;
+   END_VAR
+BEGIN
+   #cnt := #cnt + 1;
+END_FUNCTION_BLOCK
