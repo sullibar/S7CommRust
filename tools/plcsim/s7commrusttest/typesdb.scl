@@ -1,0 +1,57 @@
+﻿DATA_BLOCK "Types DB"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+NON_RETAIN
+   VAR
+      xBool : Bool := TRUE;
+      xByte : Byte := 16#12;
+      xWord : Word := 16#1234;
+      xDWord : DWord := 16#12345678;
+      xLWord : LWord := 16#123456789ABCDEF0;
+      xSInt : SInt := -5;
+      xInt : Int := -1234;
+      xDInt : DInt := -123456;
+      xLInt : LInt := -1234567890123;
+      xUSInt : USInt := 200;
+      xUInt : UInt := 60000;
+      xUDInt : UDInt := 4000000000;
+      xULInt : ULInt := 12345678901234;
+      xReal : Real := 3.5;
+      xLReal : LReal := 2.25;
+      xChar : Char := 'A';
+      xWChar : WChar;
+      xString : String := 'hello';
+      xString10 : String[10] := 'abc';
+      xWString : WString;
+      xTime : Time := T#1s;
+      xLTime : LTime;
+      xDate : Date := D#2026-10-02;
+      xTod : Time_Of_Day := TOD#12:34:56;
+      xLTod : LTOD;
+      xDT : Date_And_Time;
+      xLDT : LDT;
+      xDTL : DTL;
+      xS5Time : S5Time := S5T#2s;
+      arrBool : Array[1..10] of Bool;
+      arrNeg : Array[-2..2] of Int;
+      arr2d : Array[0..1, 0..2] of Int;
+      arrUdt : Array[0..1] of "UDT.1";
+      arrStruct : Array[0..1] of Struct
+         v : Int;
+         w : Real;
+      END_STRUCT;
+      udt : "UDT.1";
+      deep : Struct
+         lvl2 : Struct
+            lvl3 : Int := 3;
+         END_STRUCT;
+      END_STRUCT;
+      arrString : Array[0..1] of String[8];
+      iec : IEC_TIMER;
+   END_VAR
+BEGIN
+   arrNeg[-2] := -22;
+   arr2d[1,2] := 12;
+   arrUdt[1].a := 11;
+   arrStruct[1].w := 1.25;
+END_DATA_BLOCK

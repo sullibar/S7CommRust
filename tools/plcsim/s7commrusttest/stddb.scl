@@ -1,0 +1,16 @@
+﻿DATA_BLOCK "Std DB"
+{ S7_Optimized_Access := 'FALSE' }
+VERSION : 0.1
+NON_RETAIN
+   VAR
+      a : Int := 1;
+      b : Real := 2.5;
+      c : Bool := TRUE;
+      s : String[10] := 'std';
+      st : Struct
+         x : DInt := 77;
+      END_STRUCT;
+      arr : Array[0..3] of Int;
+   END_VAR
+BEGIN
+END_DATA_BLOCK

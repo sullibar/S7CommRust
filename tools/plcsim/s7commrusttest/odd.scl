@@ -1,0 +1,43 @@
+﻿DATA_BLOCK "Odd .[][1]'\ ,#$%&/:;*?<>|{}=+@!~^`()-éß温"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+NON_RETAIN
+   VAR
+      "m.x" : Int := 100;
+      "m[x" : Int := 101;
+      "m]x" : Int := 102;
+      "m[1]x" : Int := 103;
+      "m'x" : Int := 104;
+      "m\x" : Int := 105;
+      "m x" : Int := 106;
+      "m,x" : Int := 107;
+      "m#x" : Int := 108;
+      "m$x" : Int := 109;
+      "m%x" : Int := 110;
+      "m&x" : Int := 111;
+      "m/x" : Int := 112;
+      "m:x" : Int := 113;
+      "m;x" : Int := 114;
+      "m*x" : Int := 115;
+      "m?x" : Int := 116;
+      "m<x" : Int := 117;
+      "m>x" : Int := 118;
+      "m|x" : Int := 119;
+      "m{x" : Int := 120;
+      "m}x" : Int := 121;
+      "m=x" : Int := 122;
+      "m+x" : Int := 123;
+      "m@x" : Int := 124;
+      "m!x" : Int := 125;
+      "m~x" : Int := 126;
+      "m^x" : Int := 127;
+      "m`x" : Int := 128;
+      "m(x" : Int := 129;
+      "m)x" : Int := 130;
+      "m-x" : Int := 131;
+      "méx" : Int := 132;
+      "mßx" : Int := 133;
+      "m温x" : Int := 134;
+   END_VAR
+BEGIN
+END_DATA_BLOCK
