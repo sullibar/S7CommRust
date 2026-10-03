@@ -67,6 +67,10 @@ pub mod functioncode {
     /// Error — the function code a PLC may answer any failed request with (keeping the request's
     /// sequence number).
     pub const ERROR: u16 = 0x04b1;
+    /// Error2 — a second error/abort response code (Wireshark `S7COMMP_FUNCTIONCODE_ERROR_2`).
+    /// Firmware that predates TLS S7CommPlus answers an `InitSsl` request with this instead of a
+    /// real `InitSsl` response; observed on S7-1200 FW 2.2 and FW 4.2.
+    pub const ERROR_2: u16 = 0x05a9;
 }
 
 /// Well-known object IDs.
@@ -268,6 +272,7 @@ pub fn function_name(code: u16) -> &'static str {
         functioncode::SET_VAR_SUBSTREAMED => "SetVarSubstreamed",
         functioncode::INIT_SSL => "InitSsl",
         functioncode::ERROR => "Error",
+        functioncode::ERROR_2 => "Error2",
         _ => "unknown function",
     }
 }

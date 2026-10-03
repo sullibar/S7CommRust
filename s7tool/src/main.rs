@@ -243,6 +243,9 @@ fn connect_auto(addr: (&str, u16), timeout: Duration) -> Result<Connection> {
     out!("trying TLS ...");
     match Connection::connect(addr, timeout) {
         Ok(conn) => return Ok(conn),
+        // "InitSsl rejected" covers both no-TLS signals real hardware sends: a genuine
+        // InitSsl response carrying an error return value, and an error/abort function code
+        // (Error2 0x05a9) from firmware that predates TLS S7CommPlus. Either way, fall through.
         Err(e) if e.to_string().contains("InitSsl rejected") => out!("  no TLS: {e}"),
         Err(e) => return Err(e),
     }

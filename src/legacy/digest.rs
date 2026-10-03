@@ -43,16 +43,26 @@ pub fn packet_digest(session_key: &[u8], data: &[u8]) -> Result<[u8; DIGEST_LEN]
 
 /// Checks the digests of one response's chunks, in the order they arrive.
 ///
-/// Only a response's first chunk carries a plain [`packet_digest`]. The PLC keeps using its
-/// HMAC-SHA256 context after finalizing it, as if OpenSSL's `SHA256_Final` were followed by more
-/// `SHA256_Update` calls: for each later chunk, the inner and outer SHA-256 states resume from
-/// their previous digests and their byte counts keep growing (Biham et al., *Rogue7*, 2019,
-/// §3.1). The chunks are therefore chained, so none can be dropped, reordered, or spliced in from
-/// another response. On PLCSIM Advanced FW V2.8 every continuation chunk carries the chained
-/// digest, never a plain one.
+/// Only a response's first chunk carries a plain [`packet_digest`]. Later chunks carry a digest
+/// chained from the previous one, but real devices use one of two dialects in the field:
+///
+/// * **State-resume** (PLCSIM Advanced, and real S7-1200/1500 e.g. FW 4.2): the PLC keeps using
+///   its HMAC-SHA256 context after finalizing it, as if OpenSSL's `SHA256_Final` were followed
+///   by more `SHA256_Update` calls: the inner and outer SHA-256 states resume from their previous
+///   digests and their byte counts keep growing (Biham et al., *Rogue7*, 2019, §3.1).
+/// * **Feed-forward** (real S7-1200/1500 e.g. FW 4.6): each later chunk's digest is a *fresh*
+///   HMAC over the previous chunk's digest followed by this chunk's fragment,
+///   `HMAC(key, digest_{n-1} || fragment_n)`.
+///
+/// Either way the chunks are chained, so none can be dropped, reordered, or spliced in from
+/// another response. This verifier accepts whichever dialect the PLC uses, since both are keyed
+/// MACs over the previous chunk.
 pub(crate) struct ResponseDigests {
     inner: ChainedSha256,
     outer: ChainedSha256,
+    key: [u8; SESSION_KEY_LEN],
+    /// The previous chunk's digest, for the feed-forward dialect.
+    last: [u8; DIGEST_LEN],
 }
 
 impl ResponseDigests {
@@ -72,26 +82,37 @@ impl ResponseDigests {
         Ok(ResponseDigests {
             inner: ChainedSha256::after_block(&pad(0x36)),
             outer: ChainedSha256::after_block(&pad(0x5c)),
+            key: key.try_into().expect("SESSION_KEY_LEN bytes"),
+            last: [0u8; DIGEST_LEN],
         })
     }
 
-    /// Check the next chunk's `digest` over its `fragment`.
+    /// Check the next chunk's `digest` over its `fragment`, accepting either chaining dialect.
     pub(crate) fn verify(&mut self, digest: &[u8], fragment: &[u8]) -> Result<()> {
         let inner = self.inner.finalize_and_continue(fragment);
-        let expected = self.outer.finalize_and_continue(&inner);
+        let chained = self.outer.finalize_and_continue(&inner);
+        // Feed-forward: HMAC(key, previous_digest || fragment).
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.key).expect("HMAC accepts any key");
+        mac.update(&self.last);
+        mac.update(fragment);
+        let fed = mac.finalize().into_bytes();
         // Constant time, as for any MAC check.
-        let differs = digest.len() != DIGEST_LEN
-            || expected
-                .iter()
-                .zip(digest)
-                .fold(0, |acc, (a, b)| acc | (a ^ b))
-                != 0;
-        if differs {
-            return Err(Error::integrity(
-                "legacy response digest mismatch: altered in transit, or not from this session",
-            ));
+        let ok = |expected: &[u8]| {
+            digest.len() == DIGEST_LEN
+                && expected
+                    .iter()
+                    .zip(digest)
+                    .fold(0, |acc, (a, b)| acc | (a ^ b))
+                    == 0
+        };
+        if ok(&chained) || ok(&fed) {
+            // `ok` only returns true when `digest` is exactly DIGEST_LEN, so this never truncates.
+            self.last.copy_from_slice(&digest[..DIGEST_LEN]);
+            return Ok(());
         }
-        Ok(())
+        Err(Error::integrity(
+            "legacy response digest mismatch: altered in transit, or not from this session",
+        ))
     }
 }
 
@@ -241,6 +262,49 @@ mod tests {
         for (digest, fragment) in &chunks {
             digests.verify(digest, fragment).unwrap();
         }
+    }
+
+    /// A real PLC (S7-1200 FW 4.6) chains continuation chunks as a *fresh* HMAC over the
+    /// previous chunk's digest followed by the fragment — `HMAC(key, digest_{n-1} || frag)`.
+    /// The verifier must accept that dialect too.
+    #[test]
+    fn feed_forward_dialect_is_verified_too() {
+        let key = (0..24).collect::<Vec<u8>>();
+        let frag_of = |lo: u32, hi: u32| (lo..hi).map(|i| (i * 13 % 256) as u8).collect::<Vec<_>>();
+        // First chunk of a response: plain digest.
+        let frag1 = frag_of(0, 300);
+        let d1 = packet_digest(&key, &frag1).unwrap();
+        // Continuation chunks: HMAC(key, prev_digest || fragment).
+        let fed = |prev: &[u8], frag: &[u8]| {
+            let mut mac = Hmac::<Sha256>::new_from_slice(&key).unwrap();
+            mac.update(prev);
+            mac.update(frag);
+            mac.finalize().into_bytes()
+        };
+        let frag2 = frag_of(100, 500);
+        let d2 = fed(&d1, &frag2);
+        let frag3 = frag_of(7, 60);
+        let d3 = fed(&d2, &frag3);
+
+        let mut digs = ResponseDigests::new(&key).unwrap();
+        digs.verify(&d1, &frag1).unwrap();
+        digs.verify(d2.as_slice(), &frag2).unwrap();
+        digs.verify(d3.as_slice(), &frag3).unwrap();
+    }
+
+    /// A digest from the wrong dialect (state-resume where the PLC used feed-forward, or vice
+    /// versa) is still rejected.
+    #[test]
+    fn wrong_dialect_is_rejected() {
+        let key = (0..24).collect::<Vec<u8>>();
+        let frag1: Vec<u8> = (0..300u32).map(|i| (i * 7 % 256) as u8).collect();
+        let d1 = packet_digest(&key, &frag1).unwrap();
+        let frag2: Vec<u8> = (100..500u32).map(|i| (i * 13 % 256) as u8).collect();
+        // Feed-forward expects HMAC(key, d1 || frag2); give it the plain-over-frag2 digest.
+        let plain2 = packet_digest(&key, &frag2).unwrap();
+        let mut digs = ResponseDigests::new(&key).unwrap();
+        digs.verify(&d1, &frag1).unwrap();
+        assert!(matches!(digs.verify(&plain2, &frag2), Err(Error::Integrity(_))));
     }
 
     #[test]

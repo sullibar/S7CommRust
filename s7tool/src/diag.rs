@@ -70,28 +70,60 @@ struct CpuModule {
 }
 
 fn cpu_module(conn: &mut Connection) -> Result<Option<CpuModule>> {
+    // The device tree lists every module in the rack — the CPU plus any signal/comms modules,
+    // which also carry an identification record. Pick the module whose order number matches the
+    // CPU's own self-description ("1;<order no>;<fw>"); fall back to the first identification
+    // record found (a lone CPU, e.g. PLCSIM, or a CPU not matched in the tree).
+    let want = conn
+        .plc_description()
+        .and_then(cpu_order_number)
+        .map(normalize_order);
     let resp = conn.explore(DEVICE_TREE, 1, 0, &[])?;
     let mut pending: Vec<&PObject> = resp.objects.iter().collect();
+    let mut first: Option<CpuModule> = None;
     while let Some(obj) = pending.pop() {
         if let Some(PValue::Blob { data, .. }) = obj.attribute(MODULE_IDENTIFICATION) {
             let (order_number, firmware) = identification(data);
-            if order_number.is_some() {
+            if let Some(order) = order_number {
                 let name = match obj.attribute(MODULE_NAME) {
                     Some(PValue::Blob { data, .. }) => {
                         Some(String::from_utf8_lossy(data).trim().to_string())
                     }
                     _ => None,
                 };
-                return Ok(Some(CpuModule {
+                let is_cpu = want
+                    .as_deref()
+                    .is_some_and(|w| normalize_order(&order) == w);
+                let module = CpuModule {
                     name,
-                    order_number,
+                    order_number: Some(order),
                     firmware,
-                }));
+                };
+                if is_cpu {
+                    return Ok(Some(module));
+                }
+                first.get_or_insert(module);
             }
         }
         pending.extend(&obj.objects);
     }
-    Ok(None)
+    Ok(first)
+}
+
+/// The CPU's order number from its self-description `"1;<order no>;<fw>"`, e.g.
+/// `"6ES7 214-1BG40-0XB0"` from `"1;6ES7 214-1BG40-0XB0 ;V4.6"`.
+fn cpu_order_number(description: &str) -> Option<&str> {
+    let order = description.split(';').nth(1)?.trim();
+    (!order.is_empty()).then_some(order)
+}
+
+/// An order number with its whitespace stripped and upper-cased, so the device-tree record and
+/// the self-description compare equal regardless of spacing.
+fn normalize_order(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect::<String>()
+        .to_ascii_uppercase()
 }
 
 /// The order number and firmware version in a module's identification record. On PLCSIM
@@ -186,5 +218,27 @@ mod tests {
             identification(b"..6ES7 214-1AG40-0XB0"),
             (Some("6ES7 214-1AG40-0XB0".into()), None)
         );
+    }
+
+    #[test]
+    fn cpu_order_number_from_description() {
+        assert_eq!(
+            cpu_order_number("1;6ES7 214-1BG40-0XB0 ;V4.6"),
+            Some("6ES7 214-1BG40-0XB0")
+        );
+        assert_eq!(
+            cpu_order_number("1;6ES7 SIM-01500-APLC;S4.1"),
+            Some("6ES7 SIM-01500-APLC")
+        );
+        assert_eq!(cpu_order_number("no semicolons"), None);
+        assert_eq!(cpu_order_number("1; ;V4.6"), None);
+    }
+
+    #[test]
+    fn order_numbers_compare_ignoring_spacing() {
+        // The CPU's own record matches the self-description; a signal module's does not.
+        let want = normalize_order("6ES7 214-1BG40-0XB0");
+        assert_eq!(normalize_order("6ES7214-1BG40-0XB0 "), want);
+        assert_ne!(normalize_order("6ES7 231-4HD32-0XB0"), want);
     }
 }
