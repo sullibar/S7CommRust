@@ -74,10 +74,16 @@ pub fn parse_init_ssl_response(buf: &[u8]) -> Result<InitSslResponse> {
 
     let header = ResponseHeader::read(&mut cur)?;
     if header.function_code != functioncode::INIT_SSL {
+        // Firmware without TLS S7CommPlus answers InitSsl with an error/abort function code
+        // (e.g. Error2 0x05a9 on S7-1200 FW 2.2 / 4.2) rather than a real InitSsl response.
+        // Phrase this as a rejection so the `--auto` path treats it as "no TLS" and falls
+        // through to the legacy transport (see `s7tool`'s `connect_auto`).
         return Err(Error::protocol(format!(
-            "InitSslResponse: expected function InitSsl (0x{:04x}), got 0x{:04x}",
+            "InitSsl rejected: PLC answered function {} (0x{:04x}), not InitSsl (0x{:04x}) — \
+             no TLS S7CommPlus (firmware too old)",
+            pdu::function_name(header.function_code),
+            header.function_code,
             functioncode::INIT_SSL,
-            header.function_code
         )));
     }
     Ok(InitSslResponse {
@@ -147,5 +153,25 @@ mod tests {
         body.extend_from_slice(&0u16.to_be_bytes());
         let framed = pdu::frame_single_pdu(protocol_version::V1, &body);
         assert!(parse_init_ssl_response(&framed).is_err());
+    }
+
+    /// Firmware too old for TLS answers InitSsl with Error2 (0x05a9). Parsing must fail with a
+    /// "rejected" message so `--auto` falls through to the legacy transport instead of aborting.
+    #[test]
+    fn error2_response_is_reported_as_rejected() {
+        let mut body = Vec::new();
+        body.push(opcode::RESPONSE);
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(&functioncode::ERROR_2.to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(&1u16.to_be_bytes()); // sequence
+        body.push(0x34); // transport flags
+        vlq::encode_u64(&mut body, 0xa201_d600_01f2_fdf9).unwrap(); // an error return value
+        let framed = pdu::frame_single_pdu(protocol_version::V1, &body);
+
+        let err = parse_init_ssl_response(&framed).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("InitSsl rejected"), "message was: {msg}");
+        assert!(msg.contains("0x05a9"), "message was: {msg}");
     }
 }
