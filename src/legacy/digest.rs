@@ -304,7 +304,10 @@ mod tests {
         let plain2 = packet_digest(&key, &frag2).unwrap();
         let mut digs = ResponseDigests::new(&key).unwrap();
         digs.verify(&d1, &frag1).unwrap();
-        assert!(matches!(digs.verify(&plain2, &frag2), Err(Error::Integrity(_))));
+        assert!(matches!(
+            digs.verify(&plain2, &frag2),
+            Err(Error::Integrity(_))
+        ));
     }
 
     #[test]
