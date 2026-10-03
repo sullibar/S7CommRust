@@ -41,6 +41,12 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- TLS certificate pinning: `Connection::connect_pinned` accepts only the PLC whose certificate
+  has the given SHA-256 fingerprint and which signs the handshake with that certificate's key;
+  anything else fails the handshake with `Error::Tls`. `Connection::peer_certificate_sha256`
+  reports the fingerprint to pin, and `reconnect` keeps the pin. `connect` still accepts any
+  certificate (the PLC's is self-signed), which leaves it open to an active man in the middle.
+  s7tool shows the fingerprint on connect and takes `--pin <sha256>`.
 - Legacy (non-TLS) responses and notifications are now integrity-checked. Every chunk's digest
   was previously ignored, so anyone on the network path could alter values in transit. A
   response the PLC splits into several chunks chains their digests (the PLC reuses its HMAC
