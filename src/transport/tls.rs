@@ -18,13 +18,15 @@
 //!   (`use_context = 0` → [`None`], *not* `Some(&[])`), 32 bytes — the linchpin for
 //!   legitimation. One wrong byte means silent auth failure.
 //!
-//! The PLC presents a self-signed certificate, and an accept-all verifier is used, as upstream
-//! does. That leaves the connection open to an **active** man-in-the-middle: it can terminate
-//! TLS on both sides, so it knows both exported secrets and can read (and replay) the
+//! The PLC presents a self-signed certificate. Unless one is pinned, any certificate is accepted,
+//! as upstream does. That leaves the connection open to an **active** man-in-the-middle: it can
+//! terminate TLS on both sides, so it knows both exported secrets and can read (and replay) the
 //! legitimation payload — the plaintext password for a user login, or the SHA-1 of the
 //! password, which is all the PLC checks, for a legacy one. The secret only binds legitimation
-//! to *a* TLS session, not to the PLC. (TIA Portal, by contrast, has the user trust the PLC's
-//! certificate.) Use it on networks you trust.
+//! to *a* TLS session, not to the PLC. Pinning the certificate's SHA-256 fingerprint
+//! (`Connection::connect_pinned`) closes that: the handshake then fails unless the peer presents
+//! that certificate and signs with its key, much as TIA Portal has the user trust the PLC's
+//! certificate.
 //!
 //! The client also honours `SSLKEYLOGFILE` whenever it is set, writing the session keys there
 //! for Wireshark — leave it unset in production.
@@ -33,8 +35,9 @@ use std::io::{Cursor, Read, Write};
 use std::sync::Arc;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
+use rustls::{CertificateError, DigitallySignedStruct, OtherError, SignatureScheme};
 
 use crate::error::{Error, Result};
 use crate::transport::tcp::IsoTcp;
@@ -58,7 +61,7 @@ impl TlsChannel {
     ///
     /// Honours `SSLKEYLOGFILE` (via [`rustls::KeyLogFile`]) so sessions can be decrypted
     /// in Wireshark — essential for confirming the exported secret against the C# driver.
-    pub fn new() -> Result<Self> {
+    pub fn new(pin: Option<[u8; 32]>) -> Result<Self> {
         let base = rustls::crypto::ring::default_provider();
         let provider = rustls::crypto::CryptoProvider {
             cipher_suites: vec![
@@ -67,14 +70,12 @@ impl TlsChannel {
             ],
             ..base
         };
-        let schemes = provider
-            .signature_verification_algorithms
-            .supported_schemes();
+        let algorithms = provider.signature_verification_algorithms;
 
         let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAllVerifier { schemes }))
+            .with_custom_certificate_verifier(Arc::new(PlcCertVerifier { algorithms, pin }))
             .with_no_client_auth();
         config.key_log = Arc::new(rustls::KeyLogFile::new());
 
@@ -105,6 +106,14 @@ impl TlsChannel {
             self.feed_tls(&pkt)?;
         }
         Ok(())
+    }
+
+    /// SHA-256 fingerprint of the certificate the PLC presented, once the handshake has run.
+    pub fn peer_certificate_sha256(&self) -> Option<[u8; 32]> {
+        self.conn
+            .peer_certificates()
+            .and_then(<[_]>::first)
+            .map(fingerprint)
     }
 
     /// Export the 32-byte `EXPERIMENTAL_OMS` keying material (RFC 5705).
@@ -185,44 +194,101 @@ impl TlsChannel {
     }
 }
 
-/// Accept-all server certificate verifier (the PLC uses a self-signed cert).
-#[derive(Debug)]
-struct AcceptAllVerifier {
-    schemes: Vec<SignatureScheme>,
+/// SHA-256 fingerprint of a DER certificate.
+fn fingerprint(cert: &CertificateDer<'_>) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(cert.as_ref()).into()
 }
 
-impl ServerCertVerifier for AcceptAllVerifier {
+/// The PLC's certificate verifier. The PLC presents a self-signed certificate, which no CA
+/// vouches for, so the only check possible is against a fingerprint the user pins.
+///
+/// Without a pin any certificate is accepted, as upstream does, and the handshake signature goes
+/// unchecked too: it would only prove the peer holds the key of a certificate nobody vouched for.
+/// With a pin the certificate must have that fingerprint, and the handshake must be signed with
+/// its key, so a man in the middle can't replay the PLC's certificate without the key.
+#[derive(Debug)]
+struct PlcCertVerifier {
+    algorithms: WebPkiSupportedAlgorithms,
+    pin: Option<[u8; 32]>,
+}
+
+/// A PLC certificate whose fingerprint isn't the pinned one.
+struct PinMismatch {
+    expected: [u8; 32],
+    got: [u8; 32],
+}
+
+impl std::fmt::Display for PinMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        write!(
+            f,
+            "the PLC's certificate has SHA-256 {}, not the pinned {}",
+            hex(&self.got),
+            hex(&self.expected)
+        )
+    }
+}
+
+// rustls shows certificate errors with `Debug`, so make that the readable message too.
+impl std::fmt::Debug for PinMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::error::Error for PinMismatch {}
+
+impl ServerCertVerifier for PlcCertVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
+        end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
+        match self.pin {
+            Some(expected) if fingerprint(end_entity) != expected => {
+                let mismatch = PinMismatch {
+                    expected,
+                    got: fingerprint(end_entity),
+                };
+                Err(rustls::Error::InvalidCertificate(CertificateError::Other(
+                    OtherError(Arc::new(mismatch)),
+                )))
+            }
+            _ => Ok(ServerCertVerified::assertion()),
+        }
     }
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        match self.pin {
+            Some(_) => rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms),
+            None => Ok(HandshakeSignatureValid::assertion()),
+        }
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        match self.pin {
+            Some(_) => rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms),
+            None => Ok(HandshakeSignatureValid::assertion()),
+        }
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.schemes.clone()
+        self.algorithms.supported_schemes()
     }
 }
 
@@ -240,8 +306,54 @@ mod tests {
     #[test]
     fn client_config_builds() {
         // Exercises the provider/cipher-suite/verifier wiring without a network.
-        let ch = TlsChannel::new().expect("TLS client config should build");
+        let ch = TlsChannel::new(None).expect("TLS client config should build");
         // No handshake yet, so keying material must not be available.
         assert!(ch.export_oms_secret().is_err());
+        assert_eq!(ch.peer_certificate_sha256(), None);
+        assert!(TlsChannel::new(Some([7; 32])).is_ok());
+    }
+
+    #[test]
+    fn a_pinned_verifier_accepts_only_that_certificate() {
+        let verify = |pin, cert: &[u8]| {
+            let verifier = PlcCertVerifier {
+                algorithms: rustls::crypto::ring::default_provider()
+                    .signature_verification_algorithms,
+                pin,
+            };
+            let name = ServerName::try_from(DUMMY_SNI).unwrap();
+            verifier.verify_server_cert(
+                &CertificateDer::from(cert),
+                &[],
+                &name,
+                &[],
+                UnixTime::now(),
+            )
+        };
+        let cert = b"the PLC's DER certificate";
+        let pin = fingerprint(&CertificateDer::from(&cert[..]));
+        assert!(verify(Some(pin), cert).is_ok());
+        assert!(verify(None, cert).is_ok());
+        assert!(verify(None, b"any other certificate").is_ok());
+        let e = verify(Some(pin), b"another PLC's certificate").unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("not the pinned"), "{msg}");
+        assert!(
+            msg.contains(&format!("{:02x}{:02x}", pin[0], pin[1])),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn the_fingerprint_is_sha256_of_the_der() {
+        // SHA-256("abc"), FIPS 180-2 appendix B.1.
+        assert_eq!(
+            fingerprint(&CertificateDer::from(&b"abc"[..])),
+            [
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+                0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+                0xf2, 0x00, 0x15, 0xad
+            ]
+        );
     }
 }
