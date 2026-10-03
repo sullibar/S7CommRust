@@ -41,6 +41,14 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- Legacy (non-TLS) responses and notifications are now integrity-checked. Every chunk's digest
+  was previously ignored, so anyone on the network path could alter values in transit. A
+  response the PLC splits into several chunks chains their digests (the PLC reuses its HMAC
+  state after finalizing it), so they are checked as a sequence; this scheme was identified by
+  [gijzelaerr/s7commplus](https://github.com/gijzelaerr/s7commplus). Validated on PLCSIM Advanced
+  FW V2.8, where every chunk of every response verifies. A chunk whose digest is wrong or
+  missing fails with the new `Error::Integrity`, which counts as a lost connection
+  (`is_connection_lost`) and poisons the connection.
 - Byte-offset access, as the classic S7 protocol has it: `Connection::read_area` /
   `write_area` read and write a byte range of a standard (not optimized) data block or of the
   inputs, outputs or bit memory (`Area::Db(n)`, `Inputs`, `Outputs`, `Memory`), and

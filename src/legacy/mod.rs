@@ -15,7 +15,8 @@
 //! (which the PLC answers with a per-session 20-byte challenge), then a key-agreement step
 //! that delivers a random key to the PLC encrypted under the PLC's public key, from which
 //! both sides derive a **session key**. Every PDU after `CreateObject` then carries an
-//! HMAC-SHA256 **integrity digest** keyed by that session key.
+//! HMAC-SHA256 **integrity digest** keyed by that session key, which the driver checks on every
+//! response and notification.
 //!
 //! The key agreement is public-key-**family** specific: the **PLCSIM** family (`03:`, what
 //! PLCSIM Advanced reports; [`session`]) and the real S7-1200/1500 hardware families

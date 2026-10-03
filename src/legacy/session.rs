@@ -16,7 +16,7 @@
 use crate::error::{Error, Result};
 use crate::legacy::auth::authenticate_plcsim;
 use crate::legacy::blob::{derive_key_id, PLCSIM_PUBLIC_KEY};
-use crate::legacy::digest::packet_digest;
+use crate::legacy::digest::{packet_digest, ResponseDigests};
 use crate::transport::IsoTcp;
 use crate::wire::vlq;
 
@@ -203,24 +203,42 @@ pub fn frame_v3(session_key: &[u8; 24], v2_framed: &[u8]) -> Result<Vec<u8>> {
 /// `proto::parse_*` helpers accept. A large Explore response arrives as several telegrams whose
 /// `72 03 <len>` chunks concatenate up to the final `72 03 00 00` trailer.
 ///
-/// `partial` holds the body gathered so far. It survives an error (a read timeout between
+/// Every chunk's digest is checked under `session_key` ([`ResponseDigests`]); a chunk that fails
+/// is an [`Error::Integrity`].
+///
+/// `partial` holds the PDU gathered so far. It survives an error (a read timeout between
 /// telegrams), so the next call resumes the same PDU, and is emptied once the PDU is complete.
-pub fn recv_and_strip(tcp: &mut IsoTcp, partial: &mut Vec<u8>) -> Result<Vec<u8>> {
-    let mut version = 0x03u8;
+pub fn recv_and_strip(
+    tcp: &mut IsoTcp,
+    session_key: &[u8; 24],
+    partial: &mut PartialResponse,
+) -> Result<Vec<u8>> {
     loop {
         let telegram = recv_response(tcp)?;
-        if accumulate_chunks(&telegram, partial, &mut version)? {
+        if accumulate_chunks(&telegram, session_key, partial)? {
             break; // saw the len==0 trailer → PDU complete
         }
-        if partial.len() > crate::wire::pdu::MAX_TELEGRAM_LEN {
+        if partial.body.len() > crate::wire::pdu::MAX_TELEGRAM_LEN {
             return Err(Error::framing(
                 "legacy telegram exceeds the reassembly size cap",
             ));
         }
     }
-    let data = std::mem::take(partial);
+    let data = std::mem::take(partial).body;
     log::trace!("legacy: reassembled {} bytes", data.len());
-    Ok(crate::wire::pdu::frame_single_pdu(version, &data))
+    Ok(crate::wire::pdu::frame_single_pdu(V3, &data))
+}
+
+/// ProtocolVersion of the legacy, digest-protected chunks.
+const V3: u8 = 0x03;
+
+/// A legacy PDU whose chunks are still arriving.
+#[derive(Default)]
+pub(crate) struct PartialResponse {
+    /// The chunks' fragments so far.
+    body: Vec<u8>,
+    /// Their digest state; `None` until the first chunk.
+    digests: Option<ResponseDigests>,
 }
 
 /// Receive the next response, skipping unsolicited SystemEvent (`0xfe`) keep-alives. A fatal
@@ -242,11 +260,15 @@ pub(crate) fn recv_response(tcp: &mut IsoTcp) -> Result<Vec<u8>> {
     }
 }
 
-/// Strip the legacy V3 chunk framing from one telegram, appending each chunk's fragment to `data`.
-/// Every `72 03 <len>` chunk holds `20 <32-byte digest> <fragment>`; fragments concatenate up to
-/// the `72 03 00 00` trailer. Returns `true` once the trailer is seen (the PDU is complete);
-/// `false` means the PDU continues in a following telegram.
-fn accumulate_chunks(payload: &[u8], data: &mut Vec<u8>, version: &mut u8) -> Result<bool> {
+/// Strip the legacy V3 chunk framing from one telegram, verifying each chunk and appending its
+/// fragment to `partial`. Every `72 03 <len>` chunk holds `20 <32-byte digest> <fragment>`;
+/// fragments concatenate up to the `72 03 00 00` trailer. Returns `true` once the trailer is seen
+/// (the PDU is complete); `false` means the PDU continues in a following telegram.
+fn accumulate_chunks(
+    payload: &[u8],
+    session_key: &[u8; 24],
+    partial: &mut PartialResponse,
+) -> Result<bool> {
     let mut i = 0;
     while i + 4 <= payload.len() {
         if payload[i] != 0x72 {
@@ -255,7 +277,14 @@ fn accumulate_chunks(payload: &[u8], data: &mut Vec<u8>, version: &mut u8) -> Re
                 payload[i]
             )));
         }
-        *version = payload[i + 1];
+        // Once the session key is in place every PDU is digest-protected, so a chunk of
+        // another protocol version would be one that skipped the check.
+        if payload[i + 1] != V3 {
+            return Err(Error::integrity(format!(
+                "legacy chunk has protocol version 0x{:02x}, not the digest-protected 0x03",
+                payload[i + 1]
+            )));
+        }
         let len = u16::from_be_bytes([payload[i + 2], payload[i + 3]]) as usize;
         i += 4;
         if len == 0 {
@@ -266,15 +295,19 @@ fn accumulate_chunks(payload: &[u8], data: &mut Vec<u8>, version: &mut u8) -> Re
         }
         let chunk = &payload[i..i + len];
         i += len;
-        if *version == 0x03 && chunk.first() == Some(&0x20) {
-            // 1-byte marker + 32-byte digest, then the fragment.
-            let fragment = chunk
-                .get(33..)
-                .ok_or_else(|| Error::framing("legacy chunk shorter than its digest"))?;
-            data.extend_from_slice(fragment);
-        } else {
-            data.extend_from_slice(chunk);
+        // 1-byte digest length (32) + digest, then the fragment.
+        if chunk.first() != Some(&0x20) {
+            return Err(Error::integrity("legacy chunk carries no digest"));
         }
+        let (digest, fragment) = chunk[1..]
+            .split_at_checked(32)
+            .ok_or_else(|| Error::framing("legacy chunk shorter than its digest"))?;
+        let digests = match &mut partial.digests {
+            Some(digests) => digests,
+            None => partial.digests.insert(ResponseDigests::new(session_key)?),
+        };
+        digests.verify(digest, fragment)?;
+        partial.body.extend_from_slice(fragment);
     }
     Ok(false) // no trailer in this telegram => more telegrams follow
 }
@@ -378,23 +411,80 @@ mod tests {
     fn short_digest_chunk_is_an_error_not_a_panic() {
         // `72 03 00 01 20`: a V3 chunk marked as digested but only one byte long used to panic
         // slicing past the 33-byte marker + digest.
-        let (mut data, mut version) = (Vec::new(), 0);
+        let mut partial = PartialResponse::default();
         assert!(
-            accumulate_chunks(&[0x72, 0x03, 0x00, 0x01, 0x20], &mut data, &mut version).is_err()
+            accumulate_chunks(&[0x72, 0x03, 0x00, 0x01, 0x20], &[0; 24], &mut partial).is_err()
         );
+    }
+
+    /// A one-chunk telegram carrying `fragment` with its digest under `key`.
+    fn chunk(key: &[u8; 24], fragment: &[u8]) -> Vec<u8> {
+        let mut telegram = vec![0x72, 0x03];
+        telegram.extend_from_slice(&(1 + 32 + fragment.len() as u16).to_be_bytes());
+        telegram.push(0x20);
+        telegram.extend_from_slice(&packet_digest(key, fragment).unwrap());
+        telegram.extend_from_slice(fragment);
+        telegram
     }
 
     #[test]
     fn digest_chunks_reassemble() {
-        let mut telegram = vec![0x72, 0x03, 0x00, 36, 0x20];
-        telegram.extend_from_slice(&[0xee; 32]); // digest (not checked here)
-        telegram.extend_from_slice(b"abc");
-        let (mut data, mut version) = (Vec::new(), 0);
-        assert!(!accumulate_chunks(&telegram, &mut data, &mut version).unwrap());
+        let key = [7; 24];
+        let mut telegram = chunk(&key, b"abc");
+        let mut partial = PartialResponse::default();
+        assert!(!accumulate_chunks(&telegram, &key, &mut partial).unwrap());
         telegram.extend_from_slice(&[0x72, 0x03, 0x00, 0x00]);
-        data.clear();
-        assert!(accumulate_chunks(&telegram, &mut data, &mut version).unwrap());
-        assert_eq!(data, b"abc");
+        let mut partial = PartialResponse::default();
+        assert!(accumulate_chunks(&telegram, &key, &mut partial).unwrap());
+        assert_eq!(partial.body, b"abc");
+    }
+
+    #[test]
+    fn a_chunk_with_a_bad_or_missing_digest_is_rejected() {
+        let key = [7; 24];
+        let reject = |telegram: &[u8]| {
+            let e = accumulate_chunks(telegram, &key, &mut PartialResponse::default()).unwrap_err();
+            assert!(matches!(e, Error::Integrity(_)), "{e}");
+        };
+        let good = chunk(&key, b"abc");
+        let mut tampered = good.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        reject(&tampered);
+        reject(&chunk(&[8; 24], b"abc")); // another session's key
+                                          // The same chunk without its digest, as a V3 chunk and as an unprotected V2 one.
+        let mut bare = vec![0x72, 0x03, 0x00, 0x03];
+        bare.extend_from_slice(b"abc");
+        reject(&bare);
+        bare[1] = 0x02;
+        reject(&bare);
+    }
+
+    /// One response captured from PLCSIM Advanced FW V2.8: its session key and the two telegrams
+    /// it arrived in (see `tests/vectors/legacy/README.md`).
+    const PLCSIM_KEY: &[u8; 24] =
+        include_bytes!("../../tests/vectors/legacy/plcsim-session-key.bin");
+    const PLCSIM_TELEGRAMS: [&[u8]; 2] = [
+        include_bytes!("../../tests/vectors/legacy/plcsim-response-telegram1.bin"),
+        include_bytes!("../../tests/vectors/legacy/plcsim-response-telegram2.bin"),
+    ];
+
+    #[test]
+    fn a_plcsim_response_verifies_across_telegrams() {
+        let mut partial = PartialResponse::default();
+        assert!(!accumulate_chunks(PLCSIM_TELEGRAMS[0], PLCSIM_KEY, &mut partial).unwrap());
+        assert!(accumulate_chunks(PLCSIM_TELEGRAMS[1], PLCSIM_KEY, &mut partial).unwrap());
+        // The fragments of the 975- and 209-byte chunks, less their marker and digest.
+        assert_eq!(partial.body.len(), 975 - 33 + 209 - 33);
+        assert_eq!(partial.body[0], crate::wire::pdu::opcode::RESPONSE);
+    }
+
+    #[test]
+    fn a_plcsim_continuation_chunk_does_not_verify_on_its_own() {
+        // The second chunk's digest is chained to the first chunk: it is not a plain digest,
+        // and does not verify as the first chunk of a response.
+        let mut partial = PartialResponse::default();
+        let e = accumulate_chunks(PLCSIM_TELEGRAMS[1], PLCSIM_KEY, &mut partial).unwrap_err();
+        assert!(matches!(e, Error::Integrity(_)), "{e}");
     }
 
     #[test]
