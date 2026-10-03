@@ -2,8 +2,11 @@ The real-PLC (Family0) seed and key derivation in `src/legacy/family0/` (`curve.
 `present.rs`, `seed.rs`) and the challenge fingerprint in `src/legacy/fingerprint.rs` follow
 gijzelaerr/s7commplus (https://github.com/gijzelaerr/s7commplus,
 `s7commplus/v1_session_key/real_plc/`), which identified HarpoS7's Family0 transforms as an
-x-only ECDH and a PRESENT-80 variant, and its fingerprint as a fixed SPN. That work
-is used under the MIT License; the original notice is reproduced below, as required.
+x-only ECDH and a PRESENT-80 variant, and its fingerprint as a fixed SPN. The chained
+response digests in `src/legacy/digest.rs` (`ResponseDigests`) and their OpenSSL test
+vectors follow its `s7commplus/_fragment_hmac.py` and
+`tests/fixtures/s7commplus/legacy_fragment_hmac.json`. That work is used under the MIT
+License; the original notice is reproduced below, as required.
 
 ----------------------------------------------------------------------------------------
 

@@ -181,9 +181,9 @@ pub struct Connection {
     pending_notifications: VecDeque<(u32, Vec<u8>)>,
     /// Current credit limit of each finite-credit subscription, topped up as notifications arrive.
     credit_limits: HashMap<u32, i16>,
-    /// Legacy transport: body of a telegram whose chunks are still arriving (kept across a read
-    /// timeout, like the TLS path's `rbuf`).
-    legacy_partial: Vec<u8>,
+    /// Legacy transport: a telegram whose chunks are still arriving (kept across a read timeout,
+    /// like the TLS path's `rbuf`).
+    legacy_partial: crate::legacy::session::PartialResponse,
     /// Most items the PLC accepts in one GetMultiVariables (`SystemLimits`, read at connect).
     max_read_tags: usize,
     /// Most items the PLC accepts in one SetMultiVariables (`SystemLimits`, read at connect).
@@ -252,7 +252,7 @@ impl Connection {
             auto_reconnect: false,
             pending_notifications: VecDeque::new(),
             credit_limits: HashMap::new(),
-            legacy_partial: Vec::new(),
+            legacy_partial: Default::default(),
             max_read_tags: DEFAULT_TAGS_PER_REQUEST,
             max_write_tags: DEFAULT_TAGS_PER_REQUEST,
         };
@@ -424,7 +424,7 @@ impl Connection {
             auto_reconnect: false,
             pending_notifications: VecDeque::new(),
             credit_limits: HashMap::new(),
-            legacy_partial: Vec::new(),
+            legacy_partial: Default::default(),
             max_read_tags: DEFAULT_TAGS_PER_REQUEST,
             max_write_tags: DEFAULT_TAGS_PER_REQUEST,
         };
@@ -2057,8 +2057,8 @@ impl Connection {
 
     /// Receive the next telegram for the active transport (TLS, or legacy V3-digest framing).
     fn recv_one_telegram(&mut self) -> Result<Vec<u8>> {
-        if self.legacy_session_key.is_some() {
-            crate::legacy::session::recv_and_strip(&mut self.tcp, &mut self.legacy_partial)
+        if let Some(key) = &self.legacy_session_key {
+            crate::legacy::session::recv_and_strip(&mut self.tcp, key, &mut self.legacy_partial)
         } else {
             self.recv_telegram()
         }
@@ -2537,8 +2537,9 @@ mod tests {
         );
     }
 
-    /// A stand-in for a legacy (V3-digest) PLC on loopback. The client doesn't verify response
-    /// digests, so the mock frames replies with a zero digest and needs no crypto.
+    /// A stand-in for a legacy (V3-digest) PLC on loopback, with the all-zero session key
+    /// [`mock_connection`] gives the client. Every reply is a single chunk, so its digest is the
+    /// plain [`packet_digest`](crate::legacy::digest::packet_digest).
     struct MockPlc {
         stream: std::net::TcpStream,
     }
@@ -2567,7 +2568,7 @@ mod tests {
             let mut v3 = vec![0x72, 0x03];
             v3.extend_from_slice(&((1 + 32 + body.len()) as u16).to_be_bytes());
             v3.push(0x20);
-            v3.extend_from_slice(&[0u8; 32]);
+            v3.extend_from_slice(&crate::legacy::digest::packet_digest(&[0; 24], body).unwrap());
             v3.extend_from_slice(body);
             v3.extend_from_slice(&[0x72, 0x03, 0, 0]);
             let mut f = vec![3, 0];
@@ -2706,6 +2707,46 @@ mod tests {
             conn.read_variables(&[addr]),
             Err(Error::Closed(_))
         ));
+        plc.join().unwrap();
+    }
+
+    #[test]
+    fn a_response_with_a_bad_digest_poisons_the_connection() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            use std::io::Write;
+            plc.recv_request();
+            // Never parsed: the digest is checked first.
+            let mut frame = MockPlc::frame(&[pdu::opcode::RESPONSE, 0, 0, 0, 0]);
+            frame[7 + 4 + 1] ^= 1; // first digest byte, after TPKT/COTP and `72 03 len 20`
+            plc.stream.write_all(&frame).unwrap();
+        });
+        let addr = ItemAddress {
+            symbol_crc: 0,
+            access_area: 1,
+            access_sub_area: 2,
+            lid: vec![3],
+        };
+        let e = conn
+            .read_variables(std::slice::from_ref(&addr))
+            .unwrap_err();
+        assert!(matches!(e, Error::Integrity(_)), "{e}");
+        assert!(e.is_connection_lost(), "{e}");
+        assert!(conn.is_poisoned());
+        plc.join().unwrap();
+    }
+
+    #[test]
+    fn a_notification_with_a_bad_digest_poisons_the_connection() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            use std::io::Write;
+            let mut frame = MockPlc::frame(&notification(0xa, 0));
+            let trailer = frame.len() - 4;
+            frame[trailer - 1] ^= 1; // last fragment byte
+            plc.stream.write_all(&frame).unwrap();
+        });
+        let e = conn.next_any_notification().unwrap_err();
+        assert!(matches!(e, Error::Integrity(_)), "{e}");
+        assert!(conn.is_poisoned());
         plc.join().unwrap();
     }
 
