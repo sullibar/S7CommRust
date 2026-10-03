@@ -211,6 +211,8 @@ enum ReconnectTarget {
     Tls {
         addrs: Vec<SocketAddr>,
         timeout: Duration,
+        /// The pinned certificate fingerprint, if any (see [`Connection::connect_pinned`]).
+        pin: Option<[u8; 32]>,
     },
     LegacyPlcsim {
         addrs: Vec<SocketAddr>,
@@ -227,8 +229,37 @@ enum ReconnectTarget {
 
 impl Connection {
     /// Connect to a PLC at `addr` and drive the sequence through session creation.
+    ///
+    /// Any certificate the PLC presents is accepted (it is self-signed), so an active man in the
+    /// middle can impersonate the PLC and read the legitimation payload;
+    /// [`Connection::connect_pinned`] prevents that.
     pub fn connect<A: ToSocketAddrs>(addr: A, timeout: Duration) -> Result<Self> {
-        let addrs: Vec<SocketAddr> = addr.to_socket_addrs()?.collect();
+        Self::connect_tls(addr.to_socket_addrs()?.collect(), timeout, None)
+    }
+
+    /// Like [`Connection::connect`], but only to the PLC whose TLS certificate has the SHA-256
+    /// fingerprint `certificate_sha256`, which must also have signed the handshake. Anything
+    /// else fails the handshake with [`Error::Tls`]. Learn the fingerprint from
+    /// [`Connection::peer_certificate_sha256`] on a connection over a network you trust (or from
+    /// the certificate TIA Portal shows); the PLC keeps its certificate across restarts, but a new
+    /// one comes with a hardware configuration that changes it.
+    pub fn connect_pinned<A: ToSocketAddrs>(
+        addr: A,
+        timeout: Duration,
+        certificate_sha256: [u8; 32],
+    ) -> Result<Self> {
+        Self::connect_tls(
+            addr.to_socket_addrs()?.collect(),
+            timeout,
+            Some(certificate_sha256),
+        )
+    }
+
+    fn connect_tls(
+        addrs: Vec<SocketAddr>,
+        timeout: Duration,
+        pin: Option<[u8; 32]>,
+    ) -> Result<Self> {
         let mut tcp = IsoTcp::connect(addrs.as_slice(), timeout)?;
 
         // Step 2: unencrypted InitSsl bootstrap (sequence number 1).
@@ -244,7 +275,7 @@ impl Connection {
         }
 
         // Step 3: TLS handshake.
-        let mut tls = TlsChannel::new()?;
+        let mut tls = TlsChannel::new(pin)?;
         tls.handshake(&mut tcp)?;
 
         let mut conn = Connection {
@@ -263,7 +294,11 @@ impl Connection {
             db_list: None,
             symbol_cache: HashMap::new(),
             poisoned: false,
-            reconnect_target: ReconnectTarget::Tls { addrs, timeout },
+            reconnect_target: ReconnectTarget::Tls {
+                addrs,
+                timeout,
+                pin,
+            },
             auto_reconnect: false,
             pending_notifications: VecDeque::new(),
             credit_limits: HashMap::new(),
@@ -501,6 +536,12 @@ impl Connection {
         self.max_write_tags
     }
 
+    /// SHA-256 fingerprint of the TLS certificate the PLC presented, to pin with
+    /// [`Connection::connect_pinned`]. `None` on a legacy (non-TLS) connection.
+    pub fn peer_certificate_sha256(&self) -> Option<[u8; 32]> {
+        self.tls.as_ref()?.peer_certificate_sha256()
+    }
+
     /// The negotiated session id.
     pub fn session_id(&self) -> u32 {
         self.session_id
@@ -521,7 +562,11 @@ impl Connection {
     pub fn reconnect(&mut self) -> Result<()> {
         let auto = self.auto_reconnect;
         let fresh = match self.reconnect_target.clone() {
-            ReconnectTarget::Tls { addrs, timeout } => Self::connect(addrs.as_slice(), timeout)?,
+            ReconnectTarget::Tls {
+                addrs,
+                timeout,
+                pin,
+            } => Self::connect_tls(addrs, timeout, pin)?,
             ReconnectTarget::LegacyPlcsim { addrs, timeout } => {
                 Self::connect_legacy(addrs.as_slice(), timeout)?
             }

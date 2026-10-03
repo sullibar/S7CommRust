@@ -47,6 +47,8 @@ struct Config {
     legacy: bool,
     /// Use the legacy real-hardware (`00:`/`01:`) transport, auto-detecting family + key.
     real_plc: bool,
+    /// The PLC's pinned TLS certificate fingerprint (SHA-256), if any.
+    pin: Option<[u8; 32]>,
     command: Vec<String>,
 }
 
@@ -61,6 +63,7 @@ impl Config {
             .unwrap_or(s7commplus::transport::tcp::ISO_TCP_PORT);
         let mut legacy = std::env::var("S7_LEGACY").is_ok();
         let mut real_plc = std::env::var("S7_REAL_PLC").is_ok();
+        let mut pin = std::env::var("S7_PLC_CERT_SHA256").ok();
         let mut command = Vec::new();
 
         let mut args = std::env::args().skip(1);
@@ -73,6 +76,7 @@ impl Config {
                 }
                 "--legacy" | "-l" => legacy = true,
                 "--real-plc" => real_plc = true,
+                "--pin" => pin = Some(args.next().ok_or("--pin needs a value")?),
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -88,11 +92,26 @@ impl Config {
         }
 
         let ip = ip.ok_or("no PLC address — pass --ip <addr> or set S7_PLC_IP")?;
+        let pin = match pin {
+            Some(hex) => Some(
+                parse_hex(&hex)
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                    .ok_or(format!(
+                        "--pin needs 64 hex digits (a SHA-256), got {hex:?}"
+                    ))?,
+            ),
+            None => None,
+        };
+        if pin.is_some() && (legacy || real_plc) {
+            return Err("--pin applies to TLS connections only".into());
+        }
         Ok(Config {
             ip,
             port,
             legacy,
             real_plc,
+            pin,
             command,
         })
     }
@@ -125,10 +144,20 @@ fn run(cfg: Config) -> Result<()> {
         }
     } else if cfg.legacy {
         Connection::connect_legacy((cfg.ip.as_str(), cfg.port), timeout)?
+    } else if let Some(pin) = cfg.pin {
+        Connection::connect_pinned((cfg.ip.as_str(), cfg.port), timeout, pin)?
     } else {
         Connection::connect((cfg.ip.as_str(), cfg.port), timeout)?
     };
-    println!("connected — session_id = 0x{:08x}", conn.session_id());
+    // Over TLS, show the certificate fingerprint to pin with --pin.
+    let certificate = conn
+        .peer_certificate_sha256()
+        .map(|fp| format!(", certificate SHA-256 = {}", hex(&fp).replace(' ', "")))
+        .unwrap_or_default();
+    println!(
+        "connected — session_id = 0x{:08x}{certificate}",
+        conn.session_id()
+    );
 
     if cfg.command.is_empty() {
         repl(&mut conn)?;
@@ -900,7 +929,8 @@ fn print_usage() {
         "s7tool — minimal CLI for the s7commplus driver\n\
          \n\
          USAGE:\n\
-         \x20   s7tool [--ip <addr>] [--port <n>] [--legacy | --real-plc] [COMMAND ...]\n\
+         \x20   s7tool [--ip <addr>] [--port <n>] [--legacy | --real-plc | --pin <sha256>]\n\
+         \x20          [COMMAND ...]\n\
          \n\
          CONNECTION (flags must precede the command):\n\
          \x20   -i, --ip <addr>     PLC address           (or env S7_PLC_IP)\n\
@@ -911,6 +941,9 @@ fn print_usage() {
          \x20                       older firmware (00:/01:); the key is picked by its\n\
          \x20                       fingerprint, or S7_REAL_PLC_KEY=<80 hex digits>\n\
          \x20                       sets it                           (or env S7_REAL_PLC)\n\
+         \x20       --pin <sha256>  TLS: accept only the PLC whose certificate has this\n\
+         \x20                       SHA-256 (64 hex digits, shown on connect)\n\
+         \x20                                                  (or env S7_PLC_CERT_SHA256)\n\
          \n\
          With no COMMAND, s7tool connects and opens an interactive prompt.\n"
     );
