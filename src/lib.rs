@@ -77,6 +77,10 @@ pub mod wire;
 pub(crate) mod legacy;
 mod logging;
 
+// Test-only: a mock legacy PLC on loopback, scripted per test or driven by firmware profiles.
+#[cfg(test)]
+mod mock_plc;
+
 pub use connection::{Connection, CpuState, DataBlock, Subscription, VarInfo};
 pub use error::{Error, Result};
 pub use logging::set_log_redaction;
