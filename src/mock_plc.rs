@@ -30,10 +30,15 @@
 //! * **Field run**: the Python driver (gijzelaerr/s7commplus) against
 //!   the same FW V4.2 1215C, traced down to TPKT frames: chunk sizes, keep-alives, rejections.
 //!
-//! The PLCSIM profile is also checked against a live simulator by the ignored test
-//! `plcsim_matches_its_profile` (limits, the over-limit answer, the -61 answers, the M area size,
-//! the program's data blocks). For S7-1200 CPUs, `s7tool probe` collects the answers still missing
-//! here in one read-only run, and its trace log records chunk sizes and keep-alives.
+//! Two ignored tests check the PLCSIM profile against a live simulator:
+//! `plcsim_matches_its_profile` checks the individual rules (limits, the over-limit answer, the
+//! -61 answers, the M area size, the data blocks), and `live_and_mock_sessions_agree` runs one
+//! whole session against the simulator and against the mock and requires the driver to see the
+//! same thing at every step — the only differences allowed are live-varying data (device-tree
+//! timestamps, counters and password-hash blobs, compared structurally) and the informational
+//! non-zero return values PLCSIM puts on some successful responses, which the driver ignores and
+//! the mock emits as 0. For S7-1200 CPUs, `s7tool probe` collects the answers still missing here in
+//! one read-only run, and its trace log records chunk sizes and keep-alives.
 //!
 //! Requests the mock has no measured answer for make it panic ("not measured"), so a test can't
 //! quietly rely on a guess. A panic in the mock thread is re-raised by [`run`].
@@ -249,7 +254,8 @@ pub(crate) const PLCSIM_FW28: Profile = Profile {
         read_refused: 0x8206_8d00_02bf_ffc3,
         write_refused: 0x8206_8d00_0188_ffc3,
     }),
-    protection_level: None,
+    // Live run: the legacy test project has full access (no password).
+    protection_level: Some(1),
     // s7tool against PLCSIM's legacy path (DeleteObject on close).
     session_delete_return: 0x2023_8000_0088_002d,
 };
@@ -1696,6 +1702,353 @@ mod tests {
 
         assert!(!conn.is_poisoned());
         conn.close().unwrap();
+    }
+
+    // --- The same session against the live simulator and the mock --------------------------
+
+    /// Collects the driver's log records, to compare the telegrams of two sessions.
+    struct Recorder;
+
+    static RECORDED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    impl log::Log for Recorder {
+        fn enabled(&self, m: &log::Metadata) -> bool {
+            m.target().starts_with("s7commplus")
+        }
+        fn log(&self, r: &log::Record) {
+            if self.enabled(r.metadata()) {
+                let line = format!("{}", r.args());
+                RECORDED.lock().unwrap().push(line);
+            }
+        }
+        fn flush(&self) {}
+    }
+
+    static RECORDER: Recorder = Recorder;
+
+    /// Start recording (the first call installs the logger), dropping what was recorded so far.
+    fn record() {
+        let _ = log::set_logger(&RECORDER);
+        log::set_max_level(log::LevelFilter::Trace);
+        RECORDED.lock().unwrap().clear();
+    }
+
+    fn recorded() -> Vec<String> {
+        std::mem::take(&mut *RECORDED.lock().unwrap())
+    }
+
+    /// A value's type, without the value (which differs between the PLC and the mock).
+    fn kind(v: &PValue) -> String {
+        match v {
+            // Recurse into composites: a member's type changing is a structural difference, but
+            // its value (and a blob's bytes/length, which are live) is not.
+            PValue::Struct { id, elements } => format!(
+                "Struct({id},[{}])",
+                elements
+                    .iter()
+                    .map(|(i, e)| format!("{i}:{}", kind(e)))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            PValue::BlobStruct { root_id, elements } => format!(
+                "BlobStruct({root_id},[{}])",
+                elements
+                    .iter()
+                    .map(|(i, e)| format!("{i}:{}", kind(e)))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            other => {
+                let s = format!("{other:?}");
+                s.split(['(', ' ']).next().unwrap_or_default().to_string()
+            }
+        }
+    }
+
+    /// Everything the mock answers, in one session, as `(step, outcome)`: what the driver makes
+    /// of each answer, with the PLC's data (tag values, M bytes) left out. Values it changes are
+    /// put back.
+    fn full_session(mut conn: Connection) -> Vec<(&'static str, String)> {
+        let mut out: Vec<(&'static str, String)> = Vec::new();
+        out.push(("description", format!("{:?}", conn.plc_description())));
+        out.push((
+            "limits",
+            format!("{} {}", conn.max_tags_per_read(), conn.max_tags_per_write()),
+        ));
+        let dbs = conn.datablock_list().unwrap();
+        out.push((
+            "datablock_list",
+            format!(
+                "{:?}",
+                dbs.iter()
+                    .map(|d| (&d.name, d.relid, d.number, d.ti_relid))
+                    .collect::<Vec<_>>()
+            ),
+        ));
+        let v0 = conn.read_tag("Data_block_1.toto").unwrap();
+        out.push(("read toto", kind(&v0)));
+        let v1 = conn.read_tag("\"Data block.1\".\"value.1\"").unwrap();
+        out.push(("read value.1", kind(&v1)));
+        let vars = conn
+            .browse_datablock(dbs[1].relid, dbs[1].ti_relid, &dbs[1].name)
+            .unwrap();
+        out.push(("browse DB2", format!("{vars:?}")));
+        let ti = conn.type_info(0x9200_0001).unwrap();
+        out.push(("type info DB1", format!("{:?}", ti.varname_list)));
+        conn.write_tag("Data_block_1.toto", PValue::Int(456))
+            .unwrap();
+        out.push((
+            "write then read toto",
+            format!("{:?}", conn.read_tag("Data_block_1.toto").unwrap()),
+        ));
+        conn.write_tag("Data_block_1.toto", v0.clone()).unwrap();
+        out.push((
+            "toto put back",
+            format!("{}", conn.read_tag("Data_block_1.toto").unwrap() == v0),
+        ));
+        let many = conn.read_tags(&["Data_block_1.toto"; 100]).unwrap();
+        out.push((
+            "read_tags x100",
+            format!("{} ok", many.iter().filter(|v| v.is_ok()).count()),
+        ));
+        let split = conn.read_variables(&vec![toto(); 150]).unwrap();
+        out.push(("read_variables x150", format!("{}", split.values.len())));
+        let e = conn.read_variables_unsplit(&vec![toto(); 101]).unwrap_err();
+        out.push(("unsplit x101", e.to_string()));
+        let m = conn.read_area(Area::Memory, 100, 4).unwrap();
+        let flipped: Vec<u8> = m.iter().map(|b| !b).collect();
+        conn.write_area(Area::Memory, 100, &flipped).unwrap();
+        out.push((
+            "M write then read",
+            format!(
+                "{}",
+                conn.read_area(Area::Memory, 100, 4).unwrap() == flipped
+            ),
+        ));
+        conn.write_area(Area::Memory, 100, &m).unwrap();
+        out.push((
+            "M put back",
+            format!("{}", conn.read_area(Area::Memory, 100, 4).unwrap() == m),
+        ));
+        let last = conn
+            .read_area(Area::Memory, 16 * 1024 - 1, 1)
+            .map(|b| b.len());
+        out.push(("M last byte", format!("{last:?}")));
+        for (step, area, start) in [
+            ("M past the end", Area::Memory, 16 * 1024),
+            ("DB1 by offset", Area::Db(1), 0),
+            ("DB2 by offset", Area::Db(2), 0),
+        ] {
+            let r = conn.read_area(area, start, 1).map(|b| b.len());
+            out.push((step, format!("{r:?}")));
+        }
+        let w = conn.write_area(Area::Db(1), 0, &[0]);
+        out.push(("DB1 write by offset", format!("{w:?}")));
+        out.push(("cpu_state", format!("{:?}", conn.cpu_state())));
+        let program = conn.explore(3, 1, 0, &[233, 2521, 4288]).unwrap();
+        out.push(("explore program", format!("{:?}", program.objects)));
+        let tree = conn.explore(DEVICE_TREE_RID, 1, 0, &[]).unwrap();
+        out.push(("explore device tree", format!("{:?}", tree.objects)));
+        out.push(("poisoned", format!("{}", conn.is_poisoned())));
+        out.push(("close", format!("{:?}", conn.close())));
+        out
+    }
+
+    /// The steps whose outcome is live data that changes between runs (timestamps, counters,
+    /// cycle times, password-hash blobs), so the live PLC and the static capture the mock
+    /// replays can't match byte for byte — only structurally (checked separately below).
+    const LIVE_DATA_STEPS: [&str; 1] = ["explore device tree"];
+
+    /// The same whole session, run against the live simulator and against the mock, must look
+    /// the same to the driver at every step — except the device-tree Explore, whose live values
+    /// change, where the object *structure* must match instead. This is what shows the mock is a
+    /// faithful stand-in for PLCSIM on the legacy path, not only that each rule fires. Run with
+    ///
+    /// ```sh
+    /// S7_PLC_IP=<simulator address> S7_LEGACY=1 cargo test --lib live_and_mock -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "needs a live PLCSIM Advanced instance (S7_PLC_IP, S7_LEGACY)"]
+    fn live_and_mock_sessions_agree() {
+        let (Ok(ip), Ok(_)) = (std::env::var("S7_PLC_IP"), std::env::var("S7_LEGACY")) else {
+            eprintln!("live_and_mock_sessions_agree: skipped (set S7_PLC_IP and S7_LEGACY)");
+            return;
+        };
+        record();
+        let conn = Connection::connect_legacy((ip.as_str(), 102), Duration::from_secs(10)).unwrap();
+        let live = full_session(conn);
+        let live_log = recorded();
+        record();
+        let (mock, _) = run(PLCSIM_FW28, Plc::plcsim_project(), full_session);
+        let mock_log = recorded();
+
+        // The return values the PLC sends are only in the log (the driver's outcomes don't carry
+        // them). The ones that change what the driver does are the errors — the error bit set, or
+        // the low 16 bits negative (`ResponseHeader::is_ok`) — plus the session-close value. These
+        // must match. PLCSIM also puts *informational* non-zero values (still "ok") on some
+        // successful responses, e.g. raw reads and explores; the driver ignores them and the mock
+        // emits 0 there, so those are not required to match.
+        let return_values = |log: &[String]| -> Vec<u64> {
+            log.iter()
+                .filter_map(|l| l.split("return_value=0x").nth(1))
+                .filter_map(|rv| u64::from_str_radix(rv.split_whitespace().next()?, 16).ok())
+                .collect()
+        };
+        let errors = |log: &[String]| -> Vec<u64> {
+            return_values(log)
+                .into_iter()
+                .filter(|&rv| rv & 0x4000_0000_0000_0000 != 0 || (rv as i16) < 0)
+                .collect()
+        };
+        assert_eq!(
+            errors(&live_log),
+            errors(&mock_log),
+            "error return values differ"
+        );
+        let close = |log: &[String]| return_values(log).into_iter().next_back();
+        assert_eq!(
+            close(&live_log),
+            close(&mock_log),
+            "the session-close return value differs"
+        );
+        assert_eq!(close(&mock_log), Some(PLCSIM_FW28.session_delete_return));
+
+        let find = |o: &[(&str, String)], step: &str| {
+            o.iter().find(|(s, _)| *s == step).map(|(_, v)| v.clone())
+        };
+        assert_eq!(live.len(), mock.len());
+        for ((step, live_v), (_, mock_v)) in live.iter().zip(&mock) {
+            if LIVE_DATA_STEPS.contains(step) {
+                continue; // compared structurally below
+            }
+            assert_eq!(live_v, mock_v, "step '{step}' differs");
+        }
+
+        // Every step named as live-data must really be one (so the skip above can't hide a
+        // regression in a step that should match exactly).
+        for step in LIVE_DATA_STEPS {
+            let (l, m) = (find(&live, step), find(&mock, step));
+            assert!(
+                l != m,
+                "step '{step}' is listed as live-data but matched exactly"
+            );
+        }
+
+        // The device tree: same object structure (relation/class/attribute ids and value kinds),
+        // even though the values differ.
+        let objects =
+            |conn: &mut Connection| conn.explore(DEVICE_TREE_RID, 1, 0, &[]).unwrap().objects;
+        let mut live_conn =
+            Connection::connect_legacy((ip.as_str(), 102), Duration::from_secs(10)).unwrap();
+        let live_tree = objects(&mut live_conn);
+        live_conn.close().unwrap();
+        let (mock_tree, _) = run(PLCSIM_FW28, Plc::plcsim_project(), |mut c| objects(&mut c));
+        assert_eq!(
+            tree_shape(&live_tree),
+            tree_shape(&mock_tree),
+            "device-tree structure differs"
+        );
+
+        // The driver verified the legacy continuation chunks as state-resume on both.
+        let dialects = |log: &[String]| {
+            log.iter()
+                .filter(|l| l.contains("continuation chunk digest verified"))
+                .count()
+        };
+        assert!(dialects(&live_log) >= 10);
+        assert!(live_log
+            .iter()
+            .all(|l| !l.contains("feed-forward") || !l.contains("verified")));
+    }
+
+    /// An object tree as `(relation_id, class_id, [(attr id, value kind)], [children])`, with no
+    /// values: what must match between the live device tree and the mock's, since the values are
+    /// live.
+    fn tree_shape(objects: &[PObject]) -> String {
+        fn one(o: &PObject, out: &mut String) {
+            out.push_str(&format!("[{} {} ", o.relation_id, o.class_id));
+            for (id, v) in &o.attributes {
+                out.push_str(&format!("{id}:{} ", kind(v)));
+            }
+            for c in &o.objects {
+                one(c, out);
+            }
+            out.push(']');
+        }
+        let mut out = String::new();
+        for o in objects {
+            one(o, &mut out);
+        }
+        out
+    }
+
+    /// Diagnostic: measure on the live simulator what the PLCSIM profile doesn't say yet, and
+    /// print it (`--nocapture`). Each probe that may cost the connection gets its own.
+    #[test]
+    #[ignore = "diagnostic; needs a live PLCSIM Advanced (S7_PLC_IP, S7_LEGACY)"]
+    fn measure_plcsim_unknowns() {
+        let Ok(ip) = std::env::var("S7_PLC_IP") else {
+            return;
+        };
+        let timeout = Duration::from_secs(10);
+        let connect = || Connection::connect_legacy((ip.as_str(), 102), timeout).unwrap();
+        let last_responses = |n: usize| {
+            let log = recorded();
+            let lines: Vec<String> = log
+                .into_iter()
+                .filter(|l| l.starts_with("← 72") || l.contains("SystemEvent"))
+                .collect();
+            lines[lines.len().saturating_sub(n)..].join("\n")
+        };
+
+        record();
+        let mut conn = connect();
+        let level = conn.effective_protection_level();
+        println!("protection level: {level:?}\n{}", last_responses(1));
+        conn.close().unwrap();
+
+        record();
+        let mut conn = connect();
+        let r = conn.request_response(&v1_read(100));
+        println!("V1 qualifier read: {r:?}, poisoned {}", conn.is_poisoned());
+        println!("{}", last_responses(2));
+        drop(conn);
+
+        record();
+        let mut conn = connect();
+        let r = conn
+            .explore(DB_WILDCARD, 1, 0, &[])
+            .map(|r| r.objects.len());
+        println!(
+            "DB wildcard explore: {r:?}, poisoned {}",
+            conn.is_poisoned()
+        );
+        println!("{}", last_responses(2));
+        drop(conn);
+
+        // A read over 1 KB right after the login, as the driver's first request would be: once
+        // segmented (as the driver sends it), once in a single COTP frame.
+        for unsegmented in [false, true] {
+            let mut tcp = IsoTcp::connect((ip.as_str(), 102), timeout).unwrap();
+            let session = crate::legacy::session::handshake(&mut tcp, &mut |b| {
+                getrandom::getrandom(b).unwrap()
+            })
+            .unwrap();
+            let req =
+                proto::build_get_multi_request(3, session.session_id, &vec![toto(); 100], true, 1)
+                    .unwrap();
+            let v3 = crate::legacy::session::frame_v3(&session.session_key, &req).unwrap();
+            if unsegmented {
+                tcp.send_unsegmented(&v3).unwrap();
+            } else {
+                tcp.send_iso_packet(&v3).unwrap();
+            }
+            let answer = tcp.recv_iso_packet().map(|t| t.len());
+            println!(
+                "{}-byte request after login, unsegmented={unsegmented}: answer {answer:?}",
+                v3.len()
+            );
+        }
     }
 
     // --- Phase 6: before the login ----------------------------------------------------------

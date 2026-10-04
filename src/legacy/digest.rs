@@ -63,6 +63,8 @@ pub(crate) struct ResponseDigests {
     key: [u8; SESSION_KEY_LEN],
     /// The previous chunk's digest, for the feed-forward dialect.
     last: [u8; DIGEST_LEN],
+    /// Chunks verified so far.
+    chunks: usize,
 }
 
 impl ResponseDigests {
@@ -84,6 +86,7 @@ impl ResponseDigests {
             outer: ChainedSha256::after_block(&pad(0x5c)),
             key: key.try_into().expect("SESSION_KEY_LEN bytes"),
             last: [0u8; DIGEST_LEN],
+            chunks: 0,
         })
     }
 
@@ -105,9 +108,20 @@ impl ResponseDigests {
                     .fold(0, |acc, (a, b)| acc | (a ^ b))
                     == 0
         };
-        if ok(&chained) || ok(&fed) {
+        let (resumed, fed_forward) = (ok(&chained), ok(&fed));
+        if resumed || fed_forward {
             // `ok` only returns true when `digest` is exactly DIGEST_LEN, so this never truncates.
             self.last.copy_from_slice(&digest[..DIGEST_LEN]);
+            if self.chunks > 0 {
+                // Which dialect a PLC uses is a field-log measurement (see the mock PLC).
+                let dialect = if resumed {
+                    "state-resume"
+                } else {
+                    "feed-forward"
+                };
+                log::trace!("legacy: continuation chunk digest verified ({dialect})");
+            }
+            self.chunks += 1;
             return Ok(());
         }
         Err(Error::integrity(
