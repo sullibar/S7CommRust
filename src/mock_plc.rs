@@ -27,8 +27,12 @@
 //!   response with its session key).
 //! * **First s7tool logs**: this crate's `s7tool` against an S7-1215C FW V4.2 and
 //!   S7-1214C FW V4.6 (and FW 4.5/4.7 CPUs): request limits, digest dialects, DeleteObject on close.
-//! * **Field run**: the Python driver (gijzelaerr/s7commplus) against
-//!   the same FW V4.2 1215C, traced down to TPKT frames: chunk sizes, keep-alives, rejections.
+//! * **Trace run**: another S7CommPlus client against the same FW V4.2 1215C, traced
+//!   down to TPKT frames: chunk sizes, keep-alives, rejections.
+//! * **Probe run**: `s7tool --auto probe` and `report` against eight S7-1200s (1212C,
+//!   1214C and 1215C, FW 4.2 to 4.7), from redacted session logs: InitSsl refusals, digest
+//!   dialects, chunk sizes, the answer one item over the limit, the M area size, -61 on optimized
+//!   DBs, the protection level and DeleteObject on close, per firmware.
 //!
 //! Two ignored tests check the PLCSIM profile against a live simulator:
 //! `plcsim_matches_its_profile` checks the individual rules (limits, the over-limit answer, the
@@ -37,8 +41,8 @@
 //! same thing at every step — the only differences allowed are live-varying data (device-tree
 //! timestamps, counters and password-hash blobs, compared structurally) and the informational
 //! non-zero return values PLCSIM puts on some successful responses, which the driver ignores and
-//! the mock emits as 0. For S7-1200 CPUs, `s7tool probe` collects the answers still missing here in
-//! one read-only run, and its trace log records chunk sizes and keep-alives.
+//! the mock emits as 0. The S7-1200 CPUs can't be checked live from CI, so
+//! `s7_1200_profiles_hold_the_probe_run_measurements` spells their measurements out once more.
 //!
 //! Requests the mock has no measured answer for make it panic ("not measured"), so a test can't
 //! quietly rely on a guess. A panic in the mock thread is re-raised by [`run`].
@@ -49,27 +53,29 @@
 //! to guess (it panics):
 //!
 //! * **IntegrityId acceptance.** Observed: the crate's first request after login (the limits read)
-//!   carries id 1 and works on FW 4.2 (first s7tool logs). In the traced flow (session
-//!   activation + legitimation), an activation with id 1 is rejected and the first data request
-//!   needs one id skipped (field run). The full rule is unknown, so the mock accepts any
-//!   id and only records it ([`Logged::integrity_id`]).
-//! * **Chunk sizes.** FW 4.2 is measured (976-byte fragments at most, field run), as is
-//!   PLCSIM (942, `tests/vectors/legacy`). The s7tool logs only record reassembled sizes, so FW 4.6
-//!   is unmeasured; its profile assumes FW 4.2's size.
+//!   carries id 1 and works on FW 4.2 to 4.7 (first s7tool logs, probe run). In the
+//!   traced flow (session activation + legitimation), an activation with id 1 is rejected and the
+//!   first data request needs one id skipped (trace run). The full rule is unknown, so
+//!   the mock accepts any id and only records it ([`Logged::integrity_id`]).
 //! * **When keep-alives are sent.** FW 4.2 sent one about every 5 s during the traced session,
-//!   including three between the chunks of one response. None appeared in the crate's own s7tool
-//!   sessions with the same CPU, so something in the traced flow seems to turn them on.
-//!   The mock has no clock: it sends one after every `n` chunks ([`Profile::keepalive_every`]).
-//! * **FW 4.6/4.7** beyond the digest dialect, the request limits and the DeleteObject return value:
-//!   no rejection rules, keep-alives or size limit are encoded.
+//!   including three between the chunks of one response. None appeared in any of this crate's
+//!   s7tool sessions, on FW 4.2 to 4.7 (the first logs and 16 probe-run sessions), so something
+//!   in the traced flow seems to turn them on. The mock has no clock: it sends one after every `n`
+//!   chunks ([`Profile::keepalive_every`]), on FW 4.2 only.
+//! * **Rejection rules** (the V1 qualifier, the DB wildcard explore) were only tried on FW 4.2, in
+//!   the trace run; the other profiles accept those requests.
 //! * **Request size limit on S7-1200s.** Only PLCSIM is measured (resets the connection on a COTP
 //!   frame over 1024 bytes); S7-1200s accept anything here.
-//! * **Over-limit requests and byte-offset (ClassicBlob) access on S7-1200 CPUs.** Only PLCSIM's answers
-//!   are measured; on an S7-1200 profile the mock panics instead.
-//! * **Writes on S7-1200s** were never attempted in the field; the mock accepts them on every
-//!   profile.
-//! * **The exact bytes after the return value** in DeleteObject and SetMultiVariables responses: the
-//!   driver reads only the header, and the mock writes the layout of the crate's own parse tests.
+//! * **Writes on S7-1200s** were never attempted in the field (`probe` and `report` are read-only).
+//!   The mock accepts symbolic and in-range byte writes on every profile, and panics on a byte write
+//!   an S7-1200 would refuse and on a write over the item limit (neither answer is measured; the
+//!   latter not on PLCSIM either, as the driver splits writes).
+//! * **Byte reads past the end of a standard DB** on S7-1200s: not probed. The mock refuses them
+//!   with the same -61 return value as a read past the M area, which is what PLCSIM does.
+//! * **The exact bytes after the return value** in DeleteObject, SetMultiVariables and InitSsl
+//!   responses: the driver reads only the header, and the mock writes the layout of the crate's own
+//!   parse tests (the probe run's logs stop after the header).
+//! * **The S7-1215C FW 4.5 on TLS** (probe run): the mock has no TLS, so it has no profile.
 //! * **The login itself** is out of scope (see above). That includes the CreateObject of a FW 2.2
 //!   CPU, which carries no attribute-303 challenge: no capture of it is in `tests/vectors`, and one
 //!   would have to be sanitised and reviewed before it is added.
@@ -109,13 +115,24 @@ pub(crate) enum Dialect {
     FeedForward,
 }
 
-/// PLCSIM's answers to byte-offset (ClassicBlob) access that it refuses.
+/// A PLC's answers to byte-offset (ClassicBlob) access that it refuses.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RawAccess {
     /// Item error for a read of an optimized DB or past the end of an area (-61).
     pub(crate) read_refused: u64,
-    /// Item error for such a write (-61).
-    pub(crate) write_refused: u64,
+    /// Item error for such a write (-61), if measured.
+    pub(crate) write_refused: Option<u64>,
+}
+
+/// How a CPU without TLS S7CommPlus (or with it turned off) answers the client's InitSsl.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InitSslRefusal {
+    /// With function Error2 (0x05a9) instead of an InitSsl response: firmware that predates TLS
+    /// S7CommPlus.
+    Error2,
+    /// With an InitSsl response carrying this error return value: TLS-capable firmware whose
+    /// project doesn't use it.
+    ReturnValue(u64),
 }
 
 /// What a firmware does, as far as the driver can tell. Each field says where it was measured.
@@ -143,14 +160,21 @@ pub(crate) struct Profile {
     pub(crate) tags_per_read: i32,
     /// `SystemLimits` LID 1001: most items per SetMultiVariables.
     pub(crate) tags_per_write: i32,
-    /// Return value of a request with more items than the limit, if measured.
-    pub(crate) over_limit: Option<u64>,
+    /// Return value of a read with more items than the limit, if measured. (A write over the
+    /// limit was never measured: the driver splits writes, and the mock panics on one.)
+    pub(crate) read_over_limit: Option<u64>,
     /// Byte-offset access and its refusals, if measured.
     pub(crate) raw_access: Option<RawAccess>,
-    /// `EffectiveProtectionLevel` (attribute 1842), if measured.
+    /// Size of the bit memory (`%M`) in bytes: a byte-offset access past it is refused. A CPU
+    /// model's, not a project's.
+    pub(crate) m_area_bytes: usize,
+    /// `EffectiveProtectionLevel` (attribute 1842), if measured. A project setting (whether the
+    /// CPU has a password), as measured on the CPU the profile comes from.
     pub(crate) protection_level: Option<u32>,
     /// Return value of the DeleteObject of the session (`Connection::close`).
     pub(crate) session_delete_return: u64,
+    /// How it refuses InitSsl (the TLS path), if measured.
+    pub(crate) init_ssl: Option<InitSslRefusal>,
 }
 
 /// The scripted mock: one chunk per response, no rules. Not a firmware.
@@ -165,54 +189,154 @@ pub(crate) const SCRIPTED: Profile = Profile {
     max_tpdu: None,
     tags_per_read: 100,
     tags_per_write: 100,
-    over_limit: None,
+    read_over_limit: None,
     raw_access: None,
+    // Not emulated: scripted tests answer every request themselves.
+    m_area_bytes: 0,
     protection_level: None,
     session_delete_return: 0,
+    init_ssl: None,
 };
+
+// The S7-1200 CPUs. Sources: the first s7tool logs, the trace run (FW 4.2
+// only), and the s7tool probe run: `s7tool --auto probe` and `report` against eight
+// S7-1200s, FW 4.2 to 4.7, from redacted session logs. None sent a keep-alive in any s7tool
+// session, and every one answered 50 items in one read and refused 51. The rejection rules
+// (V1 qualifier, DB wildcard) were only tried on FW 4.2, in the trace run; the other profiles
+// accept those requests.
 
 /// S7-1215C 6ES7 215-1AG40-0XB0, FW V4.2.
 pub(crate) const FW42_1215C: Profile = Profile {
     name: "FW42_1215C",
     // First s7tool logs.
     description: "1;6ES7 215-1AG40-0XB0 ;V4.2",
-    // First s7tool logs (a 107924-byte Explore verified) and field run (360
-    // continuation chunks verified as state-resume).
+    // First s7tool logs (a 107924-byte Explore verified), trace run (360
+    // continuation chunks) and probe run (355).
     dialect: Dialect::StateResume,
-    // Field run: chunk length fields of at most 0x3f1 = 1 + 32 + 976 (279 of 360
-    // chunks at that size, the rest 972..975).
+    // Trace run: chunk length fields of at most 0x3f1 = 1 + 32 + 976 (279 of 360
+    // chunks at that size, the rest 972..975); probe run: 283 of 555 chunks at 976.
     max_fragment: 976,
-    // Field run: a keep-alive about every 5 s, three of them between the chunks of one
-    // response (after chunks 28, 38 and 80). The mock has no clock; 8 chunks makes a mid-size
-    // response carry one (see the module's open questions).
+    // Trace run: a keep-alive about every 5 s, three of them between the chunks of one
+    // response (after chunks 28, 38 and 80). None in any s7tool session. The mock has no clock; 8
+    // chunks makes a mid-size response carry one (see the module's open questions).
     keepalive_every: Some(8),
-    // Field run: a GetMultiVariables with the V1 layout got the notice and a closed
+    // Trace run: a GetMultiVariables with the V1 layout got the notice and a closed
     // connection; the V2 layout works.
     reject_v1_qualifier: true,
-    // Field run: Explore of 0x8A11FFFF got the notice; Explore of RID 3 works.
+    // Trace run: Explore of 0x8A11FFFF got the notice; Explore of RID 3 works.
     reject_db_wildcard_explore: true,
     max_tpdu: None,
     // First s7tool logs.
     tags_per_read: 50,
     tags_per_write: 50,
-    over_limit: None,
-    raw_access: None,
-    // Field run (password-protected program).
+    // Probe run.
+    read_over_limit: Some(0xa027_a600_0054_fffc),
+    // Probe run: byte 0 of the optimized DBs (12 of 20), and M bytes 8192 and on.
+    raw_access: Some(RawAccess {
+        read_refused: 0x8206_8d00_02b9_ffc3,
+        write_refused: None,
+    }),
+    // Probe run: byte 8191 read, 8192 refused.
+    m_area_bytes: 8192,
+    // Trace run and probe run (password-protected program).
     protection_level: Some(3),
-    // First s7tool logs: a plain 0.
+    // First s7tool logs and probe run: a plain 0.
     session_delete_return: 0,
+    // First s7tool logs and probe run.
+    init_ssl: Some(InitSslRefusal::Error2),
 };
 
-/// S7-1214C 6ES7 214-1BG40-0XB0, FW V4.6.
+/// S7-1215C 6ES7 215-1AG40-0XB0, FW V4.3. Probe run throughout: FW 4.2's behaviour,
+/// down to the return values.
+pub(crate) const FW43_1215C: Profile = Profile {
+    name: "FW43_1215C",
+    description: "1;6ES7 215-1AG40-0XB0 ;V4.3",
+    // 355 continuation chunks verified.
+    dialect: Dialect::StateResume,
+    // 289 of 554 chunks at 976.
+    max_fragment: 976,
+    keepalive_every: None,
+    reject_v1_qualifier: false,
+    reject_db_wildcard_explore: false,
+    max_tpdu: None,
+    tags_per_read: 50,
+    tags_per_write: 50,
+    read_over_limit: Some(0xa027_a600_0054_fffc),
+    raw_access: Some(RawAccess {
+        read_refused: 0x8206_8d00_02b9_ffc3,
+        write_refused: None,
+    }),
+    m_area_bytes: 8192,
+    protection_level: Some(3),
+    session_delete_return: 0,
+    init_ssl: Some(InitSslRefusal::Error2),
+};
+
+/// S7-1215C 6ES7 215-1AG40-0XB0, FW V4.4. Probe run throughout: the first firmware
+/// with feed-forward digests, still without TLS.
+pub(crate) const FW44_1215C: Profile = Profile {
+    name: "FW44_1215C",
+    description: "1;6ES7 215-1AG40-0XB0 ;V4.4",
+    // 181 continuation chunks verified.
+    dialect: Dialect::FeedForward,
+    // 140 of 328 chunks at 980, none larger.
+    max_fragment: 980,
+    keepalive_every: None,
+    reject_v1_qualifier: false,
+    reject_db_wildcard_explore: false,
+    max_tpdu: None,
+    tags_per_read: 50,
+    tags_per_write: 50,
+    read_over_limit: Some(0xa027_a600_0070_fffc),
+    // Byte 0 of every DB (all 20 tried were optimized), and M bytes 8192 and on.
+    raw_access: Some(RawAccess {
+        read_refused: 0x8206_8d00_02c7_ffc3,
+        write_refused: None,
+    }),
+    m_area_bytes: 8192,
+    protection_level: Some(3),
+    session_delete_return: 0x2023_8000_0085_002d,
+    init_ssl: Some(InitSslRefusal::Error2),
+};
+
+/// S7-1212C 6ES7 212-1HE40-0XB0, FW V4.5, on the legacy path (its project doesn't use TLS).
+/// Probe run throughout.
+pub(crate) const FW45_1212C: Profile = Profile {
+    name: "FW45_1212C",
+    description: "1;6ES7 212-1HE40-0XB0 ;V4.5",
+    // 81 continuation chunks verified.
+    dialect: Dialect::FeedForward,
+    // 62 of 110 chunks at 946, none larger.
+    max_fragment: 946,
+    keepalive_every: None,
+    reject_v1_qualifier: false,
+    reject_db_wildcard_explore: false,
+    max_tpdu: None,
+    tags_per_read: 50,
+    tags_per_write: 50,
+    read_over_limit: Some(0xa027_a600_0071_fffc),
+    // Byte 0 of every DB (all 5 optimized), and M bytes 4096 and on.
+    raw_access: Some(RawAccess {
+        read_refused: 0x8206_8d00_02d1_ffc3,
+        write_refused: None,
+    }),
+    // Byte 4095 read, 4096 refused: the 1212C has half the 1214C/1215C's bit memory.
+    m_area_bytes: 4096,
+    protection_level: Some(1),
+    session_delete_return: 0x2023_8000_0085_002d,
+    init_ssl: Some(InitSslRefusal::ReturnValue(0xa201_d600_01ed_fdf9)),
+};
+
+/// S7-1214C 6ES7 214-1BG40-0XB0, FW V4.6, on the legacy path.
 pub(crate) const FW46_1214C: Profile = Profile {
     name: "FW46_1214C",
     // First s7tool logs.
     description: "1;6ES7 214-1BG40-0XB0 ;V4.6",
     // First s7tool logs: the state-resume digest failed on the first multi-chunk Explore,
-    // the feed-forward one verified (`src/legacy/digest.rs`).
+    // the feed-forward one verified (`src/legacy/digest.rs`); probe run: 175 chunks.
     dialect: Dialect::FeedForward,
-    // Not measured: FW 4.2's size (see the module's open questions).
-    max_fragment: 976,
+    // Probe run: 98 of 386 chunks at 946, none larger (two runs alike).
+    max_fragment: 946,
     keepalive_every: None,
     reject_v1_qualifier: false,
     reject_db_wildcard_explore: false,
@@ -220,12 +344,47 @@ pub(crate) const FW46_1214C: Profile = Profile {
     // First s7tool logs.
     tags_per_read: 50,
     tags_per_write: 50,
-    over_limit: None,
-    raw_access: None,
+    // Probe run.
+    read_over_limit: Some(0xa027_a600_0071_fffc),
+    // Probe run: byte 0 of every DB (all 20 tried were optimized), M bytes 8192 on.
+    raw_access: Some(RawAccess {
+        read_refused: 0x8206_8d00_02d1_ffc3,
+        write_refused: None,
+    }),
+    // Probe run.
+    m_area_bytes: 8192,
     // First s7tool logs.
     protection_level: Some(3),
     // First s7tool logs.
     session_delete_return: 0x2023_8000_0085_002d,
+    // Probe run.
+    init_ssl: Some(InitSslRefusal::ReturnValue(0xa201_d600_01e6_fdf9)),
+};
+
+/// S7-1212C 6ES7 212-1AE40-0XB0, FW V4.7, on the legacy path. Probe run throughout.
+pub(crate) const FW47_1212C: Profile = Profile {
+    name: "FW47_1212C",
+    description: "1;6ES7 212-1AE40-0XB0 ;V4.7",
+    // 43 continuation chunks verified.
+    dialect: Dialect::FeedForward,
+    // 17 of 66 chunks at 946, none larger.
+    max_fragment: 946,
+    keepalive_every: None,
+    reject_v1_qualifier: false,
+    reject_db_wildcard_explore: false,
+    max_tpdu: None,
+    tags_per_read: 50,
+    tags_per_write: 50,
+    read_over_limit: Some(0xa027_a600_0078_fffc),
+    // M bytes 4096 and on (its one DB is a standard block and read fine).
+    raw_access: Some(RawAccess {
+        read_refused: 0x8206_8d00_02cf_ffc3,
+        write_refused: None,
+    }),
+    m_area_bytes: 4096,
+    protection_level: Some(1),
+    session_delete_return: 0x2023_8000_0087_002d,
+    init_ssl: Some(InitSslRefusal::ReturnValue(0xa201_d600_01f2_fdf9)),
 };
 
 /// PLCSIM Advanced, CPU 1511-1 PN FW V2.8, legacy path.
@@ -248,20 +407,34 @@ pub(crate) const PLCSIM_FW28: Profile = Profile {
     tags_per_read: 100,
     tags_per_write: 100,
     // Live run: a read of more than 100 items.
-    over_limit: Some(0xa027_a600_007b_fffc),
+    read_over_limit: Some(0xa027_a600_007b_fffc),
     // Live run: an optimized DB, or one byte past the end of an area.
     raw_access: Some(RawAccess {
         read_refused: 0x8206_8d00_02bf_ffc3,
-        write_refused: 0x8206_8d00_0188_ffc3,
+        write_refused: Some(0x8206_8d00_0188_ffc3),
     }),
+    // Live run (`plcsim_matches_its_profile`).
+    m_area_bytes: 16 * 1024,
     // Live run: the legacy test project has full access (no password).
     protection_level: Some(1),
     // s7tool against PLCSIM's legacy path (DeleteObject on close).
     session_delete_return: 0x2023_8000_0088_002d,
+    init_ssl: None,
 };
 
+/// Every emulated firmware profile, the S7-1200 CPUs first.
+pub(crate) const PROFILES: [Profile; 7] = [
+    FW42_1215C,
+    FW43_1215C,
+    FW44_1215C,
+    FW45_1212C,
+    FW46_1214C,
+    FW47_1212C,
+    PLCSIM_FW28,
+];
+
 /// The notice SystemEvent body an S7-1215C (FW V4.2) sends before it closes the connection
-/// over a rejected request (field run): the four header `u32`s, then a fixed-width
+/// over a rejected request (trace run): the four header `u32`s, then a fixed-width
 /// Struct (`00 00 00 17`) with id 40300 and no members.
 const FW42_REJECT_NOTICE: [u8; 28] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x85, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -617,7 +790,7 @@ fn dt_frame(payload: &[u8]) -> Vec<u8> {
 }
 
 /// A SystemEvent telegram: `72 fe <len>` and the body, no trailer (as the FW 4.2 CPU sends it,
-/// field run).
+/// trace run).
 fn system_event(body: &[u8]) -> Vec<u8> {
     let mut t = vec![0x72, 0xfe];
     t.extend_from_slice(&(body.len() as u16).to_be_bytes());
@@ -1137,13 +1310,21 @@ impl Plc {
     fn write(&mut self, a: &Address, value: Vec<u8>, p: &Profile) -> Result<(), u64> {
         if let &[3, start, len] = a.lids.as_slice() {
             let raw = raw_access(p);
+            let refused = || {
+                raw.write_refused.unwrap_or_else(|| {
+                    panic!(
+                        "mock PLC ({}): a refused byte-offset write, not measured on this firmware",
+                        p.name
+                    )
+                })
+            };
             let data = blob_bytes(&value);
             assert_eq!(data.len(), len as usize, "mock PLC: blob length");
-            let bytes = self.raw_area_mut(a).ok_or(raw.write_refused)?;
+            let bytes = self.raw_area_mut(a).ok_or_else(refused)?;
             let range = start as usize..(start + len) as usize;
             bytes
                 .get_mut(range)
-                .ok_or(raw.write_refused)?
+                .ok_or_else(refused)?
                 .copy_from_slice(&data);
             return Ok(());
         }
@@ -1195,7 +1376,11 @@ fn raw_access(p: &Profile) -> RawAccess {
 
 /// The answer to a request over the item limit, where it was measured.
 fn over_limit(p: &Profile, function: u16, seq: u16, items: usize) -> Outcome {
-    let rv = p.over_limit.unwrap_or_else(|| {
+    let measured = match function {
+        functioncode::GET_MULTI_VARIABLES => p.read_over_limit,
+        _ => None,
+    };
+    let rv = measured.unwrap_or_else(|| {
         panic!(
             "mock PLC ({}): {items} items, over the advertised limit; the answer wasn't measured",
             p.name
@@ -1210,6 +1395,7 @@ fn over_limit(p: &Profile, function: u16, seq: u16, items: usize) -> Outcome {
 fn serve(mut mock: MockPlc, mut plc: Plc) -> Served {
     let mut requests = Vec::new();
     let profile = mock.profile;
+    plc.m_area.resize(profile.m_area_bytes, 0);
     let end = loop {
         mock.corrupt = plc.corrupt_chunk.take().or(mock.corrupt);
         let req = match mock.next_request() {
@@ -1240,10 +1426,18 @@ fn serve(mut mock: MockPlc, mut plc: Plc) -> Served {
     }
 }
 
-/// A CPU without TLS S7CommPlus, before any login: it answers the client's InitSsl with function
-/// Error2 (0x05a9) instead of an InitSsl response, as FW 2.2 and FW 4.2 did (first s7tool logs; the return value is the one PR #17's test in `proto::init_ssl` records), then
-/// waits for the client to go. Returns where it listens and the InitSsl request it got.
-pub(crate) fn spawn_refusing_init_ssl() -> (std::net::SocketAddr, JoinHandle<Vec<u8>>) {
+/// A CPU that won't do TLS, before any login: it refuses the client's InitSsl the way `refusal`
+/// says, then waits for the client to go. Returns where it listens and the InitSsl request it got.
+///
+/// * [`InitSslRefusal::Error2`]: function Error2 (0x05a9) instead of an InitSsl response, as FW 2.2
+///   and FW 4.2 to 4.4 did (first s7tool logs, probe run). Its return value isn't
+///   in those logs; this one is what PR #17's test in `proto::init_ssl` records.
+/// * [`InitSslRefusal::ReturnValue`]: an InitSsl response (sequence 1, transport flags `0x34`, as
+///   the probe run's FW 4.6 dump shows) with that return value, as FW 4.5 to 4.7 did. The redacted
+///   logs don't show the bytes after the return value; the driver doesn't read them.
+pub(crate) fn spawn_refusing_init_ssl(
+    refusal: InitSslRefusal,
+) -> (std::net::SocketAddr, JoinHandle<Vec<u8>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let mock = std::thread::spawn(move || {
@@ -1254,7 +1448,12 @@ pub(crate) fn spawn_refusing_init_ssl() -> (std::net::SocketAddr, JoinHandle<Vec
             &[0x72, 0x01],
             "mock PLC: InitSsl is a V1 PDU"
         );
-        let mut body = response_header(functioncode::ERROR_2, 0, 0xa201_d600_01f2_fdf9);
+        let mut body = match refusal {
+            InitSslRefusal::Error2 => {
+                response_header(functioncode::ERROR_2, 0, 0xa201_d600_01f2_fdf9)
+            }
+            InitSslRefusal::ReturnValue(rv) => response_header(functioncode::INIT_SSL, 0, rv),
+        };
         body[7..9].copy_from_slice(&request[11..13]); // echo the sequence number
         mock.write(&dt_frame(&pdu::frame_single_pdu(0x01, &body)));
         let _ = mock.recv_tsdu(); // until the client closes
@@ -1309,9 +1508,6 @@ mod tests {
         include_bytes!("../tests/vectors/legacy/plcsim-response-telegram1.bin"),
         include_bytes!("../tests/vectors/legacy/plcsim-response-telegram2.bin"),
     ];
-
-    /// The three firmware profiles.
-    const PROFILES: [Profile; 3] = [FW42_1215C, FW46_1214C, PLCSIM_FW28];
 
     /// "Data_block_1".toto, by address.
     fn toto() -> ItemAddress {
@@ -1375,16 +1571,26 @@ mod tests {
 
     #[test]
     fn the_driver_verifies_state_resume_chunks() {
-        explore_device_tree(Profile {
-            keepalive_every: None,
-            ..FW42_1215C
-        });
-        explore_device_tree(PLCSIM_FW28);
+        for profile in PROFILES
+            .iter()
+            .filter(|p| p.dialect == Dialect::StateResume)
+        {
+            explore_device_tree(Profile {
+                keepalive_every: None,
+                ..*profile
+            });
+        }
     }
 
     #[test]
     fn the_driver_verifies_feed_forward_chunks() {
-        explore_device_tree(FW46_1214C);
+        let feed_forward = PROFILES
+            .iter()
+            .filter(|p| p.dialect == Dialect::FeedForward);
+        assert_eq!(feed_forward.clone().count(), 4);
+        for profile in feed_forward {
+            explore_device_tree(*profile);
+        }
     }
 
     #[test]
@@ -1429,7 +1635,7 @@ mod tests {
     }
 
     /// A GetMultiVariables of "Data_block_1".toto with the V1 ObjectQualifier layout, as the
-    /// Python driver sent it in the field run: the key qualifier as a fixed `u32`, no terminator.
+    /// trace run's client sent it: the key qualifier as a fixed `u32`, no terminator.
     fn v1_read(seq: u16) -> Vec<u8> {
         let mut req = proto::build_get_multi_request(seq, SESSION_ID, &[toto()], true, 9).unwrap();
         let v2 = [0x89, 0x6b, 0x00, 0x04, 0x00, 0x00];
@@ -1562,6 +1768,100 @@ mod tests {
         assert_eq!(served.plc.m_area[99..103], [0, 0xde, 0xad, 0]);
     }
 
+    /// The probe run's measurements, written out once more as the table they were
+    /// read from, so an edit to an S7-1200 profile that the logs don't back fails here: the other
+    /// tests take their expectations from the profiles themselves. (PLCSIM's profile is checked
+    /// against the live simulator instead.)
+    #[test]
+    fn s7_1200_profiles_hold_the_probe_run_measurements() {
+        use Dialect::{FeedForward as Ff, StateResume as Sr};
+        use InitSslRefusal::{Error2, ReturnValue as Rv};
+        #[rustfmt::skip]
+        let table = [
+            // FW  dialect fragment  M    over-limit low  -61 low  level  close             InitSsl
+            (FW42_1215C, Sr, 976, 8192, 0x0054, 0x02b9, 3, 0,                     Error2),
+            (FW43_1215C, Sr, 976, 8192, 0x0054, 0x02b9, 3, 0,                     Error2),
+            (FW44_1215C, Ff, 980, 8192, 0x0070, 0x02c7, 3, 0x2023_8000_0085_002d, Error2),
+            (FW45_1212C, Ff, 946, 4096, 0x0071, 0x02d1, 1, 0x2023_8000_0085_002d, Rv(0xa201_d600_01ed_fdf9)),
+            (FW46_1214C, Ff, 946, 8192, 0x0071, 0x02d1, 3, 0x2023_8000_0085_002d, Rv(0xa201_d600_01e6_fdf9)),
+            (FW47_1212C, Ff, 946, 4096, 0x0078, 0x02cf, 1, 0x2023_8000_0087_002d, Rv(0xa201_d600_01f2_fdf9)),
+        ];
+        assert_eq!(table.len() + 1, PROFILES.len());
+        for (p, dialect, fragment, m, over, refused, level, close, init_ssl) in table {
+            let at = p.name;
+            assert_eq!(p.dialect, dialect, "{at}");
+            assert_eq!(p.max_fragment, fragment, "{at}");
+            assert_eq!(p.m_area_bytes, m, "{at}");
+            assert_eq!((p.tags_per_read, p.tags_per_write), (50, 50), "{at}");
+            assert_eq!(
+                p.read_over_limit,
+                Some(0xa027_a600_0000_fffc | over << 16),
+                "{at}"
+            );
+            let raw = p.raw_access.unwrap();
+            assert_eq!(
+                raw.read_refused,
+                0x8206_8d00_0000_ffc3 | refused << 16,
+                "{at}"
+            );
+            assert_eq!(raw.write_refused, None, "{at}: writes weren't probed");
+            assert_eq!(p.protection_level, Some(level), "{at}");
+            assert_eq!(p.session_delete_return, close, "{at}");
+            assert_eq!(p.init_ssl, Some(init_ssl), "{at}");
+            assert_eq!(p.max_tpdu, None, "{at}");
+        }
+    }
+
+    /// What `s7tool probe` measured on each S7-1200 (probe run), through the driver:
+    /// the limit itself answered and one more item refused, the end of the M area, and byte reads
+    /// refused on an optimized DB but not on a standard one. Each refusal leaves the connection
+    /// usable.
+    #[test]
+    fn each_cpu_answers_at_its_limits_as_measured() {
+        let code = |c: u64| format!("0x{c:016x}");
+        for profile in PROFILES {
+            let mut plc = Plc::plcsim_project();
+            // DB 2 as a standard block, like the field CPUs' that answered byte reads.
+            plc.dbs[1].optimized = false;
+            plc.dbs[1].bytes = vec![0xab; 4];
+            let name = profile.name;
+            let raw = profile.raw_access.unwrap();
+            let refused = code(raw.read_refused);
+            let ((), served) = run(profile, plc, |mut conn| {
+                let n = profile.tags_per_read as usize;
+                assert_eq!(
+                    conn.read_variables_unsplit(&vec![toto(); n])
+                        .unwrap()
+                        .values
+                        .len(),
+                    n
+                );
+                let e = conn
+                    .read_variables_unsplit(&vec![toto(); n + 1])
+                    .unwrap_err();
+                assert!(
+                    e.to_string()
+                        .contains(&code(profile.read_over_limit.unwrap())),
+                    "{name}: {e}"
+                );
+
+                let m = profile.m_area_bytes as u32;
+                conn.read_area(Area::Memory, m - 1, 1).unwrap();
+                let e = conn.read_area(Area::Memory, m, 1).unwrap_err();
+                assert!(e.to_string().contains(&refused), "{name}: {e}");
+
+                let e = conn.read_area(Area::Db(1), 0, 1).unwrap_err();
+                assert!(e.to_string().contains(&refused), "{name}: {e}");
+                assert_eq!(conn.read_area(Area::Db(2), 0, 2).unwrap(), [0xab, 0xab]);
+                assert!(!conn.is_poisoned(), "{name}");
+            });
+            let items: Vec<usize> = served.requests.iter().map(|r| r.items).collect();
+            let n = profile.tags_per_read as usize;
+            assert_eq!(items[..3], [2, n, n + 1], "{name}");
+            assert_eq!(served.end, End::ClientClosed, "{name}");
+        }
+    }
+
     // --- Phase 5: the profiles end to end ----------------------------------------------------
 
     /// Connect, list the DBs, read, browse, write, explore something large, close: against
@@ -1675,10 +1975,13 @@ mod tests {
         let e = conn
             .read_variables_unsplit(&vec![limit; n + 1])
             .unwrap_err();
-        assert!(e.to_string().contains(&code(p.over_limit.unwrap())), "{e}");
+        assert!(
+            e.to_string().contains(&code(p.read_over_limit.unwrap())),
+            "{e}"
+        );
 
-        // The M area ends where the fixture's does.
-        let m_len = fixture.m_area.len() as u32;
+        // The M area ends where the profile says.
+        let m_len = p.m_area_bytes as u32;
         conn.read_area(Area::Memory, m_len - 1, 1).unwrap();
         let e = conn.read_area(Area::Memory, m_len, 1).unwrap_err();
         assert!(e.to_string().contains(&code(raw.read_refused)), "{e}");
@@ -1690,7 +1993,10 @@ mod tests {
             let e = conn.read_area(area, 0, 1).unwrap_err();
             assert!(e.to_string().contains(&code(raw.read_refused)), "{e}");
             let e = conn.write_area(area, 0, &[0]).unwrap_err();
-            assert!(e.to_string().contains(&code(raw.write_refused)), "{e}");
+            assert!(
+                e.to_string().contains(&code(raw.write_refused.unwrap())),
+                "{e}"
+            );
         }
 
         // Its program and type info still match the captures the mock replays.
@@ -2053,28 +2359,40 @@ mod tests {
 
     // --- Phase 6: before the login ----------------------------------------------------------
 
-    /// A CPU without TLS refuses InitSsl with Error2; the TLS connect must say "InitSsl
-    /// rejected", which is what `s7tool --auto` falls through to the legacy schemes on.
+    /// A CPU that won't do TLS refuses InitSsl, with Error2 (FW 4.2 to 4.4) or with an error
+    /// return value (FW 4.5 to 4.7); either way the TLS connect must say "InitSsl rejected",
+    /// which is what `s7tool --auto` falls through to the legacy schemes on.
     #[test]
     fn a_cpu_without_tls_refuses_init_ssl() {
-        let (addr, mock) = spawn_refusing_init_ssl();
-        let e = Connection::connect(addr, Duration::from_secs(5))
-            .err()
-            .expect("no TLS connection");
-        let request = mock.join().unwrap();
-        assert_eq!(&request[7..9], &functioncode::INIT_SSL.to_be_bytes());
-        let msg = e.to_string();
-        assert!(
-            msg.contains("InitSsl rejected") && msg.contains("0x05a9"),
-            "{msg}"
-        );
+        for profile in PROFILES {
+            let Some(refusal) = profile.init_ssl else {
+                continue;
+            };
+            let (addr, mock) = spawn_refusing_init_ssl(refusal);
+            let e = Connection::connect(addr, Duration::from_secs(5))
+                .err()
+                .expect("no TLS connection");
+            let request = mock.join().unwrap();
+            assert_eq!(&request[7..9], &functioncode::INIT_SSL.to_be_bytes());
+            let msg = e.to_string();
+            let detail = match refusal {
+                InitSslRefusal::Error2 => "0x05a9".to_owned(),
+                InitSslRefusal::ReturnValue(rv) => format!("return_value=0x{rv:016x}"),
+            };
+            assert!(
+                msg.contains("InitSsl rejected") && msg.contains(&detail),
+                "{}: {msg}",
+                profile.name
+            );
+        }
     }
 
     #[test]
     fn a_request_the_mock_has_no_answer_for_fails_the_test() {
         let caught = std::panic::catch_unwind(|| {
+            // A byte write the PLC refuses (DB 1 is optimized): never tried on an S7-1200.
             run(FW42_1215C, Plc::plcsim_project(), |mut conn| {
-                let _ = conn.read_area(Area::Memory, 0, 1);
+                let _ = conn.write_area(Area::Db(1), 0, &[1]);
             })
         });
         let panic = caught.unwrap_err();
