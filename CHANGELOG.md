@@ -41,6 +41,12 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- `s7tool probe`: a read-only run that logs how the PLC answers requests at the edge of what it
+  accepts (a read one item over its advertised limit, and one-byte reads by byte offset across
+  the M area and of each data block), for field runs on S7-1200 CPUs. It uses the new diagnostic
+  `Connection::read_variables_unsplit`, which sends a read as one request whatever the PLC's
+  limit. On the legacy transport, the trace log also records each response chunk's size and the
+  bytes of every SystemEvent, so a field log shows how a CPU splits its responses.
 - The driver logs what it does through the `log` crate: each connection step (TCP and COTP,
   InitSsl, the TLS version, cipher suite and certificate fingerprint, the session, the legacy and
   real-PLC auth steps with the key family, key id and echoed session-setup values, the request

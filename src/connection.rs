@@ -750,6 +750,17 @@ impl Connection {
         Ok(merged.expect("more than one chunk"))
     }
 
+    /// Diagnostic: like [`Connection::read_variables`], but always as **one** request, however
+    /// many addresses there are and whatever [`Connection::max_tags_per_read`] says, and without
+    /// the auto-reconnect retry. It is for measuring how a PLC answers a request over its limit
+    /// (`s7tool probe`); a PLC may refuse it, or close the connection over it.
+    pub fn read_variables_unsplit(
+        &mut self,
+        addresses: &[ItemAddress],
+    ) -> Result<GetMultiVariablesResponse> {
+        self.read_variables_once(addresses)
+    }
+
     fn read_variables_retrying(
         &mut self,
         addresses: &[ItemAddress],
@@ -3211,6 +3222,33 @@ mod tests {
         assert_eq!(conn.cpu_state().unwrap(), CpuState::Stop);
         assert_eq!(conn.cpu_state().unwrap(), CpuState::Other(6));
         assert!(conn.cpu_state().is_err());
+        plc.join().unwrap();
+    }
+
+    /// `read_variables_unsplit` sends one request whatever the PLC's limit (here 100), and a
+    /// refusal comes back as an error carrying the return value, with the connection still usable:
+    /// what `s7tool probe` relies on. The return value is PLCSIM's for 101 items (live run).
+    #[test]
+    fn read_variables_unsplit_sends_one_request() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            let req = plc.recv_request();
+            assert_eq!(&req[3..5], &functioncode::GET_MULTI_VARIABLES.to_be_bytes());
+            assert_eq!(req[18], 101, "item count, after the link id");
+            let mut body = plc.response(functioncode::GET_MULTI_VARIABLES, &[]);
+            body.pop(); // the return value 0 `response` wrote
+            crate::wire::vlq::encode_u64(&mut body, 0xa027_a600_007b_fffc).unwrap();
+            body.extend_from_slice(&[0, 0, 0]);
+            plc.send(&body);
+        });
+        let item = ItemAddress {
+            symbol_crc: 0,
+            access_area: 0x8a0e_0002,
+            access_sub_area: 2550,
+            lid: vec![9],
+        };
+        let e = conn.read_variables_unsplit(&vec![item; 101]).unwrap_err();
+        assert!(e.to_string().contains("0xa027a600007bfffc"), "{e}");
+        assert!(!conn.is_poisoned());
         plc.join().unwrap();
     }
 

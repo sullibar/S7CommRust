@@ -37,6 +37,7 @@ macro_rules! out {
 
 mod diag;
 mod logfile;
+mod probe;
 
 const PROMPT: &str = "s7> ";
 
@@ -435,6 +436,7 @@ fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
         "xverify" => xverify(conn),
         "info" => diag::info(conn),
         "report" => diag::report(conn),
+        "probe" => probe::probe(conn),
         "browse" => browse(conn, cmd.get(1).map(String::as_str)),
         "read" => {
             if cmd.len() < 2 {
@@ -1100,6 +1102,8 @@ fn help_body() -> &'static str {
     "COMMANDS:\n\
      \x20   info                what the PLC is (order number, firmware) and the session\n\
      \x20   report              run every read-only command below in turn, for the log\n\
+     \x20   probe               read-only: how the PLC answers a read over its item limit and\n\
+     \x20                       byte reads at the edges of M and of each DB (for the mock PLC)\n\
      \x20   browse [DB|M|Q|I]   recursively list tags with their current values\n\
      \x20   dbs                 list the data blocks\n\
      \x20   read <sym>...       read one or more tags by symbol name\n\
