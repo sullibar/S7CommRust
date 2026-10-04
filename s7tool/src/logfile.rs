@@ -190,11 +190,16 @@ mod tests {
 
     #[test]
     fn passwords_are_masked_even_in_a_full_log() {
-        let line =
-            command_line_for_log(&strings(&["--ip", "1.2.3.4", "legit", "admin", "hunter2"]));
+        let line = command_line_for_log(&strings(&[
+            "--ip",
+            "192.0.2.10",
+            "legit",
+            "admin",
+            "hunter2",
+        ]));
         assert_eq!(
             privacy::screen(&line),
-            "--ip 1.2.3.4 legit admin <password>"
+            "--ip 192.0.2.10 legit admin <password>"
         );
         assert_eq!(logged(line), "--ip <plc> legit <user> <password>");
         assert_eq!(

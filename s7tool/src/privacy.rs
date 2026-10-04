@@ -445,9 +445,9 @@ mod tests {
 
     #[test]
     fn ip_addresses_are_replaced() {
-        let _ = plc("192.168.17.42");
+        let _ = plc("192.0.2.42");
         let logged = for_log(
-            "TCP connected to 192.168.17.42:102 via 10.0.0.1, mask 0.0.0.0",
+            "TCP connected to 192.0.2.42:102 via 192.0.2.1, mask 0.0.0.0",
             true,
         );
         assert!(
