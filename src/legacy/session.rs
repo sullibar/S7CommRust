@@ -284,7 +284,7 @@ pub(crate) fn recv_response(tcp: &mut IsoTcp) -> Result<Vec<u8>> {
                 log::debug!(
                     "legacy: fatal SystemEvent ({} bytes): {}",
                     t.len(),
-                    crate::wire::pdu::Hex(&t)
+                    crate::wire::pdu::UnredactedHex(&t)
                 );
                 return Err(Error::closed(
                     "PLC sent a fatal SystemEvent; connection must be re-established",
@@ -293,7 +293,7 @@ pub(crate) fn recv_response(tcp: &mut IsoTcp) -> Result<Vec<u8>> {
             log::debug!(
                 "legacy: skipped SystemEvent ({} bytes): {}",
                 t.len(),
-                crate::wire::pdu::Hex(&t)
+                crate::wire::pdu::UnredactedHex(&t)
             );
             continue;
         }

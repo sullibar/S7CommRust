@@ -36,7 +36,7 @@ pub fn probe(conn: &mut Connection) -> Result<()> {
     out!("== one-byte reads of each data block by byte offset (fails on an optimized block)");
     let dbs = conn.datablock_list()?;
     for db in dbs.iter().take(MAX_DBS) {
-        let label = format!("DB{} {:?}", db.number, db.name);
+        let label = format!("DB{} {}", db.number, crate::privacy::name(&db.name));
         let result = match u16::try_from(db.number) {
             Ok(n) => conn.read_area(Area::Db(n), 0, 1).map(|_| ()),
             Err(_) => continue,

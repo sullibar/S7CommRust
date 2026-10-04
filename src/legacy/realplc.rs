@@ -28,7 +28,7 @@ use crate::legacy::session::{
     LegacySession, CREATE_OBJECT_POC,
 };
 use crate::transport::IsoTcp;
-use crate::wire::pdu::Hex;
+use crate::wire::pdu::{Hex, UnredactedHex};
 
 // The two auth `SetMultiVariables` templates (S71500_AUTH_TEMPLATE / S71200_AUTH_TEMPLATE),
 // captured from HarpoS7's PoC; each embeds a sample blob we overwrite.
@@ -72,7 +72,7 @@ fn echo_setup_values(frame: &mut Vec<u8>, resp: &[u8]) {
             Some(v) => {
                 log::debug!(
                     "real-PLC: echoing session-setup value {attr:#04x} = {}",
-                    Hex(&v)
+                    UnredactedHex(&v)
                 );
                 splice_setup_value(frame, attr, &v);
             }

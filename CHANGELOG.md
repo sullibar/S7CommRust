@@ -41,6 +41,13 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- `s7commplus::set_log_redaction`: keeps the PLC's project data out of the driver's log records
+  (telegram dumps stop after the PDU header; symbol and data-block names are left out). s7tool
+  turns it on for its session log, which no longer carries tag and block names, values, alarm
+  texts, the PLC's certificate fingerprint, IP addresses, paths or the tester's user name: names
+  become stable placeholders (`<name7>`), so a log can be sent on from a site that isn't ours.
+  The screen still shows everything; `--full-log` keeps it all in the log too (passwords stay
+  out either way).
 - `s7tool probe`: a read-only run that logs how the PLC answers requests at the edge of what it
   accepts (a read one item over its advertised limit, and one-byte reads by byte offset across
   the M area and of each data block), for field runs on S7-1200 CPUs. It uses the new diagnostic

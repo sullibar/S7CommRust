@@ -1489,7 +1489,7 @@ impl Connection {
             dbs.len(),
             found - dbs.len(),
             dbs.iter()
-                .map(|d| (d.number, d.name.as_str()))
+                .map(|d| (d.number, crate::logging::name(&d.name)))
                 .collect::<Vec<_>>()
         );
         let list: Arc<[DataBlock]> = dbs.into();
@@ -1562,7 +1562,7 @@ impl Connection {
         if self.poisoned {
             return Err(e);
         }
-        log::debug!("browse: skipping {what}: {e}");
+        log::debug!("browse: skipping {}: {e}", crate::logging::name(what));
         Ok(())
     }
 
@@ -1797,7 +1797,8 @@ impl Connection {
         let resolved = self.resolve_uncached(symbol)?;
         let addr = &resolved.0;
         log::debug!(
-            "resolved {symbol} → area 0x{:08x}, sub-area {}, LIDs {:?}",
+            "resolved {} → area 0x{:08x}, sub-area {}, LIDs {:?}",
+            crate::logging::name(symbol),
             addr.access_area,
             addr.access_sub_area,
             addr.lid
