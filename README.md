@@ -18,6 +18,9 @@ It supports both protocol versions:
 | CPU                | Order number   | Firmware | Connection          | Result |
 |--------------------|----------------|----------|---------------------|--------|
 | S7-1215C           | 6ES7 215-1AG40 | V4.2     | legacy `--real-plc` | ✅ |
+| S7-1215C           | 6ES7 215-1AG40 | V4.3     | legacy `--real-plc` | ✅ |
+| S7-1215C           | 6ES7 215-1AG40 | V4.4     | legacy `--real-plc` | ✅ |
+| S7-1212C           | 6ES7 212-1HE40 | V4.5     | legacy `--real-plc` | ✅ |
 | S7-1214C           | 6ES7 214-1BG40 | V4.6     | legacy `--real-plc` | ✅ |
 | S7-1212C           | 6ES7 212-1AE40 | V4.7     | legacy `--real-plc` | ✅ |
 | S7-1215C           | 6ES7 215-1AG40 | V4.5     | TLS                 | ✅ |
