@@ -30,6 +30,11 @@
 //! * **Field run**: the Python driver (gijzelaerr/s7commplus) against
 //!   the same FW V4.2 1215C, traced down to TPKT frames: chunk sizes, keep-alives, rejections.
 //!
+//! The PLCSIM profile is also checked against a live simulator by the ignored test
+//! `plcsim_matches_its_profile` (limits, the over-limit answer, the -61 answers, the M area size,
+//! the program's data blocks). For S7-1200 CPUs, `s7tool probe` collects the answers still missing
+//! here in one read-only run, and its trace log records chunk sizes and keep-alives.
+//!
 //! Requests the mock has no measured answer for make it panic ("not measured"), so a test can't
 //! quietly rely on a guess. A panic in the mock thread is re-raised by [`run`].
 //!
@@ -869,10 +874,10 @@ pub(crate) fn wire_value(value: &PValue) -> Vec<u8> {
 
 impl Plc {
     /// The PLCSIM FW V2.8 project the `tests/vectors` captures come from: its program tree, the
-    /// type info of its two (optimized) data blocks, the device tree and the CPU state. The
-    /// pairing of DB 1/2 with type info 0x92000001/2 follows the numbers; the LID-1 reads that
-    /// returned them weren't captured. The M area is the 16 KB a CPU 1511 has (PLCSIM read it
-    /// whole, live run). Tag values start at zero.
+    /// type info of its two data blocks, the device tree and the CPU state. Checked live (the
+    /// ignored test `plcsim_matches_its_profile`): both blocks are optimized,
+    /// their LID-1 reads return type info 0x92000001/2, and the M area is 16 KB. Tag values start
+    /// at zero.
     pub(crate) fn plcsim_project() -> Plc {
         let int0 = wire_value(&PValue::Int(0));
         let mut symbols = HashMap::new();
@@ -1616,6 +1621,81 @@ mod tests {
                 assert_eq!(ids, want, "{name}, set class {set_class}");
             }
         }
+    }
+
+    // --- The PLCSIM profile against the live simulator --------------------------------------
+
+    /// Check [`PLCSIM_FW28`] and [`Plc::plcsim_project`] against a live PLCSIM Advanced running
+    /// the legacy (FW V2.8) test project (`tools/plcsim/README.md`), so the profile can't drift
+    /// from the simulator it was measured on. Read-only, apart from one write that the PLC
+    /// refuses: it is only sent once a read has shown the block is optimized. Run with
+    ///
+    /// ```sh
+    /// S7_PLC_IP=<simulator address> S7_LEGACY=1 cargo test --lib plcsim_matches -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "needs a live PLCSIM Advanced instance (S7_PLC_IP, S7_LEGACY)"]
+    fn plcsim_matches_its_profile() {
+        let (Ok(ip), Ok(_)) = (std::env::var("S7_PLC_IP"), std::env::var("S7_LEGACY")) else {
+            eprintln!("plcsim_matches_its_profile: skipped (set S7_PLC_IP and S7_LEGACY)");
+            return;
+        };
+        let p = PLCSIM_FW28;
+        let fixture = Plc::plcsim_project();
+        let raw = p.raw_access.unwrap();
+        let code = |c: u64| format!("0x{c:016x}");
+        let mut conn = Connection::connect_legacy((ip.as_str(), 102), Duration::from_secs(10))
+            .expect("legacy connect");
+
+        assert_eq!(conn.plc_description(), Some(p.description));
+        assert_eq!(conn.max_tags_per_read(), p.tags_per_read as usize);
+        assert_eq!(conn.max_tags_per_write(), p.tags_per_write as usize);
+
+        // One item over the limit, in one request.
+        let limit = ItemAddress {
+            symbol_crc: 0,
+            access_area: crate::wire::pdu::ids::OBJECT_ROOT,
+            access_sub_area: crate::wire::pdu::ids::SYSTEM_LIMITS,
+            lid: vec![crate::wire::pdu::ids::TAGS_PER_READ_REQUEST_MAX],
+        };
+        let n = p.tags_per_read as usize;
+        assert_eq!(
+            conn.read_variables_unsplit(&vec![limit.clone(); n])
+                .unwrap()
+                .values
+                .len(),
+            n
+        );
+        let e = conn
+            .read_variables_unsplit(&vec![limit; n + 1])
+            .unwrap_err();
+        assert!(e.to_string().contains(&code(p.over_limit.unwrap())), "{e}");
+
+        // The M area ends where the fixture's does.
+        let m_len = fixture.m_area.len() as u32;
+        conn.read_area(Area::Memory, m_len - 1, 1).unwrap();
+        let e = conn.read_area(Area::Memory, m_len, 1).unwrap_err();
+        assert!(e.to_string().contains(&code(raw.read_refused)), "{e}");
+
+        // The fixture's DBs are optimized here too: byte access is refused, reads and writes.
+        for db in &fixture.dbs {
+            assert!(db.optimized);
+            let area = Area::Db((db.relid & 0xffff) as u16);
+            let e = conn.read_area(area, 0, 1).unwrap_err();
+            assert!(e.to_string().contains(&code(raw.read_refused)), "{e}");
+            let e = conn.write_area(area, 0, &[0]).unwrap_err();
+            assert!(e.to_string().contains(&code(raw.write_refused)), "{e}");
+        }
+
+        // Its program and type info still match the captures the mock replays.
+        let dbs = conn.datablock_list().unwrap();
+        for (db, want) in dbs.iter().zip(&fixture.dbs) {
+            assert_eq!((db.relid, db.ti_relid), (want.relid, want.ti_relid));
+        }
+        assert_eq!(dbs.len(), fixture.dbs.len());
+
+        assert!(!conn.is_poisoned());
+        conn.close().unwrap();
     }
 
     // --- Phase 6: before the login ----------------------------------------------------------
