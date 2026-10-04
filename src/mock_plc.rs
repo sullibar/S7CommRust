@@ -1510,6 +1510,14 @@ mod tests {
                 .unwrap();
             proto::parse_get_multi_response(&conn.request_response(&req).unwrap()).unwrap()
         });
+        // The same through the driver's diagnostic call (what `s7tool probe` uses): an error
+        // that carries the return value, and the connection stays usable.
+        let ((e, poisoned), _) = run(PLCSIM_FW28, Plc::plcsim_project(), |mut conn| {
+            let e = conn.read_variables_unsplit(&vec![toto(); 101]).unwrap_err();
+            (e, conn.is_poisoned())
+        });
+        assert!(e.to_string().contains("0xa027a600007bfffc"), "{e}");
+        assert!(!poisoned);
         assert_eq!(resp.header.return_value, 0xa027_a600_007b_fffc);
         assert!(!resp.header.is_ok());
         assert!(resp.values.is_empty() && resp.errors.is_empty());
