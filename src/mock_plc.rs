@@ -60,6 +60,9 @@
 //!   profile.
 //! * **The exact bytes after the return value** in DeleteObject and SetMultiVariables responses: the
 //!   driver reads only the header, and the mock writes the layout of the crate's own parse tests.
+//! * **The login itself** is out of scope (see above). That includes the CreateObject of a FW 2.2
+//!   CPU, which carries no attribute-303 challenge: no capture of it is in `tests/vectors`, and one
+//!   would have to be sanitised and reviewed before it is added.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -442,6 +445,22 @@ impl MockPlc {
     /// The next request, or why the connection ended. Applies the profile's frame size limit and
     /// checks the request's digest (a PLC drops the connection on a wrong one).
     fn next_request(&mut self) -> Result<Request, End> {
+        let (tsdu, dt_frames) = self.recv_tsdu()?;
+        assert_eq!(&tsdu[..2], &[0x72, 0x03], "mock PLC: not a V3 request");
+        assert_eq!(tsdu[4], 0x20, "mock PLC: request carries no digest");
+        let data = &tsdu[4 + 33..tsdu.len() - 4];
+        if tsdu[5..37] != hmac_sha256(&self.key, &[data]) {
+            let _ = self.stream.shutdown(Shutdown::Both);
+            return Err(End::Reset("wrong request digest"));
+        }
+        let body = data.to_vec();
+        self.seq = u16::from_be_bytes([body[7], body[8]]);
+        Ok(Request { body, dt_frames })
+    }
+
+    /// The next TSDU (COTP DT frames up to the end-of-TSDU bit) and how many frames it took, or
+    /// why the connection ended. Applies the profile's frame size limit.
+    fn recv_tsdu(&mut self) -> Result<(Vec<u8>, usize), End> {
         let mut tsdu = Vec::new();
         let mut dt_frames = 0;
         loop {
@@ -464,19 +483,9 @@ impl MockPlc {
             dt_frames += 1;
             tsdu.extend_from_slice(&rest[3..]);
             if rest[2] & 0x80 != 0 {
-                break;
+                return Ok((tsdu, dt_frames));
             }
         }
-        assert_eq!(&tsdu[..2], &[0x72, 0x03], "mock PLC: not a V3 request");
-        assert_eq!(tsdu[4], 0x20, "mock PLC: request carries no digest");
-        let data = &tsdu[4 + 33..tsdu.len() - 4];
-        if tsdu[5..37] != hmac_sha256(&self.key, &[data]) {
-            let _ = self.stream.shutdown(Shutdown::Both);
-            return Err(End::Reset("wrong request digest"));
-        }
-        let body = data.to_vec();
-        self.seq = u16::from_be_bytes([body[7], body[8]]);
-        Ok(Request { body, dt_frames })
     }
 
     /// A successful response body to `function`, answering the last request, followed by
@@ -1220,6 +1229,29 @@ fn serve(mut mock: MockPlc, mut plc: Plc) -> Served {
     }
 }
 
+/// A CPU without TLS S7CommPlus, before any login: it answers the client's InitSsl with function
+/// Error2 (0x05a9) instead of an InitSsl response, as FW 2.2 and FW 4.2 did (first s7tool logs; the return value is the one PR #17's test in `proto::init_ssl` records), then
+/// waits for the client to go. Returns where it listens and the InitSsl request it got.
+pub(crate) fn spawn_refusing_init_ssl() -> (std::net::SocketAddr, JoinHandle<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock = std::thread::spawn(move || {
+        let mut mock = MockPlc::accept(&listener, SCRIPTED);
+        let (request, _) = mock.recv_tsdu().expect("an InitSsl request");
+        assert_eq!(
+            &request[..2],
+            &[0x72, 0x01],
+            "mock PLC: InitSsl is a V1 PDU"
+        );
+        let mut body = response_header(functioncode::ERROR_2, 0, 0xa201_d600_01f2_fdf9);
+        body[7..9].copy_from_slice(&request[11..13]); // echo the sequence number
+        mock.write(&dt_frame(&pdu::frame_single_pdu(0x01, &body)));
+        let _ = mock.recv_tsdu(); // until the client closes
+        request
+    });
+    (addr, mock)
+}
+
 /// Start an emulated `plc` that behaves like `profile`, listening on loopback for one client.
 fn spawn_mock(profile: Profile, plc: Plc) -> (std::net::SocketAddr, JoinHandle<Served>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1576,6 +1608,25 @@ mod tests {
                 assert_eq!(ids, want, "{name}, set class {set_class}");
             }
         }
+    }
+
+    // --- Phase 6: before the login ----------------------------------------------------------
+
+    /// A CPU without TLS refuses InitSsl with Error2; the TLS connect must say "InitSsl
+    /// rejected", which is what `s7tool --auto` falls through to the legacy schemes on.
+    #[test]
+    fn a_cpu_without_tls_refuses_init_ssl() {
+        let (addr, mock) = spawn_refusing_init_ssl();
+        let e = Connection::connect(addr, Duration::from_secs(5))
+            .err()
+            .expect("no TLS connection");
+        let request = mock.join().unwrap();
+        assert_eq!(&request[7..9], &functioncode::INIT_SSL.to_be_bytes());
+        let msg = e.to_string();
+        assert!(
+            msg.contains("InitSsl rejected") && msg.contains("0x05a9"),
+            "{msg}"
+        );
     }
 
     #[test]
