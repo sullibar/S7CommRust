@@ -281,7 +281,9 @@ pub fn function_name(code: u16) -> &'static str {
 const HEX_DUMP_MAX: usize = 64 * 1024;
 
 /// What [`Hex`] keeps of a telegram while log redaction is on: the `72 <ver> <len>` framing and
-/// the PDU header up to the transport flags (opcode, function, sequence number, session id).
+/// the PDU header. A request's header ends at its transport flags (opcode, function, sequence
+/// number, session id); a response's is four bytes shorter, so its dump also shows the return
+/// value and at most the first item's number and flags, never a value (checked on the field logs).
 const REDACTED_DUMP_LEN: usize = 18;
 
 /// A telegram as space-separated hex for logs, cut off after [`HEX_DUMP_MAX`] bytes, or after its

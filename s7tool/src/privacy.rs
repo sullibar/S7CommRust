@@ -37,6 +37,13 @@ const CLOSE: char = '\u{e002}';
 /// ordinary words.
 const MIN_TRACKED_NAME: usize = 3;
 
+/// Whether a name is looked for in other log lines: not too short, and not a plain lowercase
+/// word, which s7tool's own text uses too (a tag named `done` would turn "report done" into
+/// "report <name…>").
+fn is_tracked(name: &str) -> bool {
+    name.chars().count() >= MIN_TRACKED_NAME && !name.chars().all(|c| c.is_ascii_lowercase())
+}
+
 /// Text that is shown on screen but replaced in the session log.
 pub struct Private {
     real: String,
@@ -247,7 +254,7 @@ impl Registry {
             Some(file_name(core))
         } else if self.user.as_deref() == Some(core) {
             Some("<user>".to_owned())
-        } else if core.chars().count() >= MIN_TRACKED_NAME {
+        } else if is_tracked(core) {
             self.names.get(core).cloned()
         } else {
             None
@@ -426,9 +433,14 @@ mod tests {
                 registry().names["Conveyor_Motor_3"]
             )
         );
-        // Short names would hit ordinary words, so they aren't looked for.
+        // Short names and plain words would hit s7tool's own text, so they aren't looked for.
         let _ = name("M");
+        let _ = name("done");
         assert_eq!(for_log("M area (3 tags):", true), "M area (3 tags):");
+        assert_eq!(
+            for_log("report done: 7 of 7 steps succeeded", true),
+            "report done: 7 of 7 steps succeeded"
+        );
     }
 
     #[test]
