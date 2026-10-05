@@ -124,6 +124,12 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- A SystemEvent carrying a data struct is recognised again, so `SystemEvent::is_fatal` is true for
+  it. The parser looked for a two-byte `00 17` value header; SystemEvent values are fixed-width,
+  so the header is four bytes (`00 00 00 17`), as in the reference driver and the Wireshark
+  dissector. An S7-1215C (FW V4.2) sends such a struct (id 40300, no members)
+  just before it closes the connection over a rejected request; it used to pass as a harmless
+  message and the driver waited for a response that never came.
 - An alarm's unused associated-value slots are `AssociatedValue::Unused` (new) instead of
   `Unsupported`: the PLC sends all ten SD slots, the unused ones empty. Found with a firing
   `Program_Alarm` on PLCSIM, the first live test of alarm reception: the subscription and
