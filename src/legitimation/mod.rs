@@ -129,7 +129,8 @@ fn parse_description(description: &str) -> Option<(String, u32)> {
 /// The legacy scheme's answer to `challenge`: `sha1(password) XOR challenge`, as the reference's
 /// `legitimateLegacy` computes it. The challenge must be 20 bytes, the length of a SHA-1.
 pub fn legacy_challenge_response(password: &str, challenge: &[u8]) -> Result<Vec<u8>> {
-    let hash = crypto::sha1(password.as_bytes());
+    // The hash is all the PLC checks, so it is as good as the password: wipe it after use.
+    let hash = zeroize::Zeroizing::new(crypto::sha1(password.as_bytes()));
     if challenge.len() != hash.len() {
         return Err(Error::protocol(format!(
             "legacy legitimation: challenge of {} bytes, expected {}",

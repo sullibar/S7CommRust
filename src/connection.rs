@@ -32,6 +32,7 @@ use crate::transport::{IsoTcp, TlsChannel};
 use crate::value::strings::{decode_s7_string, decode_wstring, encode_s7_string, encode_wstring};
 use crate::value::PValue;
 use crate::wire::pdu::{self, functioncode, ids, protocol_version};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Controller areas browsable by symbol: `(AccessArea RID, type-info relid, label)`, in the
 /// order the reference tries them (M, then Q, then I).
@@ -335,6 +336,16 @@ enum ReconnectTarget {
         addrs: Vec<SocketAddr>,
         timeout: Duration,
     },
+}
+
+/// Wipe the session's keys when the connection goes (a reconnect replaces it, too).
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if let Some(key) = self.legacy_session_key.as_mut() {
+            key.zeroize();
+        }
+        self.legitimation_key.zeroize();
+    }
 }
 
 impl Connection {
@@ -2797,16 +2808,22 @@ impl Connection {
                 }
                 // The reference "rolls" the key: each legitimation on a session hashes the
                 // previous key again, starting from the exported secret.
-                let base = match self.legitimation_key {
+                let base = Zeroizing::new(match self.legitimation_key {
                     Some(key) => key,
                     None => self.export_oms_secret()?,
-                };
-                let key = crypto::sha256(&base);
-                self.legitimation_key = Some(key);
+                });
+                let key = Zeroizing::new(crypto::sha256(&*base));
+                self.legitimation_key = Some(*key);
                 let iv = &challenge[..crypto::AES_BLOCK_LEN];
-                let mut payload = Vec::new();
-                build_legitimation_payload(username, password).serialize(&mut payload)?;
-                let ciphertext = crypto::encrypt_aes256_cbc_pkcs7(&key, iv, &payload)?;
+                // The credentials in the clear, wiped once encrypted.
+                let mut credentials = build_legitimation_payload(username, password);
+                // Room for it all up front: a reallocation would leave a copy behind.
+                let room = 64 + username.len() + password.len();
+                let mut payload = Zeroizing::new(Vec::with_capacity(room));
+                let serialized = credentials.serialize(&mut *payload);
+                wipe_blobs(&mut credentials);
+                serialized?;
+                let ciphertext = crypto::encrypt_aes256_cbc_pkcs7(&*key, iv, &payload)?;
                 let blob = PValue::Blob {
                     root_id: 0,
                     data: ciphertext,
@@ -3127,6 +3144,19 @@ fn scan_telegram(buf: &[u8]) -> Result<Option<Scanned>> {
         i += 4 + len;
     }
     Ok(None)
+}
+
+/// Overwrite the bytes of every `Blob` in `value` (the credentials of a legitimation payload).
+fn wipe_blobs(value: &mut PValue) {
+    match value {
+        PValue::Blob { data, .. } => data.zeroize(),
+        PValue::Struct { elements, .. } => {
+            for (_, v) in elements {
+                wipe_blobs(v);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// A GetMultiVariables response, or the error for a request the PLC refused as a whole.
@@ -4076,6 +4106,21 @@ mod tests {
         assert!(e.to_string().contains("0x81041234"), "{e}");
         assert!(!conn.is_poisoned());
         plc.join().unwrap();
+    }
+
+    #[test]
+    fn the_credentials_are_wiped_after_use() {
+        let mut credentials = crate::legitimation::build_legitimation_payload("user", "secret");
+        wipe_blobs(&mut credentials);
+        let PValue::Struct { elements, .. } = &credentials else {
+            panic!("{credentials:?}")
+        };
+        for (_, v) in elements {
+            if let PValue::Blob { data, .. } = v {
+                assert!(data.iter().all(|&b| b == 0), "{v:?}");
+            }
+        }
+        assert_eq!(elements[0].1, PValue::UDInt(2), "non-blob members stay");
     }
 
     #[test]

@@ -38,6 +38,11 @@ All notable changes to this project are documented here. The format is based on
   of a name skips the type-info walk; cached type info is shared instead of deep-copied per
   lookup. A cached type-info object no longer carries its nested objects (each is cached under
   its own relid).
+- Secrets are wiped from memory when no longer needed (with the `zeroize` crate, already a
+  dependency of rustls): the legacy session key and the legitimation key when the `Connection`
+  is dropped or replaced by a reconnect, and the legitimation credentials (the plaintext
+  payload and the password hash) once encrypted or sent. The password the caller passes in is
+  the caller's to wipe.
 - TLS session keys are written to `SSLKEYLOGFILE` only after the new
   `s7commplus::set_tls_key_logging(true)`; the environment variable alone, which other programs
   honour too, no longer exposes a session's keys (and with them the legitimation password).

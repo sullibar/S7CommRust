@@ -538,6 +538,7 @@ dependencies = [
  "sha2",
  "socket2",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]
