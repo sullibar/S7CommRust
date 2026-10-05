@@ -7,8 +7,11 @@
 //! The screen shows everything; the log file gets placeholders. Where s7tool prints a tag or
 //! block name, a value, an alarm text or the PLC's address, it wraps it in a [`Private`], whose
 //! text carries both forms between marker characters: [`screen`] keeps the real one, and the log
-//! writer ([`RedactingWriter`]) the placeholder. Names keep a stable placeholder (`<name7>`) for
-//! the whole run, so a log still shows which lines are about the same tag.
+//! ([`for_log`], on each record before env_logger writes it, then [`RedactingWriter`] on each
+//! line) the placeholder. Names keep a stable placeholder (`<name7>`) for the whole run, so a log
+//! still shows which lines are about the same tag. A `Private` never spans lines or carries
+//! control characters, and where its markers are broken the log gets `<redacted>` (it fails
+//! closed).
 //!
 //! The writer also goes over every log line, the driver's too: IPv4 addresses become `<ip1>`,
 //! `<ip2>`, … (the PLC's own is `<plc>`), the home directory becomes `~`, an absolute path keeps
@@ -32,6 +35,13 @@ const OPEN: char = '\u{e000}';
 const SPLIT: char = '\u{e001}';
 /// Ends a [`Private`].
 const CLOSE: char = '\u{e002}';
+/// Stands for a line break in a [`Private`]'s real text, so that a `Private` never spans lines
+/// (the log writer goes line by line).
+const NEWLINE: char = '\u{e003}';
+
+/// What the log gets where it can't tell which part of a line is private: a `Private` whose end
+/// or start is missing.
+const REDACTED: &str = "<redacted>";
 
 /// The shortest name looked for in other log lines; shorter ones (`x`, `M`) would also match
 /// ordinary words.
@@ -52,10 +62,9 @@ pub struct Private {
 
 impl Private {
     fn new(real: impl fmt::Display, placeholder: impl Into<String>) -> Private {
-        let real = real.to_string().replace([OPEN, SPLIT, CLOSE], "\u{fffd}");
         Private {
-            real,
-            placeholder: placeholder.into(),
+            real: clean(&real.to_string(), &NEWLINE.to_string()),
+            placeholder: clean(&placeholder.into(), " "),
         }
     }
 
@@ -72,6 +81,25 @@ impl fmt::Display for Private {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{OPEN}{}{SPLIT}{}{CLOSE}", self.real, self.placeholder)
     }
+}
+
+/// `text` made safe to carry inside a [`Private`]: no marker characters, each line break as
+/// `newline`, and no other control characters (an escape sequence could make env_logger's output
+/// layer swallow the markers around it), tabs aside. Each becomes U+FFFD.
+fn clean(text: &str, newline: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' if chars.peek() == Some(&'\n') => {}
+            '\n' => out.push_str(newline),
+            '\t' => out.push('\t'),
+            OPEN | SPLIT | CLOSE | NEWLINE => out.push('\u{fffd}'),
+            c if c.is_control() => out.push('\u{fffd}'),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// A tag, block, module or other project name: `<nameN>` in the log, the same N each time.
@@ -111,40 +139,99 @@ pub fn path(path: &str) -> Private {
     Private::new(path, file_name(path))
 }
 
-/// `line` as shown on screen: every [`Private`] in it as its real text.
-pub fn screen(line: &str) -> String {
-    resolve(line, false)
-}
-
-/// `line` for the session log: with `redact`, every [`Private`] as its placeholder and the
-/// addresses, paths and known names scrubbed; without, as on screen.
-pub fn for_log(line: &str, redact: bool) -> String {
-    if !redact {
-        return screen(line);
-    }
-    let line = resolve(line, true);
-    registry().scrub(&line)
-}
-
-/// Keep one side of each [`Private`] in `line`.
-fn resolve(line: &str, placeholders: bool) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    while let Some(start) = rest.find(OPEN) {
+/// `text` as shown on screen: every [`Private`] in it as its real text.
+pub fn screen(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find([OPEN, SPLIT, CLOSE]) {
+        let marker = rest[start..].chars().next().unwrap_or(OPEN);
         out.push_str(&rest[..start]);
-        let inner = &rest[start + OPEN.len_utf8()..];
-        let Some(end) = inner.find(CLOSE) else {
-            rest = inner;
-            break;
-        };
-        let (real, placeholder) = inner[..end]
-            .split_once(SPLIT)
-            .unwrap_or((&inner[..end], ""));
-        out.push_str(if placeholders { placeholder } else { real });
-        rest = &inner[end + CLOSE.len_utf8()..];
+        rest = &rest[start + marker.len_utf8()..];
+        if marker != OPEN {
+            continue; // a stray marker: drop it
+        }
+        let end = rest.find(CLOSE).unwrap_or(rest.len());
+        let inner = &rest[..end];
+        let real = inner.split_once(SPLIT).map_or(inner, |(real, _)| real);
+        out.extend(real.chars().filter_map(|c| match c {
+            NEWLINE => Some('\n'),
+            OPEN | SPLIT => None,
+            c => Some(c),
+        }));
+        rest = rest.get(end + CLOSE.len_utf8()..).unwrap_or("");
     }
     out.push_str(rest);
     out
+}
+
+/// `text` for the session log: with `redact`, every [`Private`] as its placeholder and the
+/// addresses, paths and known names scrubbed; without, as on screen.
+pub fn for_log(text: &str, redact: bool) -> String {
+    log_line(text, redact, &mut false)
+}
+
+/// [`for_log`] for one line of a stream of lines: `open` says whether an earlier line left a
+/// [`Private`] unfinished, whose rest this line then starts with.
+fn log_line(text: &str, redact: bool, open: &mut bool) -> String {
+    if !redact {
+        return screen(text);
+    }
+    let text = placeholders(text, open);
+    registry().scrub(&text)
+}
+
+/// Every [`Private`] in `text` as its placeholder. This fails closed: from a `Private` whose end
+/// is missing, `<redacted>` replaces the rest of `text` (and `open` is set, so that the next
+/// line is dropped up to the end marker), and so does it replace the text before a stray
+/// separator or end marker (whose `Private` lost its start).
+fn placeholders(text: &str, open: &mut bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    if *open {
+        match rest.find(CLOSE) {
+            Some(end) => {
+                rest = &rest[end + CLOSE.len_utf8()..];
+                *open = false;
+            }
+            None => return line_end(rest).to_owned(),
+        }
+    }
+    while let Some(start) = rest.find([OPEN, SPLIT, CLOSE]) {
+        let marker = rest[start..].chars().next().unwrap_or(OPEN);
+        let after = &rest[start + marker.len_utf8()..];
+        if marker != OPEN {
+            out.push_str(REDACTED);
+            rest = after;
+            continue;
+        }
+        out.push_str(&rest[..start]);
+        let Some(end) = after.find(CLOSE) else {
+            out.push_str(REDACTED);
+            out.push_str(line_end(after));
+            *open = true;
+            return out;
+        };
+        // The placeholder follows the last separator; one with a start marker in it means an
+        // end marker went missing, and real text could follow that start.
+        out.push_str(match after[..end].rsplit_once(SPLIT) {
+            Some((_, placeholder)) if !placeholder.contains(OPEN) => placeholder,
+            _ => REDACTED,
+        });
+        rest = &after[end + CLOSE.len_utf8()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The line break `text` ends with, if any.
+fn line_end(text: &str) -> &str {
+    if text.ends_with("\r\n") {
+        "\r\n"
+    } else if text.ends_with('\n') {
+        "\n"
+    } else {
+        ""
+    }
 }
 
 /// What the log writer replaces, learned as the run goes.
@@ -319,10 +406,16 @@ fn file_name(path: &str) -> String {
 }
 
 /// A writer for log records that passes each complete line through [`for_log`].
+///
+/// Log records reach it already redacted (see [`crate::logfile`]); it is the second line of
+/// defence, for anything written to the log some other way. A [`Private`] left unfinished at the
+/// end of a line keeps the following lines out of the log until its end marker.
 pub struct RedactingWriter<W: Write> {
     inner: W,
     pending: Vec<u8>,
     redact: bool,
+    /// Inside a [`Private`] that an earlier line started.
+    open: bool,
 }
 
 impl<W: Write> RedactingWriter<W> {
@@ -331,12 +424,14 @@ impl<W: Write> RedactingWriter<W> {
             inner,
             pending: Vec::new(),
             redact,
+            open: false,
         }
     }
 
     fn write_line(&mut self, line: &[u8]) -> io::Result<()> {
         let line = String::from_utf8_lossy(line);
-        self.inner.write_all(for_log(&line, self.redact).as_bytes())
+        let line = log_line(&line, self.redact, &mut self.open);
+        self.inner.write_all(line.as_bytes())
     }
 }
 
@@ -380,9 +475,85 @@ mod tests {
 
     #[test]
     fn markers_in_real_text_cannot_break_out() {
-        let line = format!("{}", text("a\u{e002}b\u{e000}c"));
+        let line = format!("{}", text("a\u{e002}b\u{e000}c\u{e003}d"));
         assert_eq!(for_log(&line, true), "<text>");
-        assert_eq!(screen(&line), "a\u{fffd}b\u{fffd}c");
+        assert_eq!(screen(&line), "a\u{fffd}b\u{fffd}c\u{fffd}d");
+    }
+
+    /// The whole of a multi-line text (a block's comment XML, an alarm text) stays out of the
+    /// log, also when the log writer sees it one line at a time.
+    #[test]
+    fn multi_line_text_stays_out_of_the_log() {
+        let xml = "<Ident>\r\n  <Comment>Secret_pump</Comment>\n</Ident>";
+        let line = format!("attr 2449:\n{}\nend", text(xml));
+        assert_eq!(
+            screen(&line),
+            "attr 2449:\n<Ident>\n  <Comment>Secret_pump</Comment>\n</Ident>\nend"
+        );
+        assert_eq!(for_log(&line, true), "attr 2449:\n<text>\nend");
+        let mut out = Vec::new();
+        {
+            let mut w = RedactingWriter::new(&mut out, true);
+            w.write_all(format!("{line}\n").as_bytes()).unwrap();
+            w.flush().unwrap();
+        }
+        assert_eq!(String::from_utf8(out).unwrap(), "attr 2449:\n<text>\nend\n");
+    }
+
+    /// Escape sequences in a value could make env_logger's output layer swallow the markers
+    /// around it; they never get into a `Private`.
+    #[test]
+    fn control_characters_are_replaced() {
+        let v = value("a\u{1b}]0;b\u{7}c\td\u{85}");
+        assert_eq!(screen(&v.to_string()), "a\u{fffd}]0;b\u{fffd}c\td\u{fffd}");
+        assert_eq!(for_log(&v.to_string(), true), "<value>");
+        // A placeholder stays on its line too.
+        assert_eq!(for_log(&path("x/a\nb").to_string(), true), "<dir>/a b");
+    }
+
+    /// Where a marker is missing, the log gets `<redacted>` rather than what might be real text.
+    #[test]
+    fn broken_markers_fail_closed() {
+        let cases = [
+            // No end marker: the rest of the text goes.
+            ("a \u{e000}Secret_1\u{e001}<value> b", "a <redacted>"),
+            // No separator.
+            ("a \u{e000}Secret_1\u{e002} b", "a <redacted> b"),
+            // No start marker: the text before the separator and the end marker goes.
+            (
+                "a Secret_1\u{e001}<value>\u{e002} b",
+                "<redacted><redacted> b",
+            ),
+            // A lost end marker, then a whole `Private`: only the last placeholder is used.
+            (
+                "\u{e000}Secret_1\u{e001}<value> \u{e000}Secret_2\u{e001}<text>\u{e002}",
+                "<text>",
+            ),
+            // ... unless that one lost its separator.
+            (
+                "\u{e000}Secret_1\u{e001}<value> \u{e000}Secret_2 x\u{e002}",
+                "<redacted>",
+            ),
+        ];
+        for (line, logged) in cases {
+            assert_eq!(for_log(line, true), logged, "{line:?}");
+            assert!(!screen(line).contains(['\u{e000}', '\u{e001}', '\u{e002}']));
+        }
+    }
+
+    /// A `Private` that a line leaves open keeps the next lines out of the log until it ends.
+    #[test]
+    fn the_writer_drops_lines_inside_an_unfinished_private() {
+        let mut out = Vec::new();
+        {
+            let mut w = RedactingWriter::new(&mut out, true);
+            w.write_all(
+                b"a \xee\x80\x80Secret_1\nSecret_2\nSecret_3\xee\x80\x81<v>\xee\x80\x82 b\nc\n",
+            )
+            .unwrap();
+            w.flush().unwrap();
+        }
+        assert_eq!(String::from_utf8(out).unwrap(), "a <redacted>\n\n b\nc\n");
     }
 
     /// The markers have to survive env_logger's output layer, which drops control characters.

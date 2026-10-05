@@ -137,6 +137,13 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- s7tool's session log no longer leaks a multi-line text (the comment XML `xidents` prints, an
+  alarm text over several lines): the log writer goes line by line, and a placeholder's markers
+  ended on the first line, so the following lines went out as they were. A line break in such a
+  text is now carried as a marker character, control characters (escape sequences, which could
+  make the log's output layer swallow the markers) become U+FFFD, and log records are redacted
+  before that layer. Where a marker is still missing, the log fails closed: it gets
+  `<redacted>` and drops the rest of the text up to the end marker.
 - `browse_vars` (and `prefetch_type_container`) no longer download the PLC's whole type-info
   container again on every call: it is fetched once per connection, until `clear_caches`. On an
   S7-1215C it is about 100 KB and took 6 s, three times per `s7tool report`.
