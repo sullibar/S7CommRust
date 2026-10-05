@@ -153,6 +153,19 @@ impl IsoTcp {
         Ok(())
     }
 
+    /// Send `payload` as ONE COTP DT frame, however large: what the driver must not do, for
+    /// measuring how a PLC reacts to it (tests only).
+    #[cfg(test)]
+    pub(crate) fn send_unsegmented(&mut self, payload: &[u8]) -> Result<()> {
+        let total = TPKT_HEADER_LEN + COTP_DT_HEADER.len() + payload.len();
+        let mut frame = vec![0x03, 0x00];
+        frame.extend_from_slice(&(total as u16).to_be_bytes());
+        frame.extend_from_slice(&COTP_DT_HEADER);
+        frame.extend_from_slice(payload);
+        self.stream.write_all(&frame)?;
+        Ok(())
+    }
+
     /// Receive a complete ISO payload, reassembling COTP DT fragments until EOT.
     ///
     /// Resumable: a read timeout keeps the fragments and bytes received so far, and the next call
