@@ -1084,6 +1084,11 @@ impl Connection {
     /// see the reference route-mode/credit table). With a finite credit limit the PLC stops
     /// sending once the credit runs out; [`Connection::next_notification`] tops it up
     /// automatically before that happens.
+    ///
+    /// `credit_limit` is `-1` (unlimited) or `1..=255`: the PLC counts credit in the
+    /// notifications' one-byte credit tick, which can't reach a larger limit, and a limit of 0
+    /// would need a top-up after every notification. Anything else is an error, before anything
+    /// is sent.
     pub fn subscribe_with(
         &mut self,
         items: &[proto::SubscriptionItem],
@@ -1091,6 +1096,7 @@ impl Connection {
         route_mode: u8,
         credit_limit: i16,
     ) -> Result<Subscription> {
+        check_credit_limit(credit_limit)?;
         let (session, session2) = (self.session_id, self.session_id2);
         let req = self.build_request(
             functioncode::CREATE_OBJECT,
@@ -1162,8 +1168,10 @@ impl Connection {
         self.subscribe_alarms_with(-1)
     }
 
-    /// Like [`Connection::subscribe_alarms`] but with an explicit credit limit (`-1` = unlimited).
+    /// Like [`Connection::subscribe_alarms`] but with an explicit credit limit (`-1` = unlimited,
+    /// or `1..=255`, as for [`Connection::subscribe_with`]).
     pub fn subscribe_alarms_with(&mut self, credit_limit: i16) -> Result<Subscription> {
+        check_credit_limit(credit_limit)?;
         let (session, session2) = (self.session_id, self.session_id2);
         let req = self.build_request(
             functioncode::CREATE_OBJECT,
@@ -1316,6 +1324,8 @@ impl Connection {
         if i16::from(notif.credit_tick) < limit - 1 {
             return Ok(());
         }
+        // The limit is in 1..=255 (see `check_credit_limit`), so this can't overflow; it wraps
+        // as the one-byte credit tick does.
         const STEP: i16 = 5;
         let next = ((limit + STEP) % 255).max(STEP);
         self.credit_limits.insert(object_id, next);
@@ -2696,6 +2706,18 @@ fn scan_telegram(buf: &[u8]) -> Result<Option<(u8, usize, usize)>> {
     Ok(None)
 }
 
+/// Check a subscription's credit limit: `-1` (unlimited) or `1..=255`. The PLC reports the credit
+/// used in a one-byte tick, so a larger limit is never topped up, and 0 would need a top-up after
+/// every notification (the reference documents 255 as the maximum).
+fn check_credit_limit(credit_limit: i16) -> Result<()> {
+    match credit_limit {
+        -1 | 1..=255 => Ok(()),
+        other => Err(Error::protocol(format!(
+            "credit limit {other} out of range: use -1 (unlimited) or 1..=255"
+        ))),
+    }
+}
+
 /// Every object in `objects` (recursively) that carries a member list, each detached from its
 /// nested objects — moved, not cloned, so a deep tree is not copied once per level.
 fn type_objects(objects: Vec<PObject>) -> Vec<PObject> {
@@ -3160,6 +3182,27 @@ mod tests {
         conn.next_notification(&b).unwrap();
         conn.next_notification(&a).unwrap();
         assert_eq!(conn.credit_limits.get(&0xa), Some(&15));
+        plc.join().unwrap();
+    }
+
+    /// A credit limit the one-byte credit tick can't count, or 0, is refused before anything is
+    /// sent; the largest one, 255, is topped up (wrapping, as the reference does).
+    #[test]
+    fn credit_limits_are_checked() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            plc.send(&notification(0xa, 254));
+            let req = plc.recv_request();
+            assert_eq!(&req[3..5], &functioncode::SET_VARIABLE.to_be_bytes());
+        });
+        for bad in [0, -2, 256, i16::MAX, i16::MIN] {
+            let e = conn.subscribe_with(&[], 100, 0, bad).unwrap_err();
+            assert!(e.to_string().contains("credit limit"), "{e}");
+            assert!(conn.subscribe_alarms_with(bad).is_err());
+        }
+        assert!(!conn.is_poisoned());
+        let a = conn.register_subscription(0xa, 255);
+        conn.next_notification(&a).unwrap();
+        assert_eq!(conn.credit_limits.get(&0xa), Some(&5));
         plc.join().unwrap();
     }
 

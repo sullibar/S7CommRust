@@ -249,6 +249,10 @@ All notable changes to this project are documented here. The format is based on
   without a response. A failed reconnect leaves the connection poisoned.
 - `reconnect` shuts the old socket down before connecting, so the old session no longer holds
   one of the PLC's connection slots (an S7-1200 has few) until the `Connection` is dropped.
+- `subscribe_with` and `subscribe_alarms_with` refuse a credit limit other than -1 (unlimited)
+  or 1..=255 before sending anything. A larger limit was never topped up (the PLC counts credit
+  in a one-byte tick), so the subscription stalled; 0 sent a top-up after every notification;
+  and a limit near `i16::MAX` overflowed the top-up arithmetic.
 
 ## [0.1.0] - 2026-07-05
 
