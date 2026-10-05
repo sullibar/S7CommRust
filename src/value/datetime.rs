@@ -231,30 +231,33 @@ impl S7DateTime {
         }
     }
 
-    /// Decode a `DATE_AND_TIME` (DT): 8 BCD bytes (year, month, day, hour, min, sec, then 3
-    /// millisecond digits + weekday nibble). Two-digit year: 90–99 ⇒ 1990s, else 2000s.
+    /// Decode a `DATE_AND_TIME` (DT): exactly 8 BCD bytes (year, month, day, hour, min, sec, then
+    /// 3 millisecond digits + weekday nibble). Two-digit year: 90–99 ⇒ 1990s, else 2000s. `None`
+    /// for another length, a digit that isn't BCD, or a field out of its range (month 13, hour
+    /// 24, …).
     pub fn from_date_and_time(b: &[u8]) -> Option<S7DateTime> {
-        if b.len() < 8 {
+        let b: &[u8; 8] = b.try_into().ok()?;
+        let bcd = |x: u8, max: u32| -> Option<u32> {
+            let (hi, lo) = (x >> 4, x & 0x0f);
+            let n = u32::from(hi) * 10 + u32::from(lo);
+            (hi <= 9 && lo <= 9 && n <= max).then_some(n)
+        };
+        let yy = bcd(b[0], 99)?;
+        let year = if yy >= 90 { 1900 + yy } else { 2000 + yy } as i32;
+        let ms_digit = b[7] >> 4;
+        if ms_digit > 9 {
             return None;
         }
-        let bcd = |x: u8| -> Option<u32> {
-            let (hi, lo) = (x >> 4, x & 0x0f);
-            if hi > 9 || lo > 9 {
-                None
-            } else {
-                Some(u32::from(hi) * 10 + u32::from(lo))
-            }
-        };
-        let yy = bcd(b[0])?;
-        let year = if yy >= 90 { 1900 + yy } else { 2000 + yy } as i32;
-        let millis = bcd(b[6])? * 10 + u32::from(b[7] >> 4);
+        let millis = bcd(b[6], 99)? * 10 + u32::from(ms_digit);
+        let month = bcd(b[1], 12).filter(|&m| m >= 1)?;
+        let day = bcd(b[2], 31).filter(|&d| d >= 1)?;
         Some(S7DateTime {
             year,
-            month: bcd(b[1])? as u8,
-            day: bcd(b[2])? as u8,
-            hour: bcd(b[3])? as u8,
-            minute: bcd(b[4])? as u8,
-            second: bcd(b[5])? as u8,
+            month: month as u8,
+            day: day as u8,
+            hour: bcd(b[3], 23)? as u8,
+            minute: bcd(b[4], 59)? as u8,
+            second: bcd(b[5], 59)? as u8,
             nanosecond: millis * 1_000_000,
         })
     }
@@ -280,30 +283,33 @@ impl S7Duration {
 }
 
 impl S7TimeOfDay {
-    fn from_day_nanos(ns: i64) -> S7TimeOfDay {
-        let (hour, minute, second, nanosecond) =
-            hms_from_day_nanos(ns.rem_euclid(NANOS_PER_SEC * SECS_PER_DAY));
-        S7TimeOfDay {
+    /// From nanoseconds since midnight; `None` past the end of the day.
+    fn from_day_nanos(ns: u64) -> Option<S7TimeOfDay> {
+        let ns = i64::try_from(ns)
+            .ok()
+            .filter(|&ns| ns < NANOS_PER_SEC * SECS_PER_DAY)?;
+        let (hour, minute, second, nanosecond) = hms_from_day_nanos(ns);
+        Some(S7TimeOfDay {
             hour,
             minute,
             second,
             nanosecond,
-        }
+        })
     }
 }
 
 /// Render a `(softdatatype, value)` pair as a human-readable date/time/duration string, or
-/// `None` if `softdatatype` is not a date/time type (the caller should format the raw value).
+/// `None` if `softdatatype` is not a date/time type (the caller should format the raw value) or
+/// the value is out of that type's range.
 pub fn format(softdatatype: u8, v: &PValue) -> Option<String> {
+    // Both the softdatatype and the value come from the PLC, so a wider value can arrive than the
+    // type holds: that means "not a valid time", not a wrapped one (or a panic).
     match softdatatype {
-        sdt::DATE => Some(S7DateTime::from_date_days(v.as_u64()? as u16).to_string()),
-        // Both the softdatatype and the value come from the PLC, so a 64-bit value can arrive where a
-        // 32-bit one is expected: overflow means "not a valid time", not a panic.
-        sdt::TIME_OF_DAY => Some(
-            S7TimeOfDay::from_day_nanos(i64::try_from(v.as_u64()?).ok()?.checked_mul(1_000_000)?)
-                .to_string(),
-        ),
-        sdt::LTOD => Some(S7TimeOfDay::from_day_nanos(v.as_i64()?).to_string()),
+        sdt::DATE => Some(S7DateTime::from_date_days(u16::try_from(v.as_u64()?).ok()?).to_string()),
+        sdt::TIME_OF_DAY => {
+            S7TimeOfDay::from_day_nanos(v.as_u64()?.checked_mul(1_000_000)?).map(|t| t.to_string())
+        }
+        sdt::LTOD => S7TimeOfDay::from_day_nanos(v.as_u64()?).map(|t| t.to_string()),
         sdt::TIME => Some(
             S7Duration {
                 nanos: v.as_i64()?.checked_mul(1_000_000)?,
@@ -311,7 +317,9 @@ pub fn format(softdatatype: u8, v: &PValue) -> Option<String> {
             .to_string(),
         ),
         sdt::LTIME => Some(S7Duration { nanos: v.as_i64()? }.to_string()),
-        sdt::S5TIME => S7Duration::from_s5time(v.as_u64()? as u16).map(|d| d.to_string()),
+        sdt::S5TIME => {
+            S7Duration::from_s5time(u16::try_from(v.as_u64()?).ok()?).map(|d| d.to_string())
+        }
         sdt::LDT => Some(S7DateTime::from_unix_nanos(v.as_i64()?).to_string()),
         sdt::DTL => S7DateTime::from_dtl(v).map(|d| d.to_string()),
         sdt::DATE_AND_TIME => S7DateTime::from_date_and_time(v.as_bytes()?).map(|d| d.to_string()),
@@ -427,6 +435,56 @@ mod tests {
         );
         // Not BCD.
         assert!(format(sdt::S5TIME, &PValue::Word(0x00a0)).is_none());
+    }
+
+    #[test]
+    fn values_out_of_range_are_not_times() {
+        // DATE is a UInt: a wider value used to wrap (70000 → 2002-03-23).
+        assert_eq!(
+            format(sdt::DATE, &PValue::UInt(65535)).unwrap(),
+            "2169-06-06 00:00:00"
+        );
+        assert!(format(sdt::DATE, &PValue::UDInt(70_000)).is_none());
+        // TIME_OF_DAY past midnight used to wrap round (90,000,000 ms → 01:00:00).
+        assert_eq!(
+            format(sdt::TIME_OF_DAY, &PValue::UDInt(86_399_999)).unwrap(),
+            "23:59:59.999"
+        );
+        assert!(format(sdt::TIME_OF_DAY, &PValue::UDInt(90_000_000)).is_none());
+        assert!(format(sdt::TIME_OF_DAY, &PValue::UDInt(86_400_000)).is_none());
+        assert!(format(sdt::LTOD, &PValue::ULInt(86_400 * 1_000_000_000)).is_none());
+        assert!(format(sdt::LTOD, &PValue::ULInt(u64::MAX)).is_none());
+        assert!(format(sdt::S5TIME, &PValue::UDInt(0x1_0200)).is_none());
+    }
+
+    #[test]
+    fn date_and_time_is_checked() {
+        let dt = |b: [u8; 8]| format(sdt::DATE_AND_TIME, &PValue::USIntArray(b.to_vec()));
+        // DT#2024-03-15-13:45:30.123, a Friday (weekday 6).
+        let ok = [0x24, 0x03, 0x15, 0x13, 0x45, 0x30, 0x12, 0x36];
+        assert_eq!(dt(ok).unwrap(), "2024-03-15 13:45:30.123");
+        assert_eq!(
+            dt([0x95, 0x12, 0x31, 0x23, 0x59, 0x59, 0x99, 0x97]).unwrap(),
+            "1995-12-31 23:59:59.999"
+        );
+        // The millisecond nibble, and each field's range.
+        for bad in [
+            [0x24, 0x03, 0x15, 0x13, 0x45, 0x30, 0x12, 0xa6],
+            [0x24, 0x13, 0x15, 0x13, 0x45, 0x30, 0x12, 0x36],
+            [0x24, 0x00, 0x15, 0x13, 0x45, 0x30, 0x12, 0x36],
+            [0x24, 0x03, 0x32, 0x13, 0x45, 0x30, 0x12, 0x36],
+            [0x24, 0x03, 0x15, 0x24, 0x45, 0x30, 0x12, 0x36],
+            [0x24, 0x03, 0x15, 0x13, 0x60, 0x30, 0x12, 0x36],
+            [0x24, 0x03, 0x15, 0x13, 0x45, 0x60, 0x12, 0x36],
+            [0x24, 0x03, 0x15, 0x13, 0x45, 0x30, 0x1a, 0x36],
+        ] {
+            assert!(dt(bad).is_none(), "{bad:02x?}");
+        }
+        // Exactly eight bytes: two DTs back to back are not one.
+        let mut two = ok.to_vec();
+        two.extend_from_slice(&ok);
+        assert!(S7DateTime::from_date_and_time(&two).is_none());
+        assert!(S7DateTime::from_date_and_time(&ok[..7]).is_none());
     }
 
     #[test]

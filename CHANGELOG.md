@@ -158,6 +158,11 @@ All notable changes to this project are documented here. The format is based on
 - A session log written with `--full-log` no longer records the password of a mistyped `legit`:
   `Legit` in another letter case is masked like `legit`, and an unknown command within two
   typing mistakes of `legit`, `login`, `auth` or `password` has all its arguments masked.
+- `datetime::format` returns `None` for a value out of its type's range instead of a wrong
+  date or time: a `DATE` wider than 16 bits used to wrap (70000 days showed as 2002-03-23), a
+  `TIME_OF_DAY` or `LTOD` past midnight wrapped round (90,000,000 ms showed as 01:00:00), and a
+  `DATE_AND_TIME` with a millisecond nibble that isn't BCD or a field out of range (month 13)
+  was shown anyway. `S7DateTime::from_date_and_time` takes exactly 8 bytes.
 - `browse_vars` (and `prefetch_type_container`) no longer download the PLC's whole type-info
   container again on every call: it is fetched once per connection, until `clear_caches`. On an
   S7-1215C it is about 100 KB and took 6 s, three times per `s7tool report`.
