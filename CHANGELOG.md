@@ -325,7 +325,7 @@ All notable changes to this project are documented here. The format is based on
   allowed, and a wrap from just below a power-of-two boundary). A violation is an
   `Error::Integrity` and poisons the connection. `explore_raw` can't check its response;
   `explore` does.
-- The real-PLC legacy handshake no longer panics on a session-setup value in the PLC's
+- The `connect_real_plc` handshake no longer panics on a session-setup value in the PLC's
   plaintext CreateObject response whose VLQ never ends: it was spliced whole into the auth
   request, overflowing the request's TPKT length. A value over 10 octets is now ignored like a
   missing one, and the auth request's lengths are checked instead of assumed to fit.
