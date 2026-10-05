@@ -43,12 +43,17 @@
 //!   [`Connection::type_info`] walk the symbolic address space.
 //! - **Read / write tags by name** — [`Connection::read_tag`] /
 //!   [`Connection::write_tag`] (and the batched [`Connection::read_tags`] /
-//!   [`Connection::write_tags`]) resolve a symbol to its address for you.
+//!   [`Connection::write_tags`]) resolve a symbol to its address for you. Resolved addresses
+//!   are cached and not checked by the PLC, so after a program download call
+//!   [`Connection::clear_caches`]: a stale address can name another variable.
 //! - **Subscriptions & alarms** — [`Connection::subscribe`] and
 //!   [`Connection::subscribe_alarms`] register for the PLC's `0x33` push
 //!   [`Notification`]s; [`Alarm`] parses and formats alarm events.
 //! - **Legitimation** — [`Connection::legitimate`] authenticates against a
-//!   password-protected program.
+//!   password-protected program, in the legacy (password hash) or new (encrypted credentials)
+//!   scheme the firmware takes, chosen as the reference driver chooses it. It needs a TLS
+//!   connection: on a legacy one it fails before sending anything, since the exchange would give
+//!   away the password's hash.
 //!
 //! Values move through the [`value::PValue`] type system (~90 PLC datatypes).
 //!
@@ -80,6 +85,9 @@ mod logging;
 // Test-only: a mock legacy PLC on loopback, scripted per test or driven by firmware profiles.
 #[cfg(test)]
 mod mock_plc;
+// Test-only: a mock TLS PLC on loopback, for the TLS transport and legitimation.
+#[cfg(test)]
+mod mock_tls;
 
 pub use connection::{Connection, CpuState, DataBlock, Subscription, VarInfo};
 pub use error::{Error, Result};
@@ -89,6 +97,7 @@ pub use proto::{
     Alarm, AlarmState, AlarmText, Area, AssociatedValue, Notification, SubscriptionItem,
     SystemEvent,
 };
+pub use transport::tls::set_tls_key_logging;
 
 /// This crate's version, for logs and bug reports.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

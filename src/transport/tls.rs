@@ -28,10 +28,12 @@
 //! that certificate and signs with its key, much as TIA Portal has the user trust the PLC's
 //! certificate.
 //!
-//! The client also honours `SSLKEYLOGFILE` whenever it is set, writing the session keys there
-//! for Wireshark — leave it unset in production.
+//! For Wireshark, the session keys can be written to the file `SSLKEYLOGFILE` names — but only
+//! once a program opts in with [`set_tls_key_logging`]: the variable alone, which other tools
+//! honour too, could otherwise leak a production session's keys to whoever reads that file.
 
 use std::io::{Cursor, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -51,16 +53,33 @@ pub const OMS_SECRET_LEN: usize = 32;
 /// Placeholder SNI. The PLC ignores it (the accept-all verifier ignores the name too).
 const DUMMY_SNI: &str = "s7-plc";
 
+/// Whether TLS connections write their session keys to `SSLKEYLOGFILE` (see
+/// [`set_tls_key_logging`]).
+static KEY_LOGGING: AtomicBool = AtomicBool::new(false);
+
+/// Let TLS connections opened from now on write their session keys to the file named by the
+/// `SSLKEYLOGFILE` environment variable (NSS key log format), so Wireshark can decrypt them. Off
+/// by default: with it off the variable is ignored. Anyone who can read that file can decrypt
+/// the sessions, including the legitimation password, so turn it on only for debugging.
+pub fn set_tls_key_logging(enabled: bool) {
+    KEY_LOGGING.store(enabled, Ordering::Relaxed);
+}
+
 /// A rustls-backed TLS channel pumped over an [`IsoTcp`] transport.
 pub(crate) struct TlsChannel {
     conn: rustls::ClientConnection,
+    /// Decrypted application data not yet handed to the caller. rustls holds at most 16 KiB of
+    /// plaintext before it refuses to read more, so it is drained into here after every record.
+    plaintext: Vec<u8>,
+    /// The PLC sent `close_notify`: no more application data will come.
+    peer_closed: bool,
 }
 
 impl TlsChannel {
     /// Build a new TLS client configured to match the reference driver.
     ///
-    /// Honours `SSLKEYLOGFILE` (via [`rustls::KeyLogFile`]) so sessions can be decrypted
-    /// in Wireshark — essential for confirming the exported secret against the C# driver.
+    /// Writes the session keys to `SSLKEYLOGFILE` (via [`rustls::KeyLogFile`]) only if
+    /// [`set_tls_key_logging`] turned that on.
     pub fn new(pin: Option<[u8; 32]>) -> Result<Self> {
         let base = rustls::crypto::ring::default_provider();
         let provider = rustls::crypto::CryptoProvider {
@@ -77,13 +96,19 @@ impl TlsChannel {
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(PlcCertVerifier { algorithms, pin }))
             .with_no_client_auth();
-        config.key_log = Arc::new(rustls::KeyLogFile::new());
+        if KEY_LOGGING.load(Ordering::Relaxed) {
+            config.key_log = Arc::new(rustls::KeyLogFile::new());
+        }
 
         let server_name = ServerName::try_from(DUMMY_SNI)
             .map_err(|_| Error::framing("invalid server name"))?
             .to_owned();
         let conn = rustls::ClientConnection::new(Arc::new(config), server_name)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            plaintext: Vec::new(),
+            peer_closed: false,
+        })
     }
 
     /// Drive the TLS handshake to completion, pumping records over `tcp`.
@@ -177,29 +202,30 @@ impl TlsChannel {
 
     /// Receive and decrypt the next chunk of application data.
     ///
-    /// Returns whatever plaintext rustls yields once at least one byte is available;
-    /// callers parse the S7CommPlus framing on top.
+    /// Returns the plaintext already decrypted, if any, without touching the socket; otherwise
+    /// whatever the next ISO packets yield once at least one byte is available. Callers parse the
+    /// S7CommPlus framing on top. Once the PLC has sent `close_notify` this fails with
+    /// [`Error::Closed`] rather than waiting for data that will never come.
     pub fn recv(&mut self, tcp: &mut IsoTcp) -> Result<Vec<u8>> {
-        let mut out = Vec::new();
         loop {
+            if !self.plaintext.is_empty() {
+                return Ok(std::mem::take(&mut self.plaintext));
+            }
+            if self.peer_closed {
+                return Err(Error::closed(
+                    "the PLC closed the TLS session (close_notify)",
+                ));
+            }
             let pkt = tcp.recv_iso_packet()?;
             self.feed_tls(&pkt)?;
-            let mut buf = [0u8; 4096];
-            loop {
-                match self.conn.reader().read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => out.extend_from_slice(&buf[..n]),
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            if !out.is_empty() {
-                return Ok(out);
-            }
         }
     }
 
-    /// Feed received TLS record bytes into rustls and process them.
+    /// Feed received TLS record bytes into rustls, process them and collect the plaintext.
+    ///
+    /// The plaintext is drained after every `process_new_packets`: rustls keeps at most 16 KiB
+    /// of it and fails the next `read_tls` with "received plaintext buffer full" beyond that,
+    /// which one ISO packet (a TSDU of up to 64 KiB) can easily exceed.
     fn feed_tls(&mut self, data: &[u8]) -> Result<()> {
         let mut cursor = Cursor::new(data);
         while (cursor.position() as usize) < data.len() {
@@ -208,8 +234,27 @@ impl TlsChannel {
                 break;
             }
             self.conn.process_new_packets()?;
+            self.drain_plaintext()?;
         }
         Ok(())
+    }
+
+    /// Move the plaintext rustls has decrypted into [`TlsChannel::plaintext`], noting a
+    /// `close_notify`.
+    fn drain_plaintext(&mut self) -> Result<()> {
+        let mut buf = [0u8; 4096];
+        loop {
+            match self.conn.reader().read(&mut buf) {
+                // A clean end of the stream: the peer's close_notify.
+                Ok(0) => {
+                    self.peer_closed = true;
+                    return Ok(());
+                }
+                Ok(n) => self.plaintext.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 }
 
