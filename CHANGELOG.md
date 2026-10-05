@@ -260,6 +260,15 @@ All notable changes to this project are documented here. The format is based on
   too many items, and an item error is a `None` at once. The batch size is set with the new
   `Connection::set_read_batch_size` instead of the `S7_READ_BATCH` environment variable, which
   was read on every call and is no longer consulted.
+- An element of a multi-dimensional `Bool` array resolves to the element the browse lists under
+  that name. The PLC starts each row on a byte boundary, which `browse_vars` accounted for but
+  symbol resolution didn't: in an `Array[0..1, 0..2] of Bool`, `[1,0]` read or wrote element 3
+  (a padding bit) instead of 8.
+- A malformed or hostile type info can no longer exhaust memory or panic the browse: the array
+  element counts it declares were expanded without bound (arrays of structs with arrays
+  multiply), and the element-id arithmetic could overflow. A browse now fails with an error past
+  1,000,000 variables (new `Connection::set_browse_limit`), and element ids past 32 bits are
+  rejected.
 
 ## [0.1.0] - 2026-07-05
 

@@ -55,6 +55,8 @@ const BROWSE_ATTRS: [u32; 3] = [
 /// RID of the OMS type-info container (`Ids.ObjectOMSTypeInfoContainer`) — one Explore returns
 /// every block's type info at once.
 const OMS_TYPE_INFO_CONTAINER_RID: u32 = 537;
+/// Default for [`Connection::set_browse_limit`].
+const DEFAULT_MAX_BROWSE_VARS: usize = 1_000_000;
 /// Recursion guard for the browse walk (nested structs; S7 types are not cyclic).
 const MAX_BROWSE_DEPTH: usize = 16;
 /// How many variables to read per `GetMultiVariables` request when reading a browsed batch, at
@@ -221,6 +223,8 @@ pub struct Connection {
     /// Resolved symbols, so a repeated [`Connection::read_tag`] / `write_tag` of the same name
     /// skips the walk through the type info.
     symbol_cache: HashMap<String, ResolvedSymbol>,
+    /// Set when a browse reached [`Connection::set_browse_limit`], so its nested walks stop too.
+    browse_limit_hit: bool,
     /// Set once a request/response fails partway through. A poisoned connection has an
     /// unknown sequence/integrity-id state relative to the PLC, so every subsequent
     /// [`Connection::request_response`] short-circuits with [`Error::Closed`].
@@ -262,6 +266,8 @@ struct Settings {
     auto_reconnect: bool,
     /// Most items [`Connection::read_var_values`] puts in one request.
     read_batch: usize,
+    /// Most variables a browse returns (see [`Connection::set_browse_limit`]).
+    max_browse_vars: usize,
 }
 
 impl Default for Settings {
@@ -269,6 +275,7 @@ impl Default for Settings {
         Settings {
             auto_reconnect: false,
             read_batch: READ_BATCH,
+            max_browse_vars: DEFAULT_MAX_BROWSE_VARS,
         }
     }
 }
@@ -373,6 +380,7 @@ impl Connection {
             db_list: None,
             symbol_cache: HashMap::new(),
             poisoned: false,
+            browse_limit_hit: false,
             reconnect_target: ReconnectTarget::Tls {
                 addrs,
                 timeout,
@@ -560,6 +568,7 @@ impl Connection {
             db_list: None,
             symbol_cache: HashMap::new(),
             poisoned: false,
+            browse_limit_hit: false,
             reconnect_target,
             settings: Settings::default(),
             pending_notifications: VecDeque::new(),
@@ -1805,6 +1814,7 @@ impl Connection {
     /// first. Blocks whose interface the PLC withholds (know-how protected) contribute nothing. A lost
     /// connection is an error rather than a partial list.
     pub fn browse_vars(&mut self) -> Result<Vec<VarInfo>> {
+        self.browse_limit_hit = false;
         let dbs = self.data_blocks()?;
         if let Err(e) = self.prefetch_type_container() {
             self.skip_unless_lost(e, "the type-info prefetch")?; // best effort
@@ -1839,11 +1849,43 @@ impl Connection {
     /// and goes on — unless the connection is gone, when continuing would only produce a partial
     /// list that looks complete.
     fn skip_unless_lost(&self, e: Error, what: &str) -> Result<()> {
-        if self.poisoned {
+        if self.poisoned || self.browse_limit_hit {
             return Err(e);
         }
         log::debug!("browse: skipping {}: {e}", crate::logging::name(what));
         Ok(())
+    }
+
+    /// Check that `more` variables still fit in a browse that has found `found` so far (see
+    /// [`Connection::set_browse_limit`]). Array element counts come from the PLC's type info, and
+    /// arrays of structs with arrays multiply, so a malformed or hostile type info could ask for
+    /// billions; past the limit the browse fails rather than run out of memory (or return a list
+    /// that looks complete but isn't).
+    fn check_browse_room(&mut self, found: usize, more: u32, what: &str) -> Result<()> {
+        let max = self.settings.max_browse_vars;
+        let needed = usize::try_from(more)
+            .ok()
+            .and_then(|m| found.checked_add(m));
+        if needed.is_some_and(|n| n <= max) {
+            return Ok(());
+        }
+        self.browse_limit_hit = true;
+        log::warn!(
+            "browse stopped at {}: more than {max} variables ({found} so far, {more} more)",
+            crate::logging::name(what)
+        );
+        Err(Error::protocol(format!(
+            "browse stopped: the program has more than {max} variables (at '{what}', {found} so \
+             far and {more} more); raise the limit with Connection::set_browse_limit"
+        )))
+    }
+
+    /// Most variables a browse ([`Connection::browse_vars`], [`Connection::browse_datablock`],
+    /// [`Connection::browse_controller_area`]) returns: past it the browse fails with an error
+    /// instead of running out of memory on a type info that declares huge arrays. The default,
+    /// 1,000,000, is far above any program measured so far.
+    pub fn set_browse_limit(&mut self, max_vars: usize) {
+        self.settings.max_browse_vars = max_vars;
     }
 
     /// Enumerate the readable leaf variables of one data block (name prefixed by the DB name).
@@ -1853,6 +1895,7 @@ impl Connection {
         ti_relid: u32,
         name: &str,
     ) -> Result<Vec<VarInfo>> {
+        self.browse_limit_hit = false;
         let mut out = Vec::new();
         let prefix = quote_level(name);
         self.walk_type(
@@ -1869,6 +1912,7 @@ impl Connection {
 
     /// Enumerate the readable leaf variables of one controller area (M/Q/I; bare tag names).
     pub fn browse_controller_area(&mut self, area_rid: u32, ti_relid: u32) -> Result<Vec<VarInfo>> {
+        self.browse_limit_hit = false;
         let mut out = Vec::new();
         self.walk_type(
             area_rid,
@@ -1918,14 +1962,16 @@ impl Connection {
             let has_rel = oi.has_relation();
 
             if oi.is_1dim || oi.is_mdim {
+                // The element count comes from the PLC: bound it before expanding it.
+                self.check_browse_room(out.len(), oi.array_element_count, &name)?;
                 // Enumerate array elements: `(display suffix, zero-based element id)`.
                 let elems: Vec<(String, u32)> = if oi.is_1dim {
-                    let lower = oi.array_lower_bounds;
+                    let lower = i64::from(oi.array_lower_bounds);
                     (0..oi.array_element_count)
-                        .map(|k| (format!("[{}]", lower + k as i32), k))
+                        .map(|k| (format!("[{}]", lower + i64::from(k)), k))
                         .collect()
                 } else {
-                    mdim_elements(oi, sdt)
+                    mdim_elements(oi, sdt)?
                 };
                 for (suffix, id) in elems {
                     let ename = format!("{name}{suffix}");
@@ -1941,6 +1987,7 @@ impl Connection {
                             }
                         }
                     } else {
+                        self.check_browse_room(out.len(), 1, &ename)?;
                         out.push(VarInfo {
                             name: ename,
                             access_area: area,
@@ -1960,6 +2007,7 @@ impl Connection {
                     }
                 }
             } else {
+                self.check_browse_room(out.len(), 1, &name)?;
                 out.push(VarInfo {
                     name,
                     access_area: area,
@@ -2158,7 +2206,7 @@ impl Connection {
             // Array indexing: append the (zero-based, row-major) element id, plus an extra
             // `.1` when the elements are structs (array-of-struct).
             if !indices.is_empty() {
-                let array_lid = array_element_id(oi, indices)
+                let array_lid = array_element_id(oi, elem.softdatatype, indices)
                     .ok_or_else(|| Error::protocol(format!("bad array index for '{name}'")))?;
                 addr.lid.push(array_lid);
                 if oi.has_relation() {
@@ -2913,46 +2961,49 @@ fn quote_level(name: &str) -> String {
 
 /// Compute the zero-based, row-major element id for an array access (the LID appended for
 /// `[..]`), porting the reference's 1-dim and M-dim access-sequence math. Returns `None` on
-/// a dimension/bounds mismatch.
-#[allow(clippy::needless_range_loop)]
-fn array_element_id(oi: &crate::proto::OffsetInfo, indices: &[i32]) -> Option<u32> {
+/// a dimension/bounds mismatch, or an id past `u32` (the counts come from the PLC).
+///
+/// A multi-dimensional array of `BBOOL` (`softdatatype`) starts each row of its fastest
+/// dimension on a byte boundary: the row stride is rounded up to a multiple of 8, as the browse
+/// enumeration ([`mdim_elements`]) has it. `Array[0..1, 0..2] of Bool` has ids 0, 1, 2, 8, 9, 10.
+fn array_element_id(
+    oi: &crate::proto::OffsetInfo,
+    softdatatype: u8,
+    indices: &[i32],
+) -> Option<u32> {
     if oi.is_1dim {
-        if indices.len() != 1 {
+        let [index] = indices else {
             return None;
-        }
-        let zero = indices[0].checked_sub(oi.array_lower_bounds)?;
-        if zero < 0 || (zero as u32) >= oi.array_element_count {
-            return None;
-        }
-        Some(zero as u32)
+        };
+        let zero = u32::try_from(i64::from(*index) - i64::from(oi.array_lower_bounds)).ok()?;
+        (zero < oi.array_element_count).then_some(zero)
     } else if oi.is_mdim {
         let dim_count = oi.mdim_element_count.iter().filter(|&&c| c > 0).count();
         if dim_count == 0 || dim_count != indices.len() {
             return None;
         }
-        // Normalize indices against the (reversed) per-dimension lower bounds.
-        let mut idx = vec![0i64; dim_count];
-        for i in 0..dim_count {
-            let lb = oi.mdim_lower_bounds[dim_count - i - 1];
-            let v = indices[i].checked_sub(lb)?;
-            if v < 0 || (v as u32) >= oi.mdim_element_count[dim_count - i - 1] {
+        // Dimension 0 varies fastest; `indices` name the dimensions high-to-low.
+        let mut id = 0u64;
+        let mut stride = 1u64;
+        for (d, &index) in indices.iter().rev().enumerate() {
+            let count = oi.mdim_element_count[d];
+            let zero = u32::try_from(i64::from(index) - i64::from(oi.mdim_lower_bounds[d])).ok()?;
+            if zero >= count {
                 return None;
             }
-            idx[i] = v as i64;
+            id = id.checked_add(u64::from(zero).checked_mul(stride)?)?;
+            if d + 1 < indices.len() {
+                let bool_row =
+                    d == 0 && softdatatype == crate::value::datatype::softdatatype::BBOOL;
+                let extent = if bool_row {
+                    u64::from(count).next_multiple_of(8)
+                } else {
+                    u64::from(count)
+                };
+                stride = stride.checked_mul(extent)?;
+            }
         }
-        // Row-major strides.
-        let mut dim_size = vec![1u64; dim_count];
-        let mut g = 1u64;
-        for i in 0..dim_count - 1 {
-            dim_size[i] = g;
-            g *= oi.mdim_element_count[i] as u64;
-        }
-        dim_size[dim_count - 1] = g;
-        let mut array_index = 0i64;
-        for i in 0..dim_count {
-            array_index += idx[i] * dim_size[dim_count - i - 1] as i64;
-        }
-        u32::try_from(array_index).ok()
+        u32::try_from(id).ok()
     } else {
         None
     }
@@ -2960,25 +3011,28 @@ fn array_element_id(oi: &crate::proto::OffsetInfo, indices: &[i32]) -> Option<u3
 
 /// Enumerate the elements of an M-dimensional array as `(display suffix, zero-based access id)`,
 /// porting the reference `Browser.AddSubNodes` M-dim loop (dimension 0 varies fastest; names list
-/// the dimensions high-to-low; `BBOOL` arrays skip ids to the next byte boundary per row).
-fn mdim_elements(oi: &crate::proto::OffsetInfo, softdatatype: u8) -> Vec<(String, u32)> {
+/// the dimensions high-to-low; `BBOOL` arrays skip ids to the next byte boundary per row). The
+/// caller bounds the element count; an id past `u32` is an error.
+fn mdim_elements(oi: &crate::proto::OffsetInfo, softdatatype: u8) -> Result<Vec<(String, u32)>> {
     let actdim = oi.mdim_element_count.iter().filter(|&&c| c > 0).count();
     if actdim == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let total = oi.array_element_count;
     let mut out = Vec::new();
     let mut xx = [0u32; 6];
-    let mut id = 0u32;
-    let mut n = 1u32;
+    let mut id = 0u64;
+    let mut n = 1u64;
     loop {
         let mut name = String::from("[");
         for j in (0..actdim).rev() {
-            let v = xx[j] as i64 + oi.mdim_lower_bounds[j] as i64;
+            let v = i64::from(xx[j]) + i64::from(oi.mdim_lower_bounds[j]);
             name.push_str(&v.to_string());
             name.push(if j > 0 { ',' } else { ']' });
         }
-        out.push((name, id));
+        let element = u32::try_from(id)
+            .map_err(|_| Error::protocol("array element id past 32 bits in the type info"))?;
+        out.push((name, element));
 
         xx[0] += 1;
         // BBOOL arrays: the id of the fastest dimension only advances in units up to 8 per byte.
@@ -2986,21 +3040,21 @@ fn mdim_elements(oi: &crate::proto::OffsetInfo, softdatatype: u8) -> Vec<(String
             && xx[0] >= oi.mdim_element_count[0]
             && oi.mdim_element_count[0] % 8 != 0
         {
-            id += 8 - (xx[0] % 8);
+            id += u64::from(8 - (xx[0] % 8));
         }
         for dim in 0..5 {
             if xx[dim] >= oi.mdim_element_count[dim] {
                 xx[dim] = 0;
-                xx[dim + 1] += 1;
+                xx[dim + 1] = xx[dim + 1].saturating_add(1);
             }
         }
         id += 1;
         n += 1;
-        if n > total {
+        if n > u64::from(total) {
             break;
         }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -3085,12 +3139,12 @@ mod tests {
             array_element_count: 10,
             ..Default::default()
         };
-        assert_eq!(array_element_id(&oi, &[3]), Some(2));
-        assert_eq!(array_element_id(&oi, &[1]), Some(0));
-        assert_eq!(array_element_id(&oi, &[0]), None); // below lower bound
-        assert_eq!(array_element_id(&oi, &[10]), Some(9)); // last element
-        assert_eq!(array_element_id(&oi, &[11]), None); // one past the upper bound
-        assert_eq!(array_element_id(&oi, &[1, 2]), None); // wrong dim count
+        assert_eq!(array_element_id(&oi, 7, &[3]), Some(2));
+        assert_eq!(array_element_id(&oi, 7, &[1]), Some(0));
+        assert_eq!(array_element_id(&oi, 7, &[0]), None); // below lower bound
+        assert_eq!(array_element_id(&oi, 7, &[10]), Some(9)); // last element
+        assert_eq!(array_element_id(&oi, 7, &[11]), None); // one past the upper bound
+        assert_eq!(array_element_id(&oi, 7, &[1, 2]), None); // wrong dim count
     }
 
     #[test]
@@ -3103,12 +3157,12 @@ mod tests {
         };
         oi.mdim_element_count[0] = 3;
         oi.mdim_element_count[1] = 4;
-        assert_eq!(array_element_id(&oi, &[1, 2]), Some(5));
-        assert_eq!(array_element_id(&oi, &[0, 0]), Some(0));
-        assert_eq!(array_element_id(&oi, &[3, 2]), Some(11)); // last element
-                                                              // One past the end in either dimension must not wrap into a neighbouring row.
-        assert_eq!(array_element_id(&oi, &[4, 0]), None);
-        assert_eq!(array_element_id(&oi, &[0, 3]), None);
+        assert_eq!(array_element_id(&oi, 7, &[1, 2]), Some(5));
+        assert_eq!(array_element_id(&oi, 7, &[0, 0]), Some(0));
+        assert_eq!(array_element_id(&oi, 7, &[3, 2]), Some(11)); // last element
+                                                                 // One past the end in either dimension must not wrap into a neighbouring row.
+        assert_eq!(array_element_id(&oi, 7, &[4, 0]), None);
+        assert_eq!(array_element_id(&oi, 7, &[0, 3]), None);
     }
 
     #[test]
@@ -3123,7 +3177,7 @@ mod tests {
             mdim_lower_bounds: [0, 0, 0, 0, 0, 0],
             ..Default::default()
         };
-        let got = mdim_elements(&oi, 7 /* DInt softdatatype, not BBOOL */);
+        let got = mdim_elements(&oi, 7 /* DInt softdatatype, not BBOOL */).unwrap();
         assert_eq!(
             got,
             vec![
@@ -3147,7 +3201,7 @@ mod tests {
             mdim_lower_bounds: [1, 10, 0, 0, 0, 0],
             ..Default::default()
         };
-        let got = mdim_elements(&oi, 7 /* DInt softdatatype, not BBOOL */);
+        let got = mdim_elements(&oi, 7 /* DInt softdatatype, not BBOOL */).unwrap();
         assert_eq!(
             got,
             vec![
@@ -3157,6 +3211,159 @@ mod tests {
                 ("[11,2]".into(), 3),
             ]
         );
+    }
+
+    /// A multi-dimensional `OffsetInfo` with per-dimension `counts` (fastest first) and lower
+    /// bounds `lower`.
+    fn mdim(counts: &[u32], lower: &[i32]) -> OffsetInfo {
+        let mut oi = OffsetInfo {
+            is_mdim: true,
+            array_element_count: counts.iter().fold(1, |n: u32, &c| n.wrapping_mul(c)),
+            ..Default::default()
+        };
+        oi.mdim_element_count[..counts.len()].copy_from_slice(counts);
+        oi.mdim_lower_bounds[..lower.len()].copy_from_slice(lower);
+        oi
+    }
+
+    /// The indices in a browse suffix like `[1,-2,3]`.
+    fn suffix_indices(suffix: &str) -> Vec<i32> {
+        suffix
+            .trim_matches(['[', ']'])
+            .split(',')
+            .map(|i| i.parse().unwrap())
+            .collect()
+    }
+
+    /// A multi-dimensional Bool array starts each row on a byte, so resolving an element must
+    /// skip the padding the browse enumeration skips (the reported case: `Array[0..1, 0..2] of
+    /// Bool` browses as ids 0, 1, 2, 8, 9, 10, and `[1,0]` resolved to 3).
+    #[test]
+    fn array_element_id_pads_bool_rows_like_the_browse() {
+        use crate::value::datatype::softdatatype::BBOOL;
+        let oi = mdim(&[3, 2], &[0, 0]);
+        assert_eq!(array_element_id(&oi, BBOOL, &[1, 0]), Some(8));
+        assert_eq!(array_element_id(&oi, BBOOL, &[1, 2]), Some(10));
+        assert_eq!(
+            array_element_id(&oi, 7, &[1, 0]),
+            Some(3),
+            "DInt: no padding"
+        );
+
+        // Every element of these shapes resolves to the id the browse gives it.
+        for (counts, lower) in [
+            (&[3, 2][..], &[0, 0][..]),
+            (&[8, 3], &[1, 0]),
+            (&[10, 2], &[0, -5]),
+            (&[3, 2, 2], &[0, 0, 0]),
+            (&[1, 4], &[2, 2]),
+            (&[5, 3, 2, 2], &[-1, 0, 1, 0]),
+        ] {
+            let oi = mdim(counts, lower);
+            for sdt in [BBOOL, 7] {
+                let elements = mdim_elements(&oi, sdt).unwrap();
+                assert_eq!(elements.len(), oi.array_element_count as usize);
+                for (suffix, id) in elements {
+                    let indices = suffix_indices(&suffix);
+                    assert_eq!(
+                        array_element_id(&oi, sdt, &indices),
+                        Some(id),
+                        "{counts:?} sdt {sdt} {suffix}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Counts and bounds come from the PLC: extreme ones give `None`, not an overflow panic.
+    #[test]
+    fn array_element_id_survives_extreme_type_info() {
+        let mut oi = mdim(&[u32::MAX; 6], &[i32::MIN; 6]);
+        oi.array_element_count = u32::MAX;
+        assert_eq!(array_element_id(&oi, 7, &[i32::MAX; 6]), None);
+        // Strides past 64 bits: no element of such an array can be addressed.
+        assert_eq!(array_element_id(&oi, 7, &[i32::MIN; 6]), None);
+        let two = mdim(&[u32::MAX; 2], &[i32::MIN; 2]);
+        assert_eq!(array_element_id(&two, 7, &[i32::MIN; 2]), Some(0));
+        assert_eq!(
+            array_element_id(&two, 7, &[i32::MIN, i32::MIN + 1]),
+            Some(1)
+        );
+        let past_u32 = [i32::MIN + 1, i32::MIN + 1]; // id u32::MAX + 1
+        assert_eq!(array_element_id(&two, 7, &past_u32), None);
+        let one = OffsetInfo {
+            is_1dim: true,
+            array_lower_bounds: i32::MIN,
+            array_element_count: u32::MAX,
+            ..Default::default()
+        };
+        assert_eq!(
+            array_element_id(&one, 7, &[i32::MAX - 1]),
+            Some(u32::MAX - 1)
+        );
+        assert_eq!(array_element_id(&one, 7, &[i32::MAX]), None); // one past the end
+        let one = OffsetInfo {
+            array_lower_bounds: i32::MAX,
+            ..one
+        };
+        assert_eq!(array_element_id(&one, 7, &[i32::MIN]), None);
+    }
+
+    /// A type object at `relid` with one member `name` of softdatatype `sdt` and offset info
+    /// `oi`.
+    fn type_object(relid: u32, name: &str, sdt: u8, oi: OffsetInfo) -> Arc<PObject> {
+        let mut obj = PObject::new(relid, 0, 0);
+        obj.vartype_list = Some(crate::proto::VartypeList {
+            first_id: 0,
+            elements: vec![crate::proto::VartypeElement {
+                lid: 1,
+                symbol_crc: 0,
+                softdatatype: sdt,
+                attribute_flags: 0,
+                bitoffsetinfo_flags: 0,
+                offset_info: oi,
+            }],
+        });
+        obj.varname_list = Some(crate::proto::VarnameList {
+            names: vec![name.into()],
+        });
+        Arc::new(obj)
+    }
+
+    /// Array counts in the type info are the PLC's: a browse stops at its limit with an error
+    /// instead of expanding billions of elements, nested ones included.
+    #[test]
+    fn browse_stops_at_its_limit() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |_| {});
+        let huge = OffsetInfo {
+            is_1dim: true,
+            array_element_count: u32::MAX,
+            ..Default::default()
+        };
+        conn.type_info_cache
+            .insert(0x10, type_object(0x10, "huge", 7, huge));
+        let e = conn.browse_datablock(0x8a0e_0001, 0x10, "DB").unwrap_err();
+        assert!(e.to_string().contains("set_browse_limit"), "{e}");
+
+        // 300 structs of 300 DInts: 90,000 variables, each array within the limit on its own.
+        let arr = |n, rel| OffsetInfo {
+            is_1dim: true,
+            array_element_count: n,
+            relation_id: rel,
+            ..Default::default()
+        };
+        conn.type_info_cache
+            .insert(0x20, type_object(0x20, "outer", 0x11, arr(300, Some(0x21))));
+        conn.type_info_cache
+            .insert(0x21, type_object(0x21, "inner", 7, arr(300, None)));
+        conn.set_browse_limit(50_000);
+        let e = conn.browse_datablock(0x8a0e_0001, 0x20, "DB").unwrap_err();
+        assert!(e.to_string().contains("more than 50000"), "{e}");
+        conn.set_browse_limit(90_000);
+        let vars = conn.browse_datablock(0x8a0e_0001, 0x20, "DB").unwrap();
+        assert_eq!(vars.len(), 90_000);
+        assert_eq!(vars[90_000 - 1].name, "DB.outer[299].inner[299]");
+        plc.join().unwrap();
     }
 
     /// A notification telegram body for `subscription` with `credit_tick` and one DInt value.
