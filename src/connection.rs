@@ -46,6 +46,10 @@ const DB_CLASS_RID: u32 = 2574;
 const PLC_PROGRAM_RID: u32 = 3;
 /// Attribute id `ObjectVariableTypeName` (an object's name).
 const OBJECT_VARIABLE_TYPE_NAME: u32 = 233;
+/// Attribute `VariableTypeStructModificationTime` (a ULInt) of a type-info object: when its
+/// layout last changed. Both type-info objects captured from PLCSIM carry it (with different
+/// values); the name is from the Wireshark dissector's id table.
+const STRUCT_MODIFICATION_TIME: u32 = 529;
 /// Attributes requested when browsing for data blocks (so DB objects are returned).
 const BROWSE_ATTRS: [u32; 3] = [
     OBJECT_VARIABLE_TYPE_NAME,
@@ -101,6 +105,9 @@ pub struct DataBlock {
 /// A variable discovered by the browse walk (or resolved by [`Connection::resolve_var`]): its
 /// fully-qualified symbol path, the access address parts, and its datatype. Read/write it via
 /// [`VarInfo::address`].
+///
+/// The address is only good for the program it was browsed from: after a download that changes
+/// the blocks, it may name another variable (see [`Connection::clear_caches`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VarInfo {
     /// Fully-qualified symbol path (e.g. `"Motor_DB.axis[2].speed"`; area tags have no DB prefix).
@@ -1826,13 +1833,71 @@ impl Connection {
     }
 
     /// Forget the cached data-block list, type info and resolved symbols, so the next lookup
-    /// asks the PLC again — e.g. after a program download changed the blocks. (A reconnect
-    /// starts with empty caches anyway.)
+    /// asks the PLC again. (A reconnect starts with empty caches anyway.)
+    ///
+    /// **Call this after a program download** (or use
+    /// [`Connection::refresh_caches_if_program_changed`]). Symbols are addressed by the data
+    /// block's relation id and the members' LIDs, with a symbol CRC of 0 — the reference driver
+    /// does the same — so the PLC does not check that an address still means the symbol it was
+    /// resolved from. After a download that renumbers a data block or changes its members' LIDs,
+    /// a cached address can silently read or write **another variable**. The same holds for
+    /// [`ItemAddress`]es and [`VarInfo`]s a caller keeps.
     pub fn clear_caches(&mut self) {
         self.type_info_cache.clear();
         self.type_container_prefetched = false;
         self.db_list = None;
         self.symbol_cache.clear();
+    }
+
+    /// Check whether the PLC program changed in a way that invalidates the cached addresses
+    /// (see [`Connection::clear_caches`]), and if so clear the caches. Returns whether it did.
+    /// Nothing is checked, and `false` returned, while nothing is cached.
+    ///
+    /// It reads the data-block list again (one Explore and one batched read, the requests the
+    /// first lookup made) and compares the blocks' names, numbers, relation ids and type-info
+    /// ids; if those match, it compares the modification time of each data block's type info
+    /// that is cached (attribute 529, `VariableTypeStructModificationTime`, which the PLC sends
+    /// with every type-info object) — one small Explore per such block. A layout change inside
+    /// a block shows up there; a change confined to a nested UDT or to the PLC tags (M/Q/I) may
+    /// not, so after a known download, [`Connection::clear_caches`] is the sure way.
+    ///
+    /// Opt-in and untested against PLCs so far: the attribute-filtered Explore of a type-info
+    /// object is the form `cpu_state` uses on the CPU object, but has not been tried on a type
+    /// (an S7-1215C on FW V4.2 closes the connection over some Explores it refuses).
+    pub fn refresh_caches_if_program_changed(&mut self) -> Result<bool> {
+        let Some(before) = self.db_list.clone() else {
+            return Ok(false);
+        };
+        let times: Vec<(u32, PValue)> = before
+            .iter()
+            .filter_map(|db| {
+                let ti = self.type_info_cache.get(&db.ti_relid)?;
+                Some((db.ti_relid, ti.attribute(STRUCT_MODIFICATION_TIME)?.clone()))
+            })
+            .collect();
+        self.db_list = None;
+        let now = self.data_blocks()?;
+        let same_blocks = before.len() == now.len()
+            && before.iter().zip(now.iter()).all(|(a, b)| {
+                (a.name.as_str(), a.relid, a.number, a.ti_relid)
+                    == (b.name.as_str(), b.relid, b.number, b.ti_relid)
+            });
+        let mut changed = !same_blocks;
+        for (ti_relid, time) in times {
+            if changed {
+                break;
+            }
+            let resp = self.explore(ti_relid, 0, 0, &[STRUCT_MODIFICATION_TIME])?;
+            let current = find_object(&resp.objects, ti_relid)
+                .and_then(|o| o.attribute(STRUCT_MODIFICATION_TIME));
+            // A PLC that doesn't answer with the attribute tells nothing either way.
+            changed = current.is_some_and(|c| *c != time);
+        }
+        if changed {
+            log::info!("the PLC program changed; cached addresses dropped");
+            self.clear_caches();
+        }
+        Ok(changed)
     }
 
     /// Discover (and cache) the data blocks: name, relid, number, and type-info relid.
@@ -2196,6 +2261,12 @@ impl Connection {
     /// (`"\"Data block.1\".\"value.1\""`), and array-DB elements are `"\"Array DB\"[2]"`. A `"`
     /// inside a quoted name is written doubled. Whitespace around a level is ignored; an empty
     /// level (`DB..x`) or anything but `.` or `[` right after a quoted name is an error.
+    ///
+    /// The result is cached (and so is the type info behind it), and the address carries no
+    /// symbol CRC for the PLC to check: after a program download that renumbers a data block or
+    /// changes its members, it may address **another variable** without any error. Call
+    /// [`Connection::clear_caches`] after a download, and don't keep the returned address past
+    /// one either (see [`Connection::refresh_caches_if_program_changed`]).
     pub fn resolve_symbol(&mut self, symbol: &str) -> Result<ItemAddress> {
         Ok(self.resolve_full(symbol)?.0)
     }
@@ -2384,6 +2455,10 @@ impl Connection {
 
     /// Write a single tag by symbol name (e.g. `"Data_block_1.titi"`). The `value` type must
     /// match the PLC variable's type.
+    ///
+    /// The name resolves through the cache: after a program download, call
+    /// [`Connection::clear_caches`] first, or the write may land in another variable (see
+    /// [`Connection::resolve_symbol`]).
     pub fn write_tag(&mut self, symbol: &str, value: PValue) -> Result<()> {
         let addr = self.resolve_symbol(symbol)?;
         self.write_resolved(symbol, addr, value)
@@ -3044,6 +3119,17 @@ fn check_credit_limit(credit_limit: i16) -> Result<()> {
             "credit limit {other} out of range: use -1 (unlimited) or 1..=255"
         ))),
     }
+}
+
+/// The object with relation id `relid` in `objects` or among their nested objects.
+fn find_object(objects: &[PObject], relid: u32) -> Option<&PObject> {
+    objects.iter().find_map(|o| {
+        if o.relation_id == relid {
+            Some(o)
+        } else {
+            find_object(&o.objects, relid)
+        }
+    })
 }
 
 /// Every object in `objects` (recursively) that carries a member list, each detached from its
@@ -4214,6 +4300,75 @@ mod tests {
         conn.clear_caches();
         conn.prefetch_type_container().unwrap();
         conn.prefetch_type_container().unwrap();
+        plc.join().unwrap();
+    }
+
+    /// Answer `refresh_caches_if_program_changed`'s data-block list: the program Explore listing
+    /// one data block `relid`, then the read of its type-info relid `ti`.
+    fn serve_block_list(plc: &mut MockPlc, relid: u32, ti: u32) {
+        let req = plc.recv_request();
+        assert_eq!(&req[14..18], &PLC_PROGRAM_RID.to_be_bytes());
+        let mut db = PObject::new(relid, DB_CLASS_RID, 0);
+        db.add_attribute(OBJECT_VARIABLE_TYPE_NAME, PValue::WString("DB".into()));
+        let mut program = PObject::new(PLC_PROGRAM_RID, 0, 0);
+        program.objects.push(db);
+        plc.send(&plc.explore_response(PLC_PROGRAM_RID, &[program]));
+        let req = plc.recv_request();
+        assert_eq!(item_count(&req), 1);
+        let mut rest = vec![1];
+        PValue::RID(ti).serialize(&mut rest).unwrap();
+        rest.extend_from_slice(&[0, 0]);
+        plc.send(&plc.reply(functioncode::GET_MULTI_VARIABLES, &rest));
+    }
+
+    /// Answer the Explore of type info `ti` for its modification time with `time`.
+    fn serve_modification_time(plc: &mut MockPlc, ti: u32, time: u64) {
+        let req = plc.recv_request();
+        assert_eq!(&req[3..5], &functioncode::EXPLORE.to_be_bytes());
+        assert_eq!(&req[14..18], &ti.to_be_bytes());
+        let mut obj = PObject::new(ti, 0, 0);
+        obj.add_attribute(STRUCT_MODIFICATION_TIME, PValue::ULInt(time));
+        plc.send(&plc.explore_response(ti, &[obj]));
+    }
+
+    /// Cached addresses are dropped when the data blocks change (here: renumbered) or a cached
+    /// block's type info has a new modification time, and kept otherwise.
+    #[test]
+    fn caches_are_dropped_when_the_program_changes() {
+        const DB1: u32 = 0x8a0e_0001;
+        const TI: u32 = 0x9200_0001;
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            serve_block_list(&mut plc, DB1, TI);
+            serve_modification_time(&mut plc, TI, 5); // unchanged
+            serve_block_list(&mut plc, DB1, TI);
+            serve_modification_time(&mut plc, TI, 6); // the layout changed
+            serve_block_list(&mut plc, 0x8a0e_0002, TI); // renumbered: no Explore needed
+        });
+        let cache = |conn: &mut Connection| {
+            conn.db_list = Some(Arc::from(vec![DataBlock {
+                name: "DB".into(),
+                relid: DB1,
+                number: 1,
+                ti_relid: TI,
+            }]));
+            let mut ti = PObject::new(TI, 0, 0);
+            ti.add_attribute(STRUCT_MODIFICATION_TIME, PValue::ULInt(5));
+            conn.type_info_cache.insert(TI, Arc::new(ti));
+            let addr = ItemAddress::raw(Area::Db(1), 0, 1);
+            conn.symbol_cache.insert("DB.x".into(), (addr, None));
+        };
+        assert!(
+            !conn.refresh_caches_if_program_changed().unwrap(),
+            "nothing cached"
+        );
+        cache(&mut conn);
+        assert!(!conn.refresh_caches_if_program_changed().unwrap());
+        assert!(conn.symbol_cache.contains_key("DB.x"), "kept");
+        assert!(conn.refresh_caches_if_program_changed().unwrap());
+        assert!(conn.symbol_cache.is_empty() && conn.db_list.is_none());
+        cache(&mut conn);
+        assert!(conn.refresh_caches_if_program_changed().unwrap());
+        assert!(conn.symbol_cache.is_empty());
         plc.join().unwrap();
     }
 

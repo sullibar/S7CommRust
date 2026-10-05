@@ -43,7 +43,9 @@
 //!   [`Connection::type_info`] walk the symbolic address space.
 //! - **Read / write tags by name** — [`Connection::read_tag`] /
 //!   [`Connection::write_tag`] (and the batched [`Connection::read_tags`] /
-//!   [`Connection::write_tags`]) resolve a symbol to its address for you.
+//!   [`Connection::write_tags`]) resolve a symbol to its address for you. Resolved addresses
+//!   are cached and not checked by the PLC, so after a program download call
+//!   [`Connection::clear_caches`]: a stale address can name another variable.
 //! - **Subscriptions & alarms** — [`Connection::subscribe`] and
 //!   [`Connection::subscribe_alarms`] register for the PLC's `0x33` push
 //!   [`Notification`]s; [`Alarm`] parses and formats alarm events.

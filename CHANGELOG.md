@@ -55,6 +55,13 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- `Connection::refresh_caches_if_program_changed`: clears the cached data-block list, type info
+  and resolved symbols if the PLC program changed — the data blocks' names, numbers or ids, or
+  the modification time of a cached block's type info (attribute 529). Resolved addresses carry
+  no symbol CRC (as in the reference driver), so the PLC doesn't notice a stale one: after a
+  download that renumbers a block or changes its members, a cached address could read or write
+  another variable. `clear_caches`, `resolve_symbol`, `write_tag` and `VarInfo` now say so.
+  The check is opt-in and not yet tried against a PLC.
 - `s7commplus::set_log_redaction`: keeps the PLC's project data out of the driver's log records
   (telegram dumps stop after the PDU header; symbol and data-block names are left out). s7tool
   turns it on for its session log, which no longer carries tag and block names, values, alarm
