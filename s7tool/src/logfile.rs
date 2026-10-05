@@ -132,7 +132,12 @@ pub fn command_for_log(cmd: &[String]) -> String {
         return String::new();
     };
     let args = &cmd[1..];
-    let shown: Vec<String> = match verb.as_str() {
+    let key = if verb.eq_ignore_ascii_case("legit") {
+        "legit"
+    } else {
+        verb.as_str()
+    };
+    let shown: Vec<String> = match key {
         "legit" => args
             .iter()
             .enumerate()
@@ -177,6 +182,13 @@ pub fn command_for_log(cmd: &[String]) -> String {
                 _ => a.clone(),
             })
             .collect(),
+        // A mistyped `legit` (or a verb from another tool, `login`) may carry a password.
+        _ if is_credential_verb(verb) => {
+            return std::iter::once(privacy::name(verb).to_string())
+                .chain(args.iter().map(|_| "<password>".to_owned()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
         // Anything else may be a mistyped tag name.
         _ => {
             return std::iter::once(verb)
@@ -190,6 +202,34 @@ pub fn command_for_log(cmd: &[String]) -> String {
         .chain(shown)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Whether an unknown verb looks like a command that takes a password: within two typing
+/// mistakes of `legit` or another tool's word for it, in any letter case.
+fn is_credential_verb(verb: &str) -> bool {
+    const VERBS: [&str; 7] = [
+        "legit", "login", "logon", "auth", "password", "passwd", "pass",
+    ];
+    let verb = verb.to_lowercase();
+    VERBS.iter().any(|v| edit_distance(&verb, v) <= 2)
+}
+
+/// The Levenshtein distance between `a` and `b`, in characters.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (above + 1)
+                .min(row[j] + 1)
+                .min(diagonal + usize::from(ca != cb));
+            diagonal = above;
+        }
+    }
+    row[b.len()]
 }
 
 /// The current UTC time as `YYYYMMDD-HHMMSS`, for log file names.
@@ -240,6 +280,31 @@ mod tests {
             "legit <password>"
         );
         assert_eq!(command_for_log(&strings(&["legit"])), "legit");
+    }
+
+    /// A mistyped `legit`, or another tool's word for it, doesn't put the password in a log
+    /// written with `--full-log` (where the log shows what the screen does).
+    #[test]
+    fn mistyped_legit_commands_mask_their_arguments() {
+        for verb in ["Legit", "LEGIT"] {
+            assert_eq!(
+                privacy::screen(&command_for_log(&strings(&[verb, "admin", "hunter2"]))),
+                format!("{verb} admin <password>")
+            );
+        }
+        for verb in [
+            "login", "Login", "legti", "lgeit", "logon", "auth", "pasword", "passwd",
+        ] {
+            let shown = privacy::screen(&command_for_log(&strings(&[verb, "admin", "hunter2"])));
+            assert_eq!(shown, format!("{verb} <password> <password>"));
+        }
+        // Other unknown commands may be tag names: private, but not masked.
+        assert_eq!(
+            privacy::screen(&command_for_log(&strings(&["Tank_level", "x"]))),
+            "Tank_level x"
+        );
+        assert_eq!(edit_distance("legit", "lgeit"), 2);
+        assert_eq!(edit_distance("", "abc"), 3);
     }
 
     #[test]

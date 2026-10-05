@@ -155,6 +155,9 @@ All notable changes to this project are documented here. The format is based on
 - s7tool's session log replaces IPv6 addresses too (with their zone, also in brackets with a
   port), not only IPv4 ones, and the PLC's host name, when `--ip` gives one, wherever it shows up
   and in any letter case (`plc.example.com:102`), not only as a whole word in the same case.
+- A session log written with `--full-log` no longer records the password of a mistyped `legit`:
+  `Legit` in another letter case is masked like `legit`, and an unknown command within two
+  typing mistakes of `legit`, `login`, `auth` or `password` has all its arguments masked.
 - `browse_vars` (and `prefetch_type_container`) no longer download the PLC's whole type-info
   container again on every call: it is fetched once per connection, until `clear_caches`. On an
   S7-1215C it is about 100 KB and took 6 s, three times per `s7tool report`.
