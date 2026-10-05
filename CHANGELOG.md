@@ -163,6 +163,8 @@ All notable changes to this project are documented here. The format is based on
   `TIME_OF_DAY` or `LTOD` past midnight wrapped round (90,000,000 ms showed as 01:00:00), and a
   `DATE_AND_TIME` with a millisecond nibble that isn't BCD or a field out of range (month 13)
   was shown anyway. `S7DateTime::from_date_and_time` takes exactly 8 bytes.
+- s7tool shows every element of a whole `Array of WString` and `Array of Date_And_Time`, as it
+  did for `Array of String`, instead of only the first.
 - `browse_vars` (and `prefetch_type_container`) no longer download the PLC's whole type-info
   container again on every call: it is fetched once per connection, until `clear_caches`. On an
   S7-1215C it is about 100 KB and took 6 s, three times per `s7tool report`.

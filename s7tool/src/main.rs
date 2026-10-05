@@ -1010,6 +1010,43 @@ fn fmt_typed(ty: u8, v: &PValue) -> String {
             return format!("[{}]", items.join(", "));
         }
     }
+    // Likewise a whole array of WSTRINGs (`max_len + 2` code units each) and of DATE_AND_TIMEs
+    // (8 bytes each).
+    if let (sdt::WSTRING, PValue::Array { items, .. }) = (ty, v) {
+        let stride = match items.first() {
+            Some(PValue::UInt(max)) => usize::from(*max) + 2,
+            _ => 0,
+        };
+        if stride > 0 && items.len() > stride && items.len() % stride == 0 {
+            let items: Vec<String> = items
+                .chunks(stride)
+                .map(|c| {
+                    let element = PValue::Array {
+                        element_type: v.datatype(),
+                        flags: 0,
+                        items: c.to_vec(),
+                    };
+                    format!(
+                        "{:?}",
+                        strings::decode_wstring(&element).unwrap_or_default()
+                    )
+                })
+                .collect();
+            return format!("[{}]", items.join(", "));
+        }
+    }
+    if let (sdt::DATE_AND_TIME, PValue::USIntArray(b)) = (ty, v) {
+        if b.len() > 8 && b.len() % 8 == 0 {
+            let items: Vec<String> = b
+                .chunks(8)
+                .map(|c| {
+                    datetime::format(ty, &PValue::USIntArray(c.to_vec()))
+                        .unwrap_or_else(|| format!("{c:?}"))
+                })
+                .collect();
+            return format!("[{}]", items.join(", "));
+        }
+    }
     let text = match (ty, v) {
         (sdt::STRING, PValue::USIntArray(b)) => Some(strings::decode_s7_string(b)),
         (sdt::WSTRING, _) => strings::decode_wstring(v),
@@ -1233,6 +1270,44 @@ mod tests {
         assert_eq!(unquote("\"DB\".x"), "\"DB\".x");
         assert_eq!(unquote("\"a\".\"b\""), "\"a\".\"b\"");
         assert_eq!(unquote("plain"), "plain");
+    }
+
+    /// A whole array of WSTRINGs or DATE_AND_TIMEs shows every element, not just the first.
+    #[test]
+    fn whole_arrays_of_wstrings_and_date_and_times() {
+        let wstring = |max: u16, s: &str| {
+            let mut units = vec![max, s.encode_utf16().count() as u16];
+            units.extend(s.encode_utf16());
+            units.resize(usize::from(max) + 2, 0);
+            units
+        };
+        let mut units = wstring(4, "ab");
+        units.extend(wstring(4, "Wé"));
+        units.extend(wstring(4, ""));
+        let array = PValue::Array {
+            element_type: s7commplus::value::datatype::tag::UINT,
+            flags: s7commplus::value::datatype::flags::ARRAY,
+            items: units.into_iter().map(PValue::UInt).collect(),
+        };
+        assert_eq!(fmt_typed(sdt::WSTRING, &array), r#"["ab", "Wé", ""]"#);
+        let single = PValue::Array {
+            element_type: s7commplus::value::datatype::tag::UINT,
+            flags: s7commplus::value::datatype::flags::ARRAY,
+            items: wstring(4, "ab").into_iter().map(PValue::UInt).collect(),
+        };
+        assert_eq!(fmt_typed(sdt::WSTRING, &single), r#""ab""#);
+
+        let dt = [0x24, 0x03, 0x15, 0x13, 0x45, 0x30, 0x12, 0x36];
+        let mut bytes = dt.to_vec();
+        bytes.extend([0x99, 0x12, 0x31, 0x23, 0x59, 0x59, 0x00, 0x05]);
+        assert_eq!(
+            fmt_typed(sdt::DATE_AND_TIME, &PValue::USIntArray(bytes)),
+            "[2024-03-15 13:45:30.123, 1999-12-31 23:59:59]"
+        );
+        assert_eq!(
+            fmt_typed(sdt::DATE_AND_TIME, &PValue::USIntArray(dt.to_vec())),
+            "2024-03-15 13:45:30.123"
+        );
     }
 
     #[test]
