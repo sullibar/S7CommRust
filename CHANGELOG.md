@@ -38,6 +38,8 @@ All notable changes to this project are documented here. The format is based on
   of a name skips the type-info walk; cached type info is shared instead of deep-copied per
   lookup. A cached type-info object no longer carries its nested objects (each is cached under
   its own relid).
+- `AssociatedValue` is `#[non_exhaustive]` and has a `UInt(u64)` variant for `ULInt` and `LWord`
+  alarm values; `Alarm` has `associated_value_types`, the type-info id of each associated value.
 
 ### Added
 
@@ -168,6 +170,13 @@ All notable changes to this project are documented here. The format is based on
 - An address array (or any array but a regular one) of `USInt` decodes as a `PValue::Array`
   that keeps its flags byte, so it re-encodes as it came (`20 02 …`); it used to decode as a
   `PValue::USIntArray`, which always encodes as a regular array (`10 02 …`).
+- Alarm associated values: a `Real` shows as the value it holds (12.756, not
+  12.755999565124512); `%f` and `%e` in an alarm text default to C's precision of 6 and `%e`
+  has C's form (`1.275600e+01`); `%x` of a negative value shows it in its type's width (`fffe`
+  for an `Int` of -2, not 16 digits); `LInt`, `ULInt`, `LWord` and the date and time types
+  (`Date`, `Time`, `Time_Of_Day`, `S5Time`, `Date_And_Time`, `LTime`, `LTOD`, `LDT`, `DTL`) are
+  decoded; and a value whose type isn't decoded leaves its placeholder in the text instead of
+  an empty string.
 - `browse_vars` (and `prefetch_type_container`) no longer download the PLC's whole type-info
   container again on every call: it is fetched once per connection, until `clear_caches`. On an
   S7-1215C it is about 100 KB and took 6 s, three times per `s7tool report`.
