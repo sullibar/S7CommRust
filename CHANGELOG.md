@@ -301,6 +301,14 @@ All notable changes to this project are documented here. The format is based on
   the poll no longer waits out one timeout after another. TCP keep-alive is on (first probe
   after 20 s idle, then every 5 s), so the OS also notices a PLC that vanished without closing
   the connection; this adds the `socket2` dependency.
+- Legacy connections detect replayed telegrams. The digest proves a telegram came from the PLC,
+  not that it is new: an accepted Get/SetMultiVariables, Explore, GetVarSubstreamed or
+  SetVariable response must now carry the integrity id that answers its request (the request's
+  integrity id plus its sequence number, as every response in the PLCSIM captures and the
+  S7-1200 logs does), and each subscription's notification sequence numbers must go up (gaps
+  allowed, and a wrap from just below a power-of-two boundary). A violation is an
+  `Error::Integrity` and poisons the connection. `explore_raw` can't check its response;
+  `explore` does.
 
 ## [0.1.0] - 2026-07-05
 

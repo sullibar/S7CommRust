@@ -179,6 +179,10 @@ type ResolvedSymbol = (ItemAddress, Option<crate::proto::VartypeElement>);
 struct BuiltRequest {
     /// The framed request telegram.
     framed: Vec<u8>,
+    /// Its sequence number.
+    seq: u16,
+    /// Its integrity id, if the session uses them.
+    integrity_id: Option<u32>,
 }
 
 /// A telegram encoded for the transport, ready to send.
@@ -240,6 +244,9 @@ pub struct Connection {
     pending_notifications: VecDeque<(u32, Vec<u8>)>,
     /// Current credit limit of each finite-credit subscription, topped up as notifications arrive.
     credit_limits: HashMap<u32, i16>,
+    /// Legacy transport: the last notification sequence number of each subscription (see
+    /// [`Connection::check_notification_sequence`]).
+    notification_sequences: HashMap<u32, u32>,
     /// The subscriptions created on this session and not deleted: what a reconnect would lose.
     subscriptions: HashSet<u32>,
     /// Whether [`Connection::legitimate`] succeeded on this session (a reconnect loses it).
@@ -393,6 +400,7 @@ impl Connection {
             settings: Settings::default(),
             pending_notifications: VecDeque::new(),
             credit_limits: HashMap::new(),
+            notification_sequences: HashMap::new(),
             subscriptions: HashSet::new(),
             legitimated: false,
             legitimation_key: None,
@@ -578,6 +586,7 @@ impl Connection {
             settings: Settings::default(),
             pending_notifications: VecDeque::new(),
             credit_limits: HashMap::new(),
+            notification_sequences: HashMap::new(),
             subscriptions: HashSet::new(),
             legitimated: false,
             legitimation_key: None,
@@ -854,7 +863,11 @@ impl Connection {
             Ok(framed)
         });
         match built {
-            Ok(framed) => Ok(BuiltRequest { framed }),
+            Ok(framed) => Ok(BuiltRequest {
+                framed,
+                seq,
+                integrity_id: with_integrity.then_some(integrity),
+            }),
             Err(e) => {
                 (
                     self.sequence_number,
@@ -872,6 +885,67 @@ impl Connection {
         if self.legacy_session_key.is_some() {
             crate::legacy::session::v3_chunk_len(framed)?;
         }
+        Ok(())
+    }
+
+    /// Legacy transport: check that an accepted response carries the integrity id that answers
+    /// `req`, its own integrity id plus its sequence number. The digest proves a response came
+    /// from the PLC, but not that it answers this request rather than replaying an earlier one;
+    /// this does (with the sequence number check of [`check_response_header`]). Every response in
+    /// the captures and field logs follows the rule (PLCSIM live run; S7-1200 FW 4.2 to 4.7,
+    /// first s7tool logs), which is also how Wireshark's dissector computes it; the reference
+    /// driver doesn't check it. A mismatch poisons the connection. TLS sessions, which TLS
+    /// protects against replay, and CreateObject / DeleteObject responses, whose parsers don't
+    /// read the id, aren't checked.
+    fn check_response_integrity(&mut self, req: &BuiltRequest, got: u32) -> Result<()> {
+        let Some(sent) = req
+            .integrity_id
+            .filter(|_| self.legacy_session_key.is_some())
+        else {
+            return Ok(());
+        };
+        let expected = sent.wrapping_add(u32::from(req.seq));
+        if got == expected {
+            return Ok(());
+        }
+        let e = Error::integrity(format!(
+            "response integrity id {got}, expected {expected} (request integrity id {sent} + \
+             sequence number {}): a replayed or misdirected response",
+            req.seq
+        ));
+        log::warn!("{e}; connection poisoned");
+        self.poisoned = true;
+        Err(e)
+    }
+
+    /// Legacy transport: check that a notification for `subscription` moves its sequence number
+    /// forward, so a replayed notification is noticed. The digest proves a notification came
+    /// from the PLC, not that it is new. S7-1200 CPUs number each subscription's notifications
+    /// 0, 1, 2, … (probe run); a gap is fine (a notification the PLC dropped), a repeat or a
+    /// step back is not — except a wrap to a small number from just below a power-of-two
+    /// boundary, since where the PLC wraps (the field is a 32-bit VLQ) isn't known. A violation
+    /// poisons the connection. The reference driver doesn't check this.
+    fn check_notification_sequence(&mut self, subscription: u32, telegram: &[u8]) -> Result<()> {
+        if self.legacy_session_key.is_none() {
+            return Ok(());
+        }
+        let Some(seq) = notification_sequence_number(telegram) else {
+            return Ok(()); // too short to parse; parse_notification reports it
+        };
+        let Some(&last) = self.notification_sequences.get(&subscription) else {
+            self.notification_sequences.insert(subscription, seq);
+            return Ok(());
+        };
+        if !sequence_moves_on(last, seq) {
+            let e = Error::integrity(format!(
+                "notification for subscription 0x{subscription:08x} has sequence number {seq} \
+                 after {last}: a replayed notification"
+            ));
+            log::warn!("{e}; connection poisoned");
+            self.poisoned = true;
+            return Err(e);
+        }
+        self.notification_sequences.insert(subscription, seq);
         Ok(())
     }
 
@@ -1029,7 +1103,11 @@ impl Connection {
             },
         )?;
         let resp_bytes = self.request_response(&req.framed)?;
-        proto::parse_get_multi_response(&resp_bytes)
+        let resp = proto::parse_get_multi_response(&resp_bytes)?;
+        if resp.header.is_ok() {
+            self.check_response_integrity(&req, resp.integrity_id)?;
+        }
+        Ok(resp)
     }
 
     /// Write one or more symbolic variables via SetMultiVariables (paired by position).
@@ -1099,6 +1177,7 @@ impl Connection {
                 resp.header.return_value
             )));
         }
+        self.check_response_integrity(&req, resp.integrity_id)?;
         Ok(resp)
     }
 
@@ -1270,6 +1349,7 @@ impl Connection {
         // If it was a subscription, forget its credit and anything still queued for it.
         self.credit_limits.remove(&object_id);
         self.subscriptions.remove(&object_id);
+        self.notification_sequences.remove(&object_id);
         self.pending_notifications
             .retain(|(id, _)| *id != object_id);
         Ok(())
@@ -1492,7 +1572,11 @@ impl Connection {
             },
         )?;
         let resp_bytes = self.request_response(&req.framed)?;
-        proto::parse_get_var_substreamed_response(&resp_bytes)
+        let resp = proto::parse_get_var_substreamed_response(&resp_bytes)?;
+        if resp.header.is_ok() {
+            self.check_response_integrity(&req, resp.integrity_id)?;
+        }
+        Ok(resp)
     }
 
     /// Write a single object attribute via SetVariable.
@@ -1514,7 +1598,11 @@ impl Connection {
             },
         )?;
         let resp_bytes = self.request_response(&req.framed)?;
-        proto::parse_set_variable_response(&resp_bytes)
+        let resp = proto::parse_set_variable_response(&resp_bytes)?;
+        if resp.header.is_ok() {
+            self.check_response_integrity(&req, resp.integrity_id)?;
+        }
+        Ok(resp)
     }
 
     /// Explore the object tree under `explore_id` and return the raw response telegram
@@ -1522,6 +1610,9 @@ impl Connection {
     /// `ExploreChildsRecursive`, `parents` = `ExploreParents`. `attrs` restricts which
     /// attributes are returned per object (empty = all); some objects (e.g. data blocks)
     /// only appear when the relevant attributes are requested.
+    ///
+    /// Unlike [`Connection::explore`], this can't check a legacy response's integrity id (it is
+    /// past the objects the caller decodes).
     pub fn explore_raw(
         &mut self,
         explore_id: u32,
@@ -1529,7 +1620,27 @@ impl Connection {
         parents: u8,
         attrs: &[u32],
     ) -> Result<Vec<u8>> {
-        self.explore_request(explore_id, ids::NONE, recursive, parents, attrs)
+        Ok(self
+            .explore_request(explore_id, ids::NONE, recursive, parents, attrs)?
+            .0)
+    }
+
+    /// An Explore, decoded; a legacy response's integrity id is checked if the PLC accepted it.
+    /// The caller checks the return value.
+    fn explore_parsed(
+        &mut self,
+        explore_id: u32,
+        request_id: u32,
+        recursive: u8,
+        parents: u8,
+        attrs: &[u32],
+    ) -> Result<proto::ExploreResponse> {
+        let (raw, req) = self.explore_request(explore_id, request_id, recursive, parents, attrs)?;
+        let resp = proto::parse_explore_response(&raw, self.with_integrity)?;
+        if resp.header.is_ok() {
+            self.check_response_integrity(&req, resp.integrity_id)?;
+        }
+        Ok(resp)
     }
 
     /// [`Connection::explore_raw`] with an `ExploreRequestId`, which some objects use to select
@@ -1541,7 +1652,7 @@ impl Connection {
         recursive: u8,
         parents: u8,
         attrs: &[u32],
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, BuiltRequest)> {
         let session = self.session_id;
         let req = self.build_request(functioncode::EXPLORE, |seq, with_integrity, integrity| {
             proto::build_explore_request(
@@ -1557,7 +1668,8 @@ impl Connection {
                 integrity,
             )
         })?;
-        self.request_response(&req.framed)
+        let raw = self.request_response(&req.framed)?;
+        Ok((raw, req))
     }
 
     /// Whether requests currently carry an integrity id.
@@ -1574,9 +1686,7 @@ impl Connection {
         parents: u8,
         attrs: &[u32],
     ) -> Result<proto::ExploreResponse> {
-        let with_integrity = self.with_integrity;
-        let raw = self.explore_raw(explore_id, recursive, parents, attrs)?;
-        let resp = proto::parse_explore_response(&raw, with_integrity)?;
+        let resp = self.explore_parsed(explore_id, ids::NONE, recursive, parents, attrs)?;
         if !resp.header.is_ok() {
             return Err(Error::protocol(format!(
                 "Explore rejected: return_value=0x{:016x}",
@@ -2473,14 +2583,13 @@ impl Connection {
     /// delivers it.
     pub fn active_alarms(&mut self) -> Result<Vec<proto::Alarm>> {
         use proto::alarm::{ALARM_SUBSYSTEM_RID, DAI_ATTRIBUTES, UPDATE_RELEVANT_DAI};
-        let raw = self.explore_request(
+        let resp = self.explore_parsed(
             ALARM_SUBSYSTEM_RID,
             UPDATE_RELEVANT_DAI,
             1,
             0,
             &DAI_ATTRIBUTES,
         )?;
-        let resp = proto::parse_explore_response(&raw, self.with_integrity)?;
         if !resp.header.is_ok() {
             return Err(Error::protocol(format!(
                 "reading the pending alarms rejected: return_value=0x{:016x}",
@@ -2735,6 +2844,7 @@ impl Connection {
             }
             if let Some(id) = notification_subscription_id(&bytes) {
                 log_notification(id, &bytes, "queued while awaiting a response");
+                self.check_notification_sequence(id, &bytes)?;
                 self.queue_notification(id, bytes);
                 continue;
             }
@@ -2750,7 +2860,10 @@ impl Connection {
                 continue;
             }
             match notification_subscription_id(&bytes) {
-                Some(id) => log_notification(id, &bytes, ""),
+                Some(id) => {
+                    log_notification(id, &bytes, "");
+                    self.check_notification_sequence(id, &bytes)?;
+                }
                 None => {
                     log::debug!(
                         "← unexpected telegram while awaiting a notification ({} bytes)",
@@ -2992,6 +3105,27 @@ fn check_response_header(request: &[u8], response: &[u8]) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// The sequence number of a framed `Notification` telegram: the VLQ after the opcode, the
+/// subscription id, six reserved bytes and the credit tick.
+fn notification_sequence_number(buf: &[u8]) -> Option<u32> {
+    let h = pdu::parse_header(buf).ok()?;
+    let mut cur = std::io::Cursor::new(buf.get(h.body_offset + 12..)?);
+    crate::wire::vlq::decode_u32(&mut cur).ok()
+}
+
+/// Whether a subscription's notification sequence number may follow `last` with `next`: forward
+/// (gaps allowed), or a wrap to a number below 16 from within 16 of a power-of-two boundary that
+/// a counter might wrap at.
+fn sequence_moves_on(last: u32, next: u32) -> bool {
+    const SLACK: u32 = 16;
+    const WRAP_POINTS: [u32; 5] = [0xff, 0x7fff, 0xffff, 0x7fff_ffff, u32::MAX];
+    next > last
+        || (next < SLACK
+            && WRAP_POINTS
+                .iter()
+                .any(|&point| last <= point && point - last < SLACK))
 }
 
 /// The subscription a framed telegram notifies about, if it is a `Notification` (`0x33`). A
@@ -3563,15 +3697,126 @@ mod tests {
         plc.join().unwrap();
     }
 
-    /// A notification telegram body for `subscription` with `credit_tick` and one DInt value.
+    /// A notification telegram body for `subscription` with `credit_tick` and one DInt value,
+    /// numbered after every earlier one (one counter for all tests, so each subscription's
+    /// numbers go up).
     fn notification(subscription: u32, credit_tick: u8) -> Vec<u8> {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let seq = NEXT.fetch_add(1, Ordering::Relaxed) as u32;
+        notification_numbered(subscription, credit_tick, seq)
+    }
+
+    /// A notification telegram body for `subscription` with sequence number `seq`.
+    fn notification_numbered(subscription: u32, credit_tick: u8, seq: u32) -> Vec<u8> {
         let mut b = vec![pdu::opcode::NOTIFICATION];
         b.extend_from_slice(&subscription.to_be_bytes());
-        b.extend_from_slice(&[0, 0, 0, 0, 0, 0, credit_tick, 1, 1]);
+        b.extend_from_slice(&[0, 0, 0, 0, 0, 0, credit_tick]);
+        crate::wire::vlq::encode_u32(&mut b, seq).unwrap();
+        b.push(1); // change counter
         b.extend_from_slice(&[0x9b, 0x01]);
         PValue::DInt(subscription as i32).serialize(&mut b).unwrap();
         b.push(0);
         b
+    }
+
+    /// On the legacy transport a response must carry the integrity id that answers its request
+    /// (the request's plus its sequence number), so a replayed earlier response is caught.
+    #[test]
+    fn a_response_with_another_integrity_id_poisons_the_connection() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            let req = plc.recv_request();
+            // The limits read was integrity id 1 at sequence 3 (answered with 4); this read is
+            // id 2 at sequence 4, so its answer carries 6.
+            assert_eq!(ids_of(&req), (4, 2));
+            assert_eq!(plc.response_integrity(), 6);
+            let mut rest = blob_item(vec![1]);
+            rest.pop();
+            rest.push(4); // the limits read's answer, replayed
+            plc.send(&plc.response(functioncode::GET_MULTI_VARIABLES, &rest));
+        });
+        let e = conn.read_area(Area::Memory, 0, 1).unwrap_err();
+        assert!(matches!(e, Error::Integrity(_)), "{e}");
+        assert!(e.to_string().contains("expected 6"), "{e}");
+        assert!(conn.is_poisoned());
+        plc.join().unwrap();
+    }
+
+    /// The emulated PLC's Explore answers are captures with the integrity id the rule gives them,
+    /// and every one decodes: the rule holds for the captures (PLCSIM), as it does for the
+    /// S7-1200 logs (the mock PLC's sessions run every firmware profile through it).
+    #[test]
+    fn the_captured_explore_responses_follow_the_integrity_rule() {
+        // Captured with integrity ids 6, 14, 10 and 6 at sequence numbers 4, 8, 6 and 4: the
+        // requests had ids 2, 6, 4 and 2, as this crate numbers get-class requests after login.
+        for (capture, seq, id) in [
+            (
+                &include_bytes!("../tests/vectors/proto/explore_cpu_state_run.bin")[..],
+                4,
+                6,
+            ),
+            (
+                include_bytes!("../tests/vectors/proto/explore_program.bin"),
+                8,
+                14,
+            ),
+            (
+                include_bytes!("../tests/vectors/proto/explore_ti_92000001.bin"),
+                6,
+                10,
+            ),
+            (
+                include_bytes!("../tests/vectors/proto/explore_device_tree.bin"),
+                4,
+                6,
+            ),
+        ] {
+            let resp = proto::parse_explore_response(capture, true).unwrap();
+            assert_eq!(resp.header.sequence_number, seq);
+            assert_eq!(resp.integrity_id, id);
+        }
+    }
+
+    /// On the legacy transport each subscription's notification numbers must go up: a repeat or
+    /// a step back is a replay and poisons the connection. Gaps are fine, and so is a wrap from
+    /// just below a power-of-two boundary.
+    #[test]
+    fn a_replayed_notification_poisons_the_connection() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            for (sub, seq) in [(0xa, 0), (0xb, 0), (0xa, 1), (0xa, 5), (0xb, 0)] {
+                plc.send(&notification_numbered(sub, 0, seq));
+            }
+        });
+        let a = conn.register_subscription(0xa, -1);
+        for _ in 0..3 {
+            conn.next_notification(&a).unwrap();
+        }
+        // B's 0 (queued) then 0 again: the second is a replay, caught when it arrives.
+        assert_eq!(
+            conn.next_any_notification().unwrap().subscription_object_id,
+            0xb
+        );
+        let e = conn.next_any_notification().unwrap_err();
+        assert!(matches!(e, Error::Integrity(_)), "{e}");
+        assert!(conn.is_poisoned());
+        plc.join().unwrap();
+
+        for (last, next, ok) in [
+            (0, 1, true),
+            (5, 9, true),
+            (5, 5, false),
+            (5, 4, false),
+            (200, 0, false),
+            (0xff, 0, true),
+            (0xfe, 1, true),
+            (0xffff, 0, true),
+            (u32::MAX, 0, true),
+            (u32::MAX - 3, 2, true),
+            (0x7fff_fff0, 0, true),
+            (0x1_0000, 0, false),
+            (0xffff, 16, false),
+        ] {
+            assert_eq!(sequence_moves_on(last, next), ok, "{last} -> {next}");
+        }
     }
 
     #[test]
@@ -3649,8 +3894,8 @@ mod tests {
             rest.push(2);
             crate::wire::vlq::encode_u64(&mut rest, 0x8206_8d00_02bf_ffc3).unwrap();
         }
-        rest.extend_from_slice(&[0, 0]);
-        plc.send(&plc.response(functioncode::GET_MULTI_VARIABLES, &rest));
+        rest.push(0); // end of errors
+        plc.send(&plc.reply(functioncode::GET_MULTI_VARIABLES, &rest));
     }
 
     /// Answer the last request with a rejection carrying `rv`.
@@ -3839,15 +4084,15 @@ mod tests {
                 data: vec![1, 2, 3],
             };
             value.serialize(&mut rest).unwrap();
-            rest.extend_from_slice(&[0, 0, 0]); // end of values, end of errors, integrity id
-            plc.send(&plc.response(functioncode::GET_MULTI_VARIABLES, &rest));
+            rest.extend_from_slice(&[0, 0]); // end of values, end of errors
+            plc.send(&plc.reply(functioncode::GET_MULTI_VARIABLES, &rest));
 
             // The same read, refused as PLCSIM refuses an optimized block.
             plc.recv_request();
             let mut rest = vec![0, 1]; // no values; an error for item 1
             crate::wire::vlq::encode_u64(&mut rest, 0x8206_8d00_02bf_ffc3).unwrap();
-            rest.extend_from_slice(&[0, 0]);
-            plc.send(&plc.response(functioncode::GET_MULTI_VARIABLES, &rest));
+            rest.push(0); // end of errors
+            plc.send(&plc.reply(functioncode::GET_MULTI_VARIABLES, &rest));
         });
         assert_eq!(conn.read_area(Area::Memory, 10, 3).unwrap(), [1, 2, 3]);
         let e = conn.read_area(Area::Db(1), 0, 4).unwrap_err();
@@ -3867,7 +4112,7 @@ mod tests {
             assert!(has_address(&req, &ItemAddress::raw(Area::Db(5), 2, 2)));
             // Item 1's value: a Blob (flags 0, type 0x14, root id 0, length 2) of the bytes.
             assert!(req.windows(7).any(|w| w == [1, 0, 0x14, 0, 2, 0xab, 0xcd]));
-            plc.send(&plc.response(functioncode::SET_MULTI_VARIABLES, &[0, 0]));
+            plc.send(&plc.reply(functioncode::SET_MULTI_VARIABLES, &[0]));
         });
         conn.write_area(Area::Db(5), 2, &[0xab, 0xcd]).unwrap();
         plc.join().unwrap();
@@ -3997,12 +4242,14 @@ mod tests {
             let mut body = CPU_STATE_RUN[4..CPU_STATE_RUN.len() - 4].to_vec();
             plc.recv_request();
             body[7..9].copy_from_slice(&plc.seq.to_be_bytes());
+            crate::mock_plc::set_explore_integrity(&mut body, plc.response_integrity());
             plc.send(&body);
             // The same reply in STOP: the code is 4 there, the only change in this attribute.
             assert_eq!(body[0x47 - 4], 8);
             body[0x47 - 4] = 4;
             plc.recv_request();
             body[7..9].copy_from_slice(&plc.seq.to_be_bytes());
+            crate::mock_plc::set_explore_integrity(&mut body, plc.response_integrity());
             plc.send(&body);
         });
         assert_eq!(conn.cpu_state().unwrap(), CpuState::Run);
@@ -4069,7 +4316,7 @@ mod tests {
             let req = plc.recv_request();
             assert_eq!(&req[3..5], &functioncode::SET_MULTI_VARIABLES.to_be_bytes());
             assert_eq!(ids_of(&req), (4, 1), "sequence 4, set-class integrity id 1");
-            plc.send(&plc.response(functioncode::SET_MULTI_VARIABLES, &[0, 0]));
+            plc.send(&plc.reply(functioncode::SET_MULTI_VARIABLES, &[0]));
             let req = plc.recv_request();
             assert_eq!(ids_of(&req), (5, 2), "sequence 5, get-class integrity id 2");
             let mut rest = vec![1];
@@ -4079,8 +4326,8 @@ mod tests {
             }
             .serialize(&mut rest)
             .unwrap();
-            rest.extend_from_slice(&[0, 0, 0]);
-            plc.send(&plc.response(functioncode::GET_MULTI_VARIABLES, &rest));
+            rest.extend_from_slice(&[0, 0]); // end of values, end of errors
+            plc.send(&plc.reply(functioncode::GET_MULTI_VARIABLES, &rest));
         });
         let bad_value = PValue::Array {
             element_type: crate::value::datatype::tag::INT,
@@ -4113,8 +4360,8 @@ mod tests {
         }
         .serialize(&mut rest)
         .unwrap();
-        rest.extend_from_slice(&[0, 0, 0]);
-        plc.send(&plc.response(functioncode::GET_MULTI_VARIABLES, &rest));
+        rest.extend_from_slice(&[0, 0]); // end of values, end of errors
+        plc.send(&plc.reply(functioncode::GET_MULTI_VARIABLES, &rest));
     }
 
     /// A mock PLC that takes one request and hangs up without answering.
