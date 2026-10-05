@@ -124,6 +124,12 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- `browse_vars` (and `prefetch_type_container`) no longer download the PLC's whole type-info
+  container again on every call: it is fetched once per connection, until `clear_caches`. On an
+  S7-1215C it is about 100 KB and took 6 s, three times per `s7tool report`.
+- `softdatatype::name` knows the system types (128–182: hardware, event, OB and connection
+  identifiers such as `HW_ANY`, `CONN_OUC`, `PORT`, and the alarm instruction types), so s7tool
+  shows their names instead of `sdt170`.
 - A SystemEvent carrying a data struct is recognised again, so `SystemEvent::is_fatal` is true for
   it. The parser looked for a two-byte `00 17` value header; SystemEvent values are fixed-width,
   so the header is four bytes (`00 00 00 17`), as in the reference driver and the Wireshark

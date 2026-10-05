@@ -177,6 +177,9 @@ pub struct Connection {
     with_integrity: bool,
     /// Cache of type-info objects by relation id (populated lazily during browsing).
     type_info_cache: HashMap<u32, Arc<PObject>>,
+    /// Whether the whole type-info container is in [`Self::type_info_cache`] already, so
+    /// [`Connection::prefetch_type_container`] needn't fetch it again.
+    type_container_prefetched: bool,
     /// Cached data-block list (lazily populated by [`Connection::datablock_list`]).
     db_list: Option<Arc<[DataBlock]>>,
     /// Resolved symbols, so a repeated [`Connection::read_tag`] / `write_tag` of the same name
@@ -300,6 +303,7 @@ impl Connection {
             integrity_id_set: 0,
             with_integrity: false,
             type_info_cache: HashMap::new(),
+            type_container_prefetched: false,
             db_list: None,
             symbol_cache: HashMap::new(),
             poisoned: false,
@@ -483,6 +487,7 @@ impl Connection {
             integrity_id_set: 0,
             with_integrity: true,
             type_info_cache: HashMap::new(),
+            type_container_prefetched: false,
             db_list: None,
             symbol_cache: HashMap::new(),
             poisoned: false,
@@ -1409,6 +1414,7 @@ impl Connection {
     /// starts with empty caches anyway.)
     pub fn clear_caches(&mut self) {
         self.type_info_cache.clear();
+        self.type_container_prefetched = false;
         self.db_list = None;
         self.symbol_cache.clear();
     }
@@ -1485,14 +1491,20 @@ impl Connection {
     /// source of type info the reference uses for browsing (`ObjectOMSTypeInfoContainer`): one
     /// round-trip for the whole program instead of a per-type Explore, and complete for large
     /// programs. Best-effort — [`Connection::type_info`] still falls back to a per-type Explore
-    /// on a cache miss.
+    /// on a cache miss. Fetched once per connection (until [`Connection::clear_caches`]): on an
+    /// S7-1215C it is about 100 KB and takes 6 s (field run), and `browse_vars`
+    /// asks for it on every call.
     pub fn prefetch_type_container(&mut self) -> Result<()> {
+        if self.type_container_prefetched {
+            return Ok(());
+        }
         let resp = self.explore(OMS_TYPE_INFO_CONTAINER_RID, 1, 0, &[])?;
         for obj in type_objects(resp.objects) {
             self.type_info_cache
                 .entry(obj.relation_id)
                 .or_insert_with(|| Arc::new(obj));
         }
+        self.type_container_prefetched = true;
         Ok(())
     }
 
@@ -3199,6 +3211,28 @@ mod tests {
         assert_eq!(conn.cpu_state().unwrap(), CpuState::Stop);
         assert_eq!(conn.cpu_state().unwrap(), CpuState::Other(6));
         assert!(conn.cpu_state().is_err());
+        plc.join().unwrap();
+    }
+
+    /// The type-info container is fetched once per connection, not on every `browse_vars`:
+    /// an S7-1215C's is ~100 KB and took 6 s, three times per s7tool report (field run).
+    /// `clear_caches` fetches it again.
+    #[test]
+    fn the_type_container_is_fetched_once() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            // Two fetches, then the mock hangs up: a third request would fail the test.
+            for _ in 0..2 {
+                let req = plc.recv_request();
+                assert_eq!(&req[3..5], &functioncode::EXPLORE.to_be_bytes());
+                assert_eq!(&req[14..18], &OMS_TYPE_INFO_CONTAINER_RID.to_be_bytes());
+                plc.send(&plc.explore_response(OMS_TYPE_INFO_CONTAINER_RID, &[]));
+            }
+        });
+        conn.prefetch_type_container().unwrap();
+        conn.prefetch_type_container().unwrap();
+        conn.clear_caches();
+        conn.prefetch_type_container().unwrap();
+        conn.prefetch_type_container().unwrap();
         plc.join().unwrap();
     }
 

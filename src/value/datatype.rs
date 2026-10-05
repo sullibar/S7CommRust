@@ -179,6 +179,50 @@ pub mod softdatatype {
             73 => "IEC_USCounter",
             74 => "IEC_UDCounter",
             75 => "IEC_ULCounter",
+            // System types: hardware, event, OB and connection identifiers, and the alarm
+            // instruction types. Names as the Wireshark S7comm-plus dissector gives them; six of
+            // them (AOM_IDENT, AOM_AID, HW_ANY, HW_PWM, CONN_OUC, PORT) showed up in S7-1200
+            // programs (field run).
+            128 => "AOM_IDENT",
+            129 => "EVENT_ANY",
+            130 => "EVENT_ATT",
+            131 => "FOLDER",
+            132 => "AOM_AID",
+            133 => "AOM_LINK",
+            134 => "EVENT_HWINT",
+            144 => "HW_ANY",
+            145 => "HW_IOSYSTEM",
+            146 => "HW_DPMASTER",
+            147 => "HW_DEVICE",
+            148 => "HW_DPSLAVE",
+            149 => "HW_IO",
+            150 => "HW_MODULE",
+            151 => "HW_SUBMODULE",
+            152 => "HW_HSC",
+            153 => "HW_PWM",
+            154 => "HW_PTO",
+            155 => "HW_INTERFACE",
+            156 => "HW_IEPORT",
+            160 => "OB_ANY",
+            161 => "OB_DELAY",
+            162 => "OB_TOD",
+            163 => "OB_CYCLIC",
+            164 => "OB_ATT",
+            168 => "CONN_ANY",
+            169 => "CONN_PRG",
+            170 => "CONN_OUC",
+            171 => "CONN_R_ID",
+            172 => "HW_NR",
+            173 => "PORT",
+            174 => "RTM",
+            175 => "PIP",
+            176 => "C_ALARM",
+            177 => "C_ALARM_S",
+            178 => "C_ALARM_8",
+            179 => "C_ALARM_8P",
+            180 => "C_ALARM_T",
+            181 => "C_AR_SEND",
+            182 => "C_NOTIFY",
             _ => return None,
         })
     }
@@ -195,4 +239,29 @@ pub mod flags {
 
     /// Mask of all the array-shape flags.
     pub const ANY_ARRAY: u8 = ARRAY | ADDRESS_ARRAY | SPARSE_ARRAY;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::softdatatype;
+
+    #[test]
+    fn softdatatype_names() {
+        assert_eq!(softdatatype::name(softdatatype::BBOOL), Some("Bool"));
+        assert_eq!(softdatatype::name(10), Some("Time_Of_Day"));
+        // The system types seen in S7-1200 programs (field run).
+        for (sdt, name) in [
+            (128, "AOM_IDENT"),
+            (132, "AOM_AID"),
+            (144, "HW_ANY"),
+            (153, "HW_PWM"),
+            (170, "CONN_OUC"),
+            (173, "PORT"),
+        ] {
+            assert_eq!(softdatatype::name(sdt), Some(name));
+        }
+        for unknown in [13, 135, 183, 255] {
+            assert_eq!(softdatatype::name(unknown), None, "{unknown}");
+        }
+    }
 }
