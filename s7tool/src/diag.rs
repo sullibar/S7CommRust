@@ -29,7 +29,10 @@ pub fn info(conn: &mut Connection) -> Result<()> {
             m.firmware.as_deref().unwrap_or("?")
         ),
         Ok(None) => out!("CPU module:       no identification record in the device tree"),
-        Err(e) => out!("CPU module:       device tree not readable: {e}"),
+        Err(e) => out!(
+            "CPU module:       device tree not readable: {}",
+            crate::privacy::error(e)
+        ),
     }
     match conn.peer_certificate_sha256() {
         Some(fp) => out!(
@@ -50,13 +53,19 @@ pub fn info(conn: &mut Connection) -> Result<()> {
     );
     match conn.effective_protection_level() {
         Ok(level) => out!("protection level: {level}"),
-        Err(e) => out!("protection level: not readable: {e}"),
+        Err(e) => out!(
+            "protection level: not readable: {}",
+            crate::privacy::error(e)
+        ),
     }
     match conn.cpu_state() {
         Ok(CpuState::Run) => out!("CPU state:        RUN"),
         Ok(CpuState::Stop) => out!("CPU state:        STOP"),
         Ok(CpuState::Other(code)) => out!("CPU state:        code {code}"),
-        Err(e) => out!("CPU state:        not readable: {e}"),
+        Err(e) => out!(
+            "CPU state:        not readable: {}",
+            crate::privacy::error(e)
+        ),
     }
     Ok(())
 }
@@ -181,6 +190,8 @@ pub fn report(conn: &mut Connection) -> Result<()> {
         out!("== {title}");
         if let Err(e) = step(conn) {
             failed += 1;
+            crate::remember_db_names(conn);
+            let e = crate::privacy::error(e);
             out!("FAILED: {e}");
             log::error!(target: "s7tool", "report step '{title}' failed: {e}");
             if conn.is_poisoned() {

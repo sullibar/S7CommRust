@@ -144,6 +144,14 @@ All notable changes to this project are documented here. The format is based on
   make the log's output layer swallow the markers) become U+FFFD, and log records are redacted
   before that layer. Where a marker is still missing, the log fails closed: it gets
   `<redacted>` and drops the rest of the text up to the end marker.
+- Names in error messages no longer reach s7tool's session log: the log looked for a printed
+  name only as a whole whitespace-separated word, so a level of a typed symbol (`member 'lvl'
+  not found`), a quoted block name or a name with a space in it went out as it was. Every level
+  of a symbol is now looked for on its own, as a whole identifier anywhere in a line (short and
+  plain lowercase names where they are quoted or part of a path), longest first; s7tool learns
+  every data block's name when a command fails, so the driver's hint naming the block to quote
+  is caught; and errors s7tool prints have their quoted parts and `(got …)` values left out of
+  the log.
 - `browse_vars` (and `prefetch_type_container`) no longer download the PLC's whole type-info
   container again on every call: it is fetched once per connection, until `clear_caches`. On an
   S7-1215C it is about 100 KB and took 6 s, three times per `s7tool report`.

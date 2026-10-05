@@ -73,7 +73,7 @@ fn main() {
     logfile::header(&std::env::args().skip(1).collect::<Vec<_>>());
     let result = run(cfg);
     if let Err(e) = &result {
-        log::error!(target: "s7tool", "{e}");
+        log::error!(target: "s7tool", "{}", privacy::error(e));
         eprintln!("error: {e}");
     }
     if let Some(path) = &log_path {
@@ -265,14 +265,16 @@ fn connect_auto(addr: (&str, u16), timeout: Duration) -> Result<Connection> {
         // "InitSsl rejected" covers both no-TLS signals real hardware sends: a genuine
         // InitSsl response carrying an error return value, and an error/abort function code
         // (Error2 0x05a9) from firmware that predates TLS S7CommPlus. Either way, fall through.
-        Err(e) if e.to_string().contains("InitSsl rejected") => out!("  no TLS: {e}"),
+        Err(e) if e.to_string().contains("InitSsl rejected") => {
+            out!("  no TLS: {}", privacy::error(e))
+        }
         Err(e) => return Err(e),
     }
     out!("trying the legacy scheme of real S7-1200/1500 CPUs ...");
     match Connection::connect_real_plc(addr, timeout) {
         Ok(conn) => return Ok(conn),
         Err(e) if e.to_string().contains("no 00:/01: fingerprint") => {
-            out!("  not a real CPU's key family: {e}")
+            out!("  not a real CPU's key family: {}", privacy::error(e))
         }
         Err(e) => return Err(e),
     }
@@ -344,7 +346,7 @@ fn repl(conn: &mut Connection) -> Result<()> {
             Some("quit" | "exit" | "q") => break,
             Some(_) => {
                 if let Err(e) = dispatch(conn, &parts) {
-                    log::error!(target: "s7tool", "{e}");
+                    log::error!(target: "s7tool", "{}", privacy::error(&e));
                     eprintln!("error: {e}");
                 }
             }
@@ -356,6 +358,26 @@ fn repl(conn: &mut Connection) -> Result<()> {
 /// Run one command (`cmd[0]` is the verb, the rest are arguments).
 fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
     log::info!(target: "s7tool", "> {}", logfile::command_for_log(cmd));
+    let result = run_command(conn, cmd);
+    if result.is_err() {
+        // The error may name a data block s7tool hasn't printed.
+        remember_db_names(conn);
+    }
+    result
+}
+
+/// Have the session log look out for every data block's name, which a driver error may show (a
+/// symbol that isn't found names the block it should have been quoted as, say). The list is
+/// cached by the connection, so this costs a request only if nothing has needed it before.
+fn remember_db_names(conn: &mut Connection) {
+    if let Ok(dbs) = conn.datablock_list() {
+        for db in &dbs {
+            privacy::remember(&db.name);
+        }
+    }
+}
+
+fn run_command(conn: &mut Connection, cmd: &[String]) -> Result<()> {
     match cmd[0].as_str() {
         "help" | "?" => {
             print_help();
@@ -406,7 +428,7 @@ fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
                     cmd[3].clone()
                 };
                 std::fs::write(&path, data)
-                    .map_err(|e| Error::Protocol(format!("write {path}: {e}")))?;
+                    .map_err(|e| Error::Protocol(format!("write {path:?}: {e}")))?;
                 out!(
                     "wrote {} bytes (obj 0x{objrel:08x}) -> {}",
                     data.len(),
@@ -444,7 +466,7 @@ fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
                     );
                     match inflate_metadata_blob(&data) {
                         Ok(xml) => out!("\n{}\n", privacy::text(xml)),
-                        Err(e) => out!(" <decompress failed: {e}>"),
+                        Err(e) => out!(" <decompress failed: {}>", privacy::error(e)),
                     }
                 }
             }
@@ -586,7 +608,11 @@ fn xverify(conn: &mut Connection) -> Result<()> {
             }
             Err(e) => {
                 bad += 1;
-                out!("UNRESOLVED {}: {e}", privacy::name(&v.name));
+                out!(
+                    "UNRESOLVED {}: {}",
+                    privacy::name(&v.name),
+                    privacy::error(e)
+                );
             }
         }
     }
@@ -648,7 +674,10 @@ fn browse(conn: &mut Connection, target: Option<&str>) -> Result<()> {
             // A DB whose interface the PLC withholds (TComSize=0, no VartypeList) is the signature
             // of a know-how-protected FB — not recoverable without the block's know-how password.
             Err(e) => {
-                out!("  (skipped — interface withheld by PLC, likely know-how protected: {e})")
+                out!(
+                    "  (skipped — interface withheld by PLC, likely know-how protected: {})",
+                    privacy::error(e)
+                )
             }
         }
         out!();
@@ -683,7 +712,7 @@ fn print_values(conn: &mut Connection, vars: &[VarInfo], strip: Option<&str>) {
     let values = match conn.read_var_values(vars) {
         Ok(v) => v,
         Err(e) => {
-            out!("  (read failed: {e})");
+            out!("  (read failed: {})", privacy::error(e));
             return;
         }
     };
@@ -854,7 +883,10 @@ fn read_one(conn: &mut Connection, sym: &str) {
             sdt_name(ty),
             privacy::value(fmt_typed(ty, &v))
         ),
-        Err(e) => out!("  {name} -> ERROR: {e}"),
+        Err(e) => {
+            remember_db_names(conn);
+            out!("  {name} -> ERROR: {}", privacy::error(e))
+        }
     }
 }
 

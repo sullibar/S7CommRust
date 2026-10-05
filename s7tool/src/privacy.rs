@@ -15,12 +15,15 @@
 //!
 //! The writer also goes over every log line, the driver's too: IPv4 addresses become `<ip1>`,
 //! `<ip2>`, … (the PLC's own is `<plc>`), the home directory becomes `~`, an absolute path keeps
-//! only its file name, and a name s7tool has already printed is replaced wherever it shows up
-//! again (an error message, say). The driver itself cuts its telegram dumps after the PDU header
-//! and leaves names out ([`s7commplus::set_log_redaction`]). `--full-log` turns all of this off.
+//! only its file name, and a name s7tool has already printed (each level of a symbol path on its
+//! own too) or learned ([`remember`], every data block's) is replaced wherever it shows up again.
+//! An error message printed through [`error`] has what it quotes left out of the log. The driver
+//! itself cuts its telegram dumps after the PDU header and leaves names out
+//! ([`s7commplus::set_log_redaction`]). `--full-log` turns all of this off.
 //!
-//! This is best effort for the readable text: a name inside an error message is only caught once
-//! s7tool has printed it. The telegram bytes, where most of a project lives, are not logged.
+//! This is best effort for the readable text: a name inside an unquoted part of an error message
+//! is only caught once s7tool has printed or learned it. The telegram bytes, where most of a
+//! project lives, are not logged.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -43,15 +46,80 @@ const NEWLINE: char = '\u{e003}';
 /// or start is missing.
 const REDACTED: &str = "<redacted>";
 
-/// The shortest name looked for in other log lines; shorter ones (`x`, `M`) would also match
-/// ordinary words.
-const MIN_TRACKED_NAME: usize = 3;
+/// The shortest name replaced wherever it shows up in other log lines; shorter ones (`x`, `M`)
+/// would also match ordinary words.
+const MIN_DISTINCTIVE_NAME: usize = 3;
 
-/// Whether a name is looked for in other log lines: not too short, and not a plain lowercase
-/// word, which s7tool's own text uses too (a tag named `done` would turn "report done" into
-/// "report <name…>").
-fn is_tracked(name: &str) -> bool {
-    name.chars().count() >= MIN_TRACKED_NAME && !name.chars().all(|c| c.is_ascii_lowercase())
+/// Whether a name is replaced wherever it shows up in other log lines: not too short, and not a
+/// plain lowercase word, which s7tool's own text uses too (a tag named `done` would turn "report
+/// done" into "report <name…>"). The others are replaced where they read as a name: in quotes,
+/// or as a level of a dotted path (see [`in_name_context`]).
+fn is_distinctive(name: &str) -> bool {
+    name.chars().count() >= MIN_DISTINCTIVE_NAME && !name.chars().all(|c| c.is_ascii_lowercase())
+}
+
+/// A character of an identifier: names are matched only as whole identifiers.
+fn is_ident(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// The identifier characters `s` starts with (empty when it starts with another character).
+fn head(s: &str) -> &str {
+    &s[..s.find(|c: char| !is_ident(c)).unwrap_or(s.len())]
+}
+
+/// Whether a name between `before` and `after` in a log line reads as a name: in quotes on both
+/// sides, or a level of a dotted path (`Tank.level`, `arr[2]`).
+fn in_name_context(before: &str, after: &str) -> bool {
+    let quote = |c: char| matches!(c, '\'' | '"' | '`');
+    let mut left = before.chars().rev();
+    let (left_quote, left_path) = match left.next() {
+        Some(c) if quote(c) => (true, false),
+        Some('.') => (
+            false,
+            left.next()
+                .is_some_and(|c| is_ident(c) || quote(c) || c == ']'),
+        ),
+        _ => (false, false),
+    };
+    let mut right = after.chars();
+    let (right_quote, right_path) = match right.next() {
+        Some(c) if quote(c) => (true, false),
+        Some('.' | '[') => (false, right.next().is_some_and(|c| is_ident(c) || quote(c))),
+        _ => (false, false),
+    };
+    (left_quote && right_quote) || left_path || right_path
+}
+
+/// The levels of a symbol path, without quotes and array indices: `"My.DB".arr[2].x` has
+/// `My.DB`, `arr` and `x`.
+fn path_levels(symbol: &str) -> Vec<String> {
+    let mut levels = Vec::new();
+    let mut level = String::new();
+    let (mut quoted, mut index) = (false, 0u32);
+    for c in symbol.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            '[' if !quoted => index += 1,
+            ']' if !quoted => index = index.saturating_sub(1),
+            '.' if !quoted && index == 0 => levels.push(std::mem::take(&mut level)),
+            _ if index > 0 => {}
+            c => level.push(c),
+        }
+    }
+    levels.push(level);
+    levels.retain(|l| !l.trim().is_empty());
+    levels
+}
+
+/// The length of the placeholder `s` starts with (`<name7>`, `<value>`), if it starts with one.
+fn placeholder_len(s: &str) -> Option<usize> {
+    let inner = s.strip_prefix('<')?;
+    let letters = inner.find(|c: char| !c.is_ascii_lowercase())?;
+    let digits = inner[letters..]
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(inner.len() - letters);
+    (letters > 0 && inner[letters + digits..].starts_with('>')).then_some(letters + digits + 2)
 }
 
 /// Text that is shown on screen but replaced in the session log.
@@ -102,10 +170,93 @@ fn clean(text: &str, newline: &str) -> String {
     out
 }
 
-/// A tag, block, module or other project name: `<nameN>` in the log, the same N each time.
+/// A tag, block, module or other project name: `<nameN>` in the log, the same N each time. Each
+/// level of a symbol path gets one too, so that a level an error message names on its own is
+/// replaced as well.
 pub fn name(name: &str) -> Private {
     let placeholder = registry().name(name);
     Private::new(name, placeholder)
+}
+
+/// Look out for `name` in the log from now on, without printing it (a data block's name that an
+/// error message may show).
+pub fn remember(name: &str) {
+    registry().name(name);
+}
+
+/// An error message: on screen as it is; in the log without what it quotes and the value it
+/// shows after "got", which become `<redacted>` (the driver's and s7tool's messages quote the
+/// names and values they show).
+pub fn error(error: impl fmt::Display) -> Private {
+    let real = error.to_string();
+    let placeholder = mask_quoted(&real);
+    Private::new(real, placeholder)
+}
+
+/// `message` with each quoted part (`'…'`, `"…"`, `` `…` ``) and each `(got …)` as `<redacted>`.
+/// An apostrophe within a word (`can't`) doesn't start a quote; an unfinished quote runs to the
+/// end of the message.
+fn mask_quoted(message: &str) -> String {
+    let chars: Vec<char> = message.chars().collect();
+    let mut out = String::with_capacity(message.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let after_word = i > 0 && chars[i - 1].is_alphanumeric();
+        if matches!(c, '"' | '`') || (c == '\'' && !after_word) {
+            let mut j = i + 1;
+            let end = loop {
+                match chars.get(j) {
+                    None => break None,
+                    Some('\\') if c == '"' => j += 2,
+                    Some(&q)
+                        if q == c
+                            && (c != '\''
+                                || !chars.get(j + 1).is_some_and(|n| n.is_alphanumeric())) =>
+                    {
+                        break Some(j)
+                    }
+                    Some(_) => j += 1,
+                }
+            };
+            let Some(end) = end else {
+                out.push(c);
+                out.push_str(REDACTED);
+                return out;
+            };
+            // Punctuation in quotes (`'.'`) is s7tool's or the driver's own.
+            if chars[i + 1..end].iter().any(|c| c.is_alphanumeric()) {
+                out.push(c);
+                out.push_str(REDACTED);
+                out.push(c);
+            } else {
+                out.extend(&chars[i..=end]);
+            }
+            i = end + 1;
+        } else if chars[i..].starts_with(&['(', 'g', 'o', 't', ' ']) {
+            out.push_str("(got ");
+            out.push_str(REDACTED);
+            let mut depth = 0usize;
+            let mut j = i;
+            let end = loop {
+                match chars.get(j) {
+                    None => break None,
+                    Some('(') => depth += 1,
+                    Some(')') if depth == 1 => break Some(j),
+                    Some(')') => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            };
+            let Some(end) = end else { return out };
+            out.push(')');
+            i = end + 1;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// A tag's value (or bytes read from the PLC's memory).
@@ -238,6 +389,8 @@ fn line_end(text: &str) -> &str {
 struct Registry {
     /// Names printed so far, and their placeholders.
     names: HashMap<String, String>,
+    /// The names to look for in log lines, by their [`head`], longest first.
+    by_head: HashMap<String, Vec<String>>,
     /// IPv4 addresses seen so far, and their placeholders.
     ips: HashMap<String, String>,
     /// The tester's home directory and user name, from the environment.
@@ -254,6 +407,7 @@ fn registry() -> std::sync::MutexGuard<'static, Registry> {
         };
         Mutex::new(Registry {
             names: HashMap::new(),
+            by_head: HashMap::new(),
             ips: HashMap::new(),
             home: env(&["HOME", "USERPROFILE"]),
             user: env(&["USER", "USERNAME", "LOGNAME"]),
@@ -264,19 +418,37 @@ fn registry() -> std::sync::MutexGuard<'static, Registry> {
 }
 
 impl Registry {
+    /// The placeholder of `name`, registering it and each level of it as a symbol path.
     fn name(&mut self, name: &str) -> String {
-        let n = self.names.len() + 1;
-        self.names
-            .entry(name.to_owned())
-            .or_insert_with(|| format!("<name{n}>"))
-            .clone()
+        let placeholder = self.insert(name, None);
+        for level in path_levels(name) {
+            self.insert(&level, None);
+        }
+        placeholder
+    }
+
+    /// Register `name` (with `placeholder`, or the next `<nameN>`) unless it is known, and
+    /// return its placeholder.
+    fn insert(&mut self, name: &str, placeholder: Option<&str>) -> String {
+        if let Some(known) = self.names.get(name) {
+            return known.clone();
+        }
+        let placeholder =
+            placeholder.map_or_else(|| format!("<name{}>", self.names.len() + 1), str::to_owned);
+        self.names.insert(name.to_owned(), placeholder.clone());
+        if !name.trim().is_empty() {
+            let list = self.by_head.entry(head(name).to_owned()).or_default();
+            list.push(name.to_owned());
+            list.sort_by_key(|n| std::cmp::Reverse(n.len()));
+        }
+        placeholder
     }
 
     fn plc(&mut self, addr: &str) {
         if is_ipv4(addr) {
             self.ips.insert(addr.to_owned(), "<plc>".into());
         } else {
-            self.names.insert(addr.to_owned(), "<plc>".into());
+            self.insert(addr, Some("<plc>"));
         }
     }
 
@@ -286,6 +458,7 @@ impl Registry {
             None => line.to_owned(),
         };
         let line = self.scrub_ips(&line);
+        let line = self.scrub_names(&line);
         let mut out = String::with_capacity(line.len());
         let mut token = String::new();
         for c in line.chars() {
@@ -331,7 +504,55 @@ impl Registry {
         out
     }
 
-    /// One whitespace-free token: a path, the user name, or a name printed before.
+    /// Replace each known name in `line`, longest first, where it is a whole identifier (and,
+    /// for a short or plain lowercase name, where it reads as a name: see [`is_distinctive`]).
+    /// Placeholders already in the line stay as they are.
+    fn scrub_names(&self, line: &str) -> String {
+        let mut out = String::with_capacity(line.len());
+        let mut prev: Option<char> = None;
+        let mut i = 0;
+        while let Some(c) = line[i..].chars().next() {
+            let rest = &line[i..];
+            let found = if c == '<' {
+                placeholder_len(rest).map(|len| (len, &rest[..len]))
+            } else {
+                None
+            }
+            .or_else(|| {
+                (!prev.is_some_and(is_ident))
+                    .then(|| self.find_name(&line[..i], rest))
+                    .flatten()
+            });
+            match found {
+                Some((len, replacement)) => {
+                    out.push_str(replacement);
+                    prev = rest[..len].chars().next_back();
+                    i += len;
+                }
+                None => {
+                    out.push(c);
+                    prev = Some(c);
+                    i += c.len_utf8();
+                }
+            }
+        }
+        out
+    }
+
+    /// The longest known name that `rest` starts with as a whole identifier, after `before`:
+    /// its length and placeholder.
+    fn find_name(&self, before: &str, rest: &str) -> Option<(usize, &str)> {
+        self.by_head.get(head(rest))?.iter().find_map(|name| {
+            let after = rest.strip_prefix(name.as_str())?;
+            if name.ends_with(is_ident) && after.starts_with(is_ident) {
+                return None;
+            }
+            (is_distinctive(name) || in_name_context(before, after))
+                .then(|| (name.len(), self.names[name].as_str()))
+        })
+    }
+
+    /// One whitespace-free token: a path or the user name.
     fn scrub_token(&self, token: &str) -> String {
         let core = token.trim_matches(|c: char| "\"'`()[]{},;:".contains(c));
         if core.is_empty() {
@@ -341,8 +562,6 @@ impl Registry {
             Some(file_name(core))
         } else if self.user.as_deref() == Some(core) {
             Some("<user>".to_owned())
-        } else if is_tracked(core) {
-            self.names.get(core).cloned()
         } else {
             None
         };
@@ -604,7 +823,8 @@ mod tests {
                 registry().names["Conveyor_Motor_3"]
             )
         );
-        // Short names and plain words would hit s7tool's own text, so they aren't looked for.
+        // Short names and plain words would hit s7tool's own text, so they are looked for only
+        // where they read as names: quoted, or a level of a path.
         let _ = name("M");
         let _ = name("done");
         assert_eq!(for_log("M area (3 tags):", true), "M area (3 tags):");
@@ -612,6 +832,100 @@ mod tests {
             for_log("report done: 7 of 7 steps succeeded", true),
             "report done: 7 of 7 steps succeeded"
         );
+        assert_eq!(for_log("report done.", true), "report done.");
+        let done = registry().names["done"].clone();
+        assert_eq!(
+            for_log("member 'done' not found", true),
+            format!("member '{done}' not found")
+        );
+        assert_eq!(for_log("Pump.done", true), format!("Pump.{done}"));
+        assert_eq!(for_log("'M'", true), format!("'{}'", registry().names["M"]));
+    }
+
+    /// Every level of a typed symbol is looked for on its own, quoted levels and names with
+    /// spaces included, and as part of longer text.
+    #[test]
+    fn each_level_of_a_symbol_is_looked_for() {
+        let whole = name("\"Line.Two\".Tank_level[3].lvl").placeholder;
+        let p = |n: &str| registry().names[n].clone();
+        for (line, logged) in [
+            (
+                "member 'lvl' not found".to_string(),
+                format!("member '{}' not found", p("lvl")),
+            ),
+            (
+                "bad array index for 'Tank_level'".into(),
+                format!("bad array index for '{}'", p("Tank_level")),
+            ),
+            (
+                "names containing '.' must be double-quoted: \"Line.Two\")".into(),
+                format!(
+                    "names containing '.' must be double-quoted: \"{}\")",
+                    p("Line.Two")
+                ),
+            ),
+            (
+                "read '\"Line.Two\".Tank_level[3].lvl' failed".into(),
+                format!("read '{whole}' failed"),
+            ),
+            // Not a whole identifier: left alone.
+            ("Tank_levels".into(), "Tank_levels".into()),
+        ] {
+            assert_eq!(for_log(&line, true), logged, "{line}");
+        }
+        let _ = name("Main Tank");
+        assert_eq!(
+            for_log("could not resolve Main Tank.x", true),
+            format!("could not resolve {}.x", p("Main Tank"))
+        );
+        // A placeholder already in the line stays as it is, even where it looks like a name.
+        let _ = name("name1");
+        assert_eq!(for_log("<name1> = <value>", true), "<name1> = <value>");
+    }
+
+    /// A data block s7tool never printed, but an error message names.
+    #[test]
+    fn remembered_names_are_looked_for() {
+        remember("Plant.Area_9");
+        let logged = for_log(
+            "symbol 'x' not found (names containing '.' must be double-quoted: \"Plant.Area_9\")",
+            true,
+        );
+        assert!(!logged.contains("Plant.Area_9"), "{logged}");
+        assert!(!logged.contains("Area_9"), "{logged}");
+    }
+
+    #[test]
+    fn errors_leave_quoted_parts_out_of_the_log() {
+        for (message, logged) in [
+            (
+                "symbol 'tank.lvl' not found in any data block or M/Q/I area \
+                 (names containing '.' must be double-quoted: \"My.DB\")",
+                "symbol '<redacted>' not found in any data block or M/Q/I area \
+                 (names containing '.' must be double-quoted: \"<redacted>\")",
+            ),
+            (
+                "can't parse \"a \\\"b\\\" c\" as Int",
+                "can't parse \"<redacted>\" as Int",
+            ),
+            (
+                "'secret' did not read back as a STRING (got Int(5))",
+                "'<redacted>' did not read back as a STRING (got <redacted>)",
+            ),
+            (
+                "'x' does not fit in a Char",
+                "'<redacted>' does not fit in a Char",
+            ),
+            ("bad 'secret", "bad '<redacted>"),
+            (
+                "GetMultiVariables rejected: return_value=0x8104",
+                "GetMultiVariables rejected: return_value=0x8104",
+            ),
+        ] {
+            let e = error(message).to_string();
+            assert_eq!(screen(&e), message);
+            assert_eq!(for_log(&e, true), logged, "{message}");
+        }
     }
 
     #[test]
