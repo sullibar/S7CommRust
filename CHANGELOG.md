@@ -165,6 +165,9 @@ All notable changes to this project are documented here. The format is based on
   was shown anyway. `S7DateTime::from_date_and_time` takes exactly 8 bytes.
 - s7tool shows every element of a whole `Array of WString` and `Array of Date_And_Time`, as it
   did for `Array of String`, instead of only the first.
+- An address array (or any array but a regular one) of `USInt` decodes as a `PValue::Array`
+  that keeps its flags byte, so it re-encodes as it came (`20 02 …`); it used to decode as a
+  `PValue::USIntArray`, which always encodes as a regular array (`10 02 …`).
 - `browse_vars` (and `prefetch_type_container`) no longer download the PLC's whole type-info
   container again on every call: it is fetched once per connection, until `clear_caches`. On an
   S7-1215C it is about 100 KB and took 6 s, three times per `s7tool report`.
