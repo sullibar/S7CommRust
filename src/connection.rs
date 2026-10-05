@@ -1752,10 +1752,10 @@ impl Connection {
             );
             for (id, v) in &obj.attributes {
                 let vs = format!("{v:?}");
-                let vs = if vs.len() > 80 {
-                    format!("{}…", &vs[..80])
-                } else {
-                    vs
+                // Cut at the 80th character, not byte: a WString may hold non-ASCII text.
+                let vs = match vs.char_indices().nth(80) {
+                    Some((cut, _)) => format!("{}…", &vs[..cut]),
+                    None => vs,
                 };
                 let _ = writeln!(out, "{pad}  attr 0x{id:x} ({id}) = {vs}");
             }
@@ -1991,8 +1991,9 @@ impl Connection {
             crate::logging::name(what)
         );
         Err(Error::protocol(format!(
-            "browse stopped: the program has more than {max} variables (at '{what}', {found} so \
-             far and {more} more); raise the limit with Connection::set_browse_limit"
+            "browse stopped: the program has more than {max} variables (at '{}', {found} so far \
+             and {more} more); raise the limit with Connection::set_browse_limit",
+            crate::logging::name(what)
         )))
     }
 
@@ -2272,8 +2273,10 @@ impl Connection {
                     }
                 }
                 found.ok_or_else(|| {
+                    // The hint names a data block, which a redacted log must not carry.
                     let hint = dbs
                         .iter()
+                        .filter(|_| !crate::logging::redacting())
                         .find(|d| d.name.contains('.') && symbol.starts_with(d.name.as_str()))
                         .map(|d| {
                             format!(
@@ -2283,7 +2286,8 @@ impl Connection {
                         })
                         .unwrap_or_default();
                     Error::protocol(format!(
-                        "symbol '{symbol}' not found in any data block or M/Q/I area{hint}"
+                        "symbol '{}' not found in any data block or M/Q/I area{hint}",
+                        crate::logging::name(symbol)
                     ))
                 })?
             };
@@ -2308,11 +2312,9 @@ impl Connection {
                 .vartype_list
                 .as_ref()
                 .ok_or_else(|| Error::protocol("type info missing VartypeList"))?;
-            let idx = names
-                .names
-                .iter()
-                .position(|n| n == name)
-                .ok_or_else(|| Error::protocol(format!("member '{name}' not found")))?;
+            let idx = names.names.iter().position(|n| n == name).ok_or_else(|| {
+                Error::protocol(format!("member '{}' not found", crate::logging::name(name)))
+            })?;
             let elem = vt
                 .elements
                 .get(idx)
@@ -2324,8 +2326,13 @@ impl Connection {
             // Array indexing: append the (zero-based, row-major) element id, plus an extra
             // `.1` when the elements are structs (array-of-struct).
             if !indices.is_empty() {
-                let array_lid = array_element_id(oi, elem.softdatatype, indices)
-                    .ok_or_else(|| Error::protocol(format!("bad array index for '{name}'")))?;
+                let array_lid =
+                    array_element_id(oi, elem.softdatatype, indices).ok_or_else(|| {
+                        Error::protocol(format!(
+                            "bad array index for '{}'",
+                            crate::logging::name(name)
+                        ))
+                    })?;
                 addr.lid.push(array_lid);
                 if oi.has_relation() {
                     addr.lid.push(1);
@@ -2334,7 +2341,8 @@ impl Connection {
                 // A whole array-of-struct can be read as the leaf, but its members can only be
                 // reached through an element.
                 return Err(Error::protocol(format!(
-                    "'{name}' is an array; index it to reach its members"
+                    "'{}' is an array; index it to reach its members",
+                    crate::logging::name(name)
                 )));
             }
 
@@ -2349,8 +2357,9 @@ impl Connection {
         }
         if i < levels.len() {
             return Err(Error::protocol(format!(
-                "could not fully resolve '{symbol}' (stopped before '{}')",
-                levels[i].0
+                "could not fully resolve '{}' (stopped before '{}')",
+                crate::logging::name(symbol),
+                crate::logging::name(&levels[i].0)
             )));
         }
         Ok((addr, leaf))
@@ -3158,7 +3167,12 @@ fn notification_subscription_id(buf: &[u8]) -> Option<u32> {
 /// of a name, or an unterminated quote or `[` are errors — the old parser silently joined or
 /// dropped such parts, which could address another variable.
 fn parse_symbol_path(symbol: &str) -> Result<Vec<(String, Vec<i32>)>> {
-    let bad = |what: String| Error::protocol(format!("{what} in symbol '{symbol}'"));
+    let bad = |what: String| {
+        Error::protocol(format!(
+            "{what} in symbol '{}'",
+            crate::logging::name(symbol)
+        ))
+    };
     let mut levels = Vec::new();
     let mut chars = symbol.chars().peekable();
     let skip_whitespace = |chars: &mut std::iter::Peekable<std::str::Chars>| {
@@ -4200,6 +4214,21 @@ mod tests {
         conn.clear_caches();
         conn.prefetch_type_container().unwrap();
         conn.prefetch_type_container().unwrap();
+        plc.join().unwrap();
+    }
+
+    /// The dump shortens long attribute values by characters: cutting a non-ASCII `WString` by
+    /// bytes used to panic off a character boundary.
+    #[test]
+    fn explore_dump_shortens_non_ascii_values() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            plc.recv_request();
+            let mut obj = PObject::new(0x8a0e_0001, DB_CLASS_RID, 0);
+            obj.add_attribute(OBJECT_VARIABLE_TYPE_NAME, PValue::WString("é".repeat(100)));
+            plc.send(&plc.explore_response(0x8a0e_0001, &[obj]));
+        });
+        let dump = conn.explore_dump(0x8a0e_0001, 0, 0).unwrap();
+        assert!(dump.contains("ééé…"), "{dump}");
         plc.join().unwrap();
     }
 

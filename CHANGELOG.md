@@ -316,6 +316,11 @@ All notable changes to this project are documented here. The format is based on
 - Legacy: bytes after a telegram's trailer in the same COTP TSDU, or 1–3 bytes too short for a
   chunk header, are a framing error (the connection is lost) instead of being dropped silently,
   which lost whatever telegram they belonged to.
+- `explore_dump` / `explore_dump_attrs` (s7tool `xexplore`) no longer panic on a long attribute
+  value with non-ASCII text: it was shortened at byte 80, which can fall inside a character.
+- With `set_log_redaction` on, symbol-resolution errors (`not found`, `could not fully
+  resolve`, a bad path or array index, the browse limit) show `<name>` instead of the names,
+  and the "must be double-quoted" hint, which names a data block, is left out.
 
 ## [0.1.0] - 2026-07-05
 
