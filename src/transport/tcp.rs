@@ -82,6 +82,7 @@ impl IsoTcp {
             last_err.unwrap_or_else(|| Error::framing("no socket addresses resolved"))
         })?;
         stream.set_nodelay(true)?;
+        enable_keepalive(&stream);
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
 
@@ -229,18 +230,34 @@ impl IsoTcp {
             }
             let mut buf = [0u8; 8192];
             let n = match self.stream.read(&mut buf) {
-                Ok(0) => {
-                    return Err(Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "connection closed by the PLC",
-                    )))
-                }
+                // The PLC closed the connection: nothing more will arrive, so this is not a
+                // timeout to retry but a lost connection.
+                Ok(0) => return Err(Error::closed("connection closed by the PLC")),
                 Ok(n) => n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e.into()),
             };
             self.rx.extend_from_slice(&buf[..n]);
         }
+    }
+}
+
+/// Idle time before the first TCP keep-alive probe, and the time between probes.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(20);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Turn on TCP keep-alive (best effort), so a PLC that vanishes without closing the connection
+/// (power loss, a pulled cable) is noticed: the OS then fails the socket after the probes go
+/// unanswered — on Windows 10 probes, about 70 s; on Linux its `tcp_keepalive_probes` (default 9).
+/// Without it a notification poll on such a connection only ever times out, which is
+/// indistinguishable from a quiet subscription. Requests are unaffected: their own timeout
+/// already ends them.
+fn enable_keepalive(stream: &TcpStream) {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL);
+    if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        log::debug!("TCP keep-alive unavailable: {e}");
     }
 }
 

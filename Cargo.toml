@@ -49,6 +49,7 @@ aes = "0.8"               # AES-256-CBC...
 cbc = { version = "0.1", features = ["alloc", "block-padding"] }  # ...with PKCS7 padding
 thiserror = "2"
 log = "0.4"
+socket2 = "0.6"            # SO_KEEPALIVE (std has no setter), so a silently dead PLC is noticed
 
 [dev-dependencies]
 hex-literal = "0.4"       # golden byte-vector fixtures

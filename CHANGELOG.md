@@ -38,6 +38,9 @@ All notable changes to this project are documented here. The format is based on
   of a name skips the type-info walk; cached type info is shared instead of deep-copied per
   lookup. A cached type-info object no longer carries its nested objects (each is cached under
   its own relid).
+- TLS session keys are written to `SSLKEYLOGFILE` only after the new
+  `s7commplus::set_tls_key_logging(true)`; the environment variable alone, which other programs
+  honour too, no longer exposes a session's keys (and with them the legitimation password).
 
 ### Added
 
@@ -275,6 +278,18 @@ All notable changes to this project are documented here. The format is based on
   names. Whitespace around a level is now ignored. A `"` inside a quoted name is written doubled
   (`"a""b"`), and browsed names containing a quote or starting or ending with whitespace are
   quoted that way, so every browsed name round-trips through `resolve_symbol`.
+- TLS: a SystemEvent the PLC sends between the chunks of a response is cut out and handled on
+  its own; it used to be joined to the response, corrupting it (FW 4.2 sent keep-alives between
+  chunks on the legacy transport). The chunks and trailer of one telegram must now share a
+  protocol version.
+- TLS: a response arriving as one ISO packet with more than 16 KiB of data no longer fails with
+  "received plaintext buffer full"; decrypted data is taken out of rustls after every record,
+  and data already decrypted is returned before the socket is read again.
+- A PLC that closes the connection is noticed by a notification poll: the TLS `close_notify`
+  and the TCP connection closing are `Error::Closed` (the latter was `Io(UnexpectedEof)`), and
+  the poll no longer waits out one timeout after another. TCP keep-alive is on (first probe
+  after 20 s idle, then every 5 s), so the OS also notices a PLC that vanished without closing
+  the connection; this adds the `socket2` dependency.
 
 ## [0.1.0] - 2026-07-05
 

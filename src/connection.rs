@@ -2702,9 +2702,29 @@ impl Connection {
     ///
     /// Nothing is consumed from `rbuf` until the whole telegram is there, so a read timeout
     /// part-way through keeps every byte for the next call.
+    ///
+    /// A SystemEvent chunk (`72 fe len`, no trailer) is a telegram of its own, even between the
+    /// chunks of another telegram (FW 4.2 sent keep-alives there on the legacy transport, trace
+    /// run): it is cut out and returned as it is, and the other telegram's chunks stay put.
     fn recv_telegram(&mut self) -> Result<Vec<u8>> {
         loop {
-            if let Some((version, end, body_len)) = scan_telegram(&self.rbuf[self.rpos..])? {
+            let scanned = scan_telegram(&self.rbuf[self.rpos..])?;
+            if let Some(Scanned::SystemEvent { start, end }) = scanned {
+                let (start, end) = (self.rpos + start, self.rpos + end);
+                let event = self.rbuf[start..end].to_vec();
+                self.rbuf.drain(start..end);
+                if self.rpos == self.rbuf.len() {
+                    self.rbuf.clear();
+                    self.rpos = 0;
+                }
+                return Ok(event);
+            }
+            if let Some(Scanned::Telegram {
+                version,
+                end,
+                body_len,
+            }) = scanned
+            {
                 // Re-frame as a single chunk directly (what `pdu::frame_single_pdu` produces),
                 // copying each chunk's payload once.
                 let raw = &self.rbuf[self.rpos..self.rpos + end];
@@ -2742,12 +2762,30 @@ impl Connection {
     }
 }
 
-/// Find a complete telegram at the start of `buf`: `(trailer version, length including the
-/// trailer, total body length)`, or `None` if more bytes are needed. Only reads `buf`, so the
-/// caller can retry after the next read.
-fn scan_telegram(buf: &[u8]) -> Result<Option<(u8, usize, usize)>> {
+/// What [`scan_telegram`] found at the start of the receive buffer.
+#[derive(Debug, PartialEq, Eq)]
+enum Scanned {
+    /// A complete telegram: its version, its length including the trailer, and the total length
+    /// of its chunks' payloads.
+    Telegram {
+        version: u8,
+        end: usize,
+        body_len: usize,
+    },
+    /// A complete SystemEvent chunk at `start..end`, possibly between another telegram's chunks.
+    SystemEvent { start: usize, end: usize },
+}
+
+/// Find a complete telegram at the start of `buf`, or a SystemEvent among its chunks, or `None`
+/// if more bytes are needed. Only reads `buf`, so the caller can retry after the next read.
+///
+/// The chunks and trailer of one telegram must share a protocol version: a mismatch means the
+/// stream is out of step. A SystemEvent (`0xfe`) carries no trailer and stands alone wherever it
+/// appears, so it is reported on its own instead of being joined to the telegram around it.
+fn scan_telegram(buf: &[u8]) -> Result<Option<Scanned>> {
     let mut i = 0;
     let mut body_len = 0;
+    let mut telegram_version = None;
     while let Some(&[id, version, hi, lo]) = buf.get(i..i + 4) {
         if id != pdu::PROTOCOL_ID {
             return Err(Error::framing(format!(
@@ -2755,8 +2793,27 @@ fn scan_telegram(buf: &[u8]) -> Result<Option<(u8, usize, usize)>> {
             )));
         }
         let len = usize::from(u16::from_be_bytes([hi, lo]));
+        if version == protocol_version::SYSTEM_EVENT {
+            let end = i + 4 + len;
+            return Ok((end <= buf.len()).then_some(Scanned::SystemEvent { start: i, end }));
+        }
+        match telegram_version {
+            None => telegram_version = Some(version),
+            Some(first) if first != version => {
+                return Err(Error::framing(format!(
+                    "chunks of one telegram with protocol versions 0x{first:02x} and \
+                     0x{version:02x}"
+                )))
+            }
+            Some(_) => {}
+        }
         if len == 0 {
-            return Ok(Some((version, i + 4, body_len))); // trailer => end of telegram
+            // The trailer: the end of the telegram.
+            return Ok(Some(Scanned::Telegram {
+                version,
+                end: i + 4,
+                body_len,
+            }));
         }
         body_len += len;
         if body_len > pdu::MAX_TELEGRAM_LEN {
@@ -3082,6 +3139,9 @@ mod tests {
     use super::*;
     use crate::mock_plc::{mock_connection, MockPlc};
     use crate::proto::OffsetInfo;
+
+    /// The timeout of the mock TLS connections.
+    const TIMEOUT: Duration = Duration::from_secs(5);
 
     fn levels(symbol: &str) -> Vec<(String, Vec<i32>)> {
         parse_symbol_path(symbol).unwrap()
@@ -4119,7 +4179,140 @@ mod tests {
         for cut in 0..t.len() {
             assert_eq!(scan_telegram(&t[..cut]).unwrap(), None, "cut {cut}");
         }
-        assert_eq!(scan_telegram(&t).unwrap(), Some((2, t.len(), 3)));
+        assert_eq!(
+            scan_telegram(&t).unwrap(),
+            Some(Scanned::Telegram {
+                version: 2,
+                end: t.len(),
+                body_len: 3
+            })
+        );
         assert!(scan_telegram(&[0x55, 2, 0, 0]).is_err());
+    }
+
+    /// A GetMultiVariables response body (after the header) with one Blob value.
+    fn blob_item(data: Vec<u8>) -> Vec<u8> {
+        let mut rest = vec![1];
+        PValue::Blob { root_id: 0, data }
+            .serialize(&mut rest)
+            .unwrap();
+        rest.extend_from_slice(&[0, 0, 0]);
+        rest
+    }
+
+    /// A keep-alive SystemEvent telegram: `72 fe 00 10` and four zero `u32`s.
+    const KEEPALIVE: [u8; 20] = [
+        0x72, 0xfe, 0, 16, 0, 0, 0, 0, 0, 0, 2, 0xee, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+
+    /// Over TLS a response may arrive as one ISO packet carrying more than rustls' 16 KiB of
+    /// plaintext; it used to fail with "received plaintext buffer full".
+    #[test]
+    fn tls_takes_a_large_response_in_one_packet() {
+        use crate::mock_tls::{mock_tls_connection, send_in_one_packet};
+        let (mut conn, plc) = mock_tls_connection("1;6ES7 MOCK;V0.0", TIMEOUT, |mut plc| {
+            plc.recv_request();
+            let body = plc.response(
+                functioncode::GET_MULTI_VARIABLES,
+                &blob_item(vec![0x5a; 40_000]),
+            );
+            send_in_one_packet(
+                &mut plc,
+                &pdu::frame_single_pdu(protocol_version::V2, &body),
+            );
+        });
+        let data = conn.read_area(Area::Memory, 0, 40_000).unwrap();
+        assert_eq!(data, vec![0x5a; 40_000]);
+        plc.join().unwrap();
+    }
+
+    /// A SystemEvent between the chunks of a TLS response is skipped, and the response
+    /// reassembled from the chunks around it; a fatal one ends the connection.
+    #[test]
+    fn tls_cuts_a_system_event_out_of_a_response() {
+        use crate::mock_tls::mock_tls_connection;
+        let (mut conn, plc) = mock_tls_connection("1;6ES7 MOCK;V0.0", TIMEOUT, |mut plc| {
+            plc.recv_request();
+            let body = plc.response(functioncode::GET_MULTI_VARIABLES, &blob_item(vec![1, 2, 3]));
+            plc.send_chunked(&body, 8, &KEEPALIVE);
+            plc.recv_request();
+            let body = plc.response(functioncode::GET_MULTI_VARIABLES, &blob_item(vec![4]));
+            // A data struct (`00 00 00 17`, struct id 40300, no members): fatal.
+            let mut fatal = vec![0x72, 0xfe, 0, 28];
+            fatal.extend_from_slice(&[0; 16]);
+            fatal.extend_from_slice(&[0, 0, 0, 0x17, 0, 0, 0x9d, 0x6c, 0, 0, 0, 0]);
+            plc.send_chunked(&body, 8, &fatal);
+        });
+        assert_eq!(conn.read_area(Area::Memory, 0, 3).unwrap(), [1, 2, 3]);
+        let e = conn.read_area(Area::Memory, 0, 1).unwrap_err();
+        assert!(matches!(e, Error::Closed(_)), "{e}");
+        assert!(e.to_string().contains("SystemEvent"), "{e}");
+        plc.join().unwrap();
+    }
+
+    /// A PLC that ends the TLS session (close_notify) while a notification poll waits makes the
+    /// poll fail as a lost connection at once, instead of timing out again and again.
+    #[test]
+    fn tls_close_notify_ends_a_notification_poll() {
+        use crate::mock_tls::mock_tls_connection;
+        let (mut conn, plc) = mock_tls_connection("1;6ES7 MOCK;V0.0", TIMEOUT, |mut plc| {
+            plc.close_notify();
+            std::thread::sleep(Duration::from_millis(1500)); // the TCP connection stays open
+        });
+        let started = std::time::Instant::now();
+        let e = conn.next_any_notification().unwrap_err();
+        assert!(matches!(e, Error::Closed(_)), "{e}");
+        assert!(!e.is_timeout());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(conn.is_poisoned());
+        plc.join().unwrap();
+    }
+
+    /// The PLC closing the TCP connection is a lost connection, also for a notification poll.
+    #[test]
+    fn a_closed_socket_ends_a_notification_poll() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |_| {});
+        plc.join().unwrap();
+        let e = conn.next_any_notification().unwrap_err();
+        assert!(matches!(e, Error::Closed(_)), "{e}");
+        assert!(e.is_connection_lost());
+        assert!(conn.is_poisoned());
+    }
+
+    /// A SystemEvent between two chunks of a telegram is reported on its own, so the caller can
+    /// cut it out; it used to be joined to the telegram's body.
+    #[test]
+    fn scan_telegram_reports_a_system_event_between_chunks() {
+        let event = [0x72, 0xfe, 0, 2, 0xaa, 0xbb];
+        let t = [
+            &[0x72, 2, 0, 2, 9, 9][..],
+            &event,
+            &[0x72, 2, 0, 1, 8, 0x72, 2, 0, 0],
+        ]
+        .concat();
+        // Until the event is complete, more bytes are needed.
+        for cut in 0..10 {
+            assert_eq!(scan_telegram(&t[..cut]).unwrap(), None, "cut {cut}");
+        }
+        assert_eq!(
+            scan_telegram(&t).unwrap(),
+            Some(Scanned::SystemEvent { start: 6, end: 12 })
+        );
+        // A SystemEvent first is one too.
+        assert_eq!(
+            scan_telegram(&event).unwrap(),
+            Some(Scanned::SystemEvent { start: 0, end: 6 })
+        );
+    }
+
+    #[test]
+    fn scan_telegram_requires_one_version_per_telegram() {
+        let mixed = [0x72, 2, 0, 1, 9, 0x72, 3, 0, 1, 8, 0x72, 2, 0, 0];
+        assert!(matches!(scan_telegram(&mixed), Err(Error::Framing(_))));
+        let mixed_trailer = [0x72, 2, 0, 1, 9, 0x72, 3, 0, 0];
+        assert!(matches!(
+            scan_telegram(&mixed_trailer),
+            Err(Error::Framing(_))
+        ));
     }
 }

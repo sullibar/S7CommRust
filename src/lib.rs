@@ -80,6 +80,9 @@ mod logging;
 // Test-only: a mock legacy PLC on loopback, scripted per test or driven by firmware profiles.
 #[cfg(test)]
 mod mock_plc;
+// Test-only: a mock TLS PLC on loopback, for the TLS transport and legitimation.
+#[cfg(test)]
+mod mock_tls;
 
 pub use connection::{Connection, CpuState, DataBlock, Subscription, VarInfo};
 pub use error::{Error, Result};
@@ -89,6 +92,7 @@ pub use proto::{
     Alarm, AlarmState, AlarmText, Area, AssociatedValue, Notification, SubscriptionItem,
     SystemEvent,
 };
+pub use transport::tls::set_tls_key_logging;
 
 /// This crate's version, for logs and bug reports.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
