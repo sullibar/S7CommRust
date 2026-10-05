@@ -48,6 +48,8 @@ pub(crate) struct IsoTcp {
     rx: Vec<u8>,
     /// DT fragments of the TSDU being reassembled (no EOT seen yet).
     tsdu: Vec<u8>,
+    /// The socket's read and write timeout, as last set.
+    timeout: Duration,
 }
 
 impl IsoTcp {
@@ -91,6 +93,7 @@ impl IsoTcp {
             max_dt_payload: PROPOSED_TPDU_SIZE - COTP_DT_HEADER.len(),
             rx: Vec::new(),
             tsdu: Vec::new(),
+            timeout,
         };
         this.iso_connect(calling_tsap, called_tsap)?;
         Ok(this)
@@ -151,6 +154,17 @@ impl IsoTcp {
             }
         }
         self.stream.flush()?;
+        Ok(())
+    }
+
+    /// Set the socket's read and write timeout (a no-op if it already is `timeout`). It applies
+    /// to each socket read or write, not to a whole request. Zero is an error.
+    pub fn set_timeout(&mut self, timeout: Duration) -> Result<()> {
+        if timeout != self.timeout {
+            self.stream.set_read_timeout(Some(timeout))?;
+            self.stream.set_write_timeout(Some(timeout))?;
+            self.timeout = timeout;
+        }
         Ok(())
     }
 

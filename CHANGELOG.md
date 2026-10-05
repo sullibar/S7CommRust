@@ -55,6 +55,10 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- `Connection::set_timeouts(request, notification_poll)`: separate socket timeouts for requests
+  and for notification polls (until now the connect timeout bounded both), so a poll loop can
+  wait briefly without shortening the time a request may take, or the other way round. Kept
+  across a reconnect.
 - `Connection::refresh_caches_if_program_changed`: clears the cached data-block list, type info
   and resolved symbols if the PLC program changed — the data blocks' names, numbers or ids, or
   the modification time of a cached block's type info (attribute 529). Resolved addresses carry

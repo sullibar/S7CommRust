@@ -182,6 +182,13 @@ const REAL_PLC_PUBLIC_KEY_LEN: usize = 40;
 /// A resolved symbol: its address and the leaf member's type-info element (none for a bare DB).
 type ResolvedSymbol = (ItemAddress, Option<crate::proto::VartypeElement>);
 
+/// Which of the [`Connection::set_timeouts`] a socket wait uses.
+#[derive(Clone, Copy)]
+enum Timeout {
+    Request,
+    NotificationPoll,
+}
+
 /// A request built by [`Connection::build_request`], with the ids it was given.
 struct BuiltRequest {
     /// The framed request telegram.
@@ -286,6 +293,9 @@ struct Settings {
     read_batch: usize,
     /// Most variables a browse returns (see [`Connection::set_browse_limit`]).
     max_browse_vars: usize,
+    /// `(request, notification poll)` socket timeouts (see [`Connection::set_timeouts`]); `None`
+    /// keeps the connect timeout for both.
+    timeouts: Option<(Duration, Duration)>,
 }
 
 impl Default for Settings {
@@ -294,6 +304,7 @@ impl Default for Settings {
             auto_reconnect: false,
             read_batch: READ_BATCH,
             max_browse_vars: DEFAULT_MAX_BROWSE_VARS,
+            timeouts: None,
         }
     }
 }
@@ -819,6 +830,32 @@ impl Connection {
     /// reconnect.
     pub fn set_auto_reconnect(&mut self, enabled: bool) {
         self.settings.auto_reconnect = enabled;
+    }
+
+    /// Use separate socket timeouts for requests and for notification polls, instead of the
+    /// timeout given at connect for everything. `request` bounds each wait for (part of) a
+    /// response, and each socket write; a request that runs into it poisons the connection.
+    /// `notification_poll` bounds each wait in [`Connection::next_notification`] /
+    /// [`Connection::next_any_notification`], which then fail with a retryable timeout — so it
+    /// can be short for a responsive poll loop (or long for rare alarms) without loosening the
+    /// request timeout. Both apply per socket read, not to a whole operation, and are kept by
+    /// [`Connection::reconnect`]; connecting itself always uses the connect timeout. Zero is an
+    /// error.
+    pub fn set_timeouts(&mut self, request: Duration, notification_poll: Duration) -> Result<()> {
+        if request.is_zero() || notification_poll.is_zero() {
+            return Err(Error::protocol("timeouts must be longer than zero"));
+        }
+        self.settings.timeouts = Some((request, notification_poll));
+        Ok(())
+    }
+
+    /// Put the socket timeout for `what` in place (see [`Connection::set_timeouts`]).
+    fn use_timeout(&mut self, what: Timeout) -> Result<()> {
+        match (self.settings.timeouts, what) {
+            (None, _) => Ok(()),
+            (Some((request, _)), Timeout::Request) => self.tcp.set_timeout(request),
+            (Some((_, poll)), Timeout::NotificationPoll) => self.tcp.set_timeout(poll),
+        }
     }
 
     /// The exported `EXPERIMENTAL_OMS` keying material (for TLS legitimation). Errors on a legacy
@@ -1421,6 +1458,7 @@ impl Connection {
         let bytes = match queued.and_then(|i| self.pending_notifications.remove(i)) {
             Some((_, bytes)) => bytes,
             None => loop {
+                self.use_timeout(Timeout::NotificationPoll)?;
                 let bytes = match self.recv_notification_telegram() {
                     Ok(b) => b,
                     Err(e) => {
@@ -1508,6 +1546,7 @@ impl Connection {
         );
         log::trace!("→ {}", pdu::Hex(framed));
         let wire = self.encode_for_transport(framed)?;
+        self.use_timeout(Timeout::Request)?;
         self.send_encoded(wire).map_err(|e| self.poison(e))
     }
 
@@ -2839,6 +2878,7 @@ impl Connection {
         }
         // Nothing has gone out if the request can't be encoded, so the connection stays usable.
         let wire = self.encode_for_transport(framed_request)?;
+        self.use_timeout(Timeout::Request)?;
         let started = std::time::Instant::now();
         let result = self.request_response_inner(framed_request, wire);
         let ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -4872,6 +4912,29 @@ mod tests {
         assert!(!e.is_timeout());
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(conn.is_poisoned());
+        plc.join().unwrap();
+    }
+
+    /// A short notification-poll timeout doesn't shorten the request timeout, and the other way
+    /// round.
+    #[test]
+    fn requests_and_notification_polls_have_their_own_timeouts() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            let req = plc.recv_request();
+            std::thread::sleep(Duration::from_millis(500)); // longer than the poll timeout
+            assert_eq!(item_count(&req), 1);
+            let mut rest = blob_item(vec![9]);
+            rest.truncate(rest.len() - 1);
+            plc.send(&plc.reply(functioncode::GET_MULTI_VARIABLES, &rest));
+        });
+        assert!(conn.set_timeouts(Duration::ZERO, TIMEOUT).is_err());
+        conn.set_timeouts(Duration::from_secs(5), Duration::from_millis(150))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let e = conn.next_any_notification().unwrap_err();
+        assert!(e.is_timeout(), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(conn.read_area(Area::Memory, 0, 1).unwrap(), [9]);
         plc.join().unwrap();
     }
 
