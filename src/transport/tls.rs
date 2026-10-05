@@ -108,12 +108,14 @@ impl TlsChannel {
         Ok(())
     }
 
-    /// The negotiated protocol version, cipher suite and the PLC certificate's fingerprint, for logs.
+    /// The negotiated protocol version, cipher suite and the PLC certificate's fingerprint, for logs
+    /// (the fingerprint identifies the device, so it is left out under [`crate::set_log_redaction`]).
     pub fn describe(&self) -> String {
-        let fingerprint = self
-            .peer_certificate_sha256()
-            .map(|fp| fp.iter().map(|b| format!("{b:02x}")).collect::<String>())
-            .unwrap_or_else(|| "none".into());
+        let fingerprint = match self.peer_certificate_sha256() {
+            Some(_) if crate::logging::redacting() => "<certificate>".into(),
+            Some(fp) => fp.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            None => "none".into(),
+        };
         let version = self
             .conn
             .protocol_version()

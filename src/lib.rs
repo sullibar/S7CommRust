@@ -75,9 +75,11 @@ pub mod wire;
 
 // Non-TLS legacy dialect — internal implementation behind `Connection::connect_legacy`.
 pub(crate) mod legacy;
+mod logging;
 
 pub use connection::{Connection, CpuState, DataBlock, Subscription, VarInfo};
 pub use error::{Error, Result};
+pub use logging::set_log_redaction;
 pub use optimized::decompress_blob;
 pub use proto::{
     Alarm, AlarmState, AlarmText, Area, AssociatedValue, Notification, SubscriptionItem,

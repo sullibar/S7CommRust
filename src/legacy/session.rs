@@ -281,11 +281,20 @@ pub(crate) fn recv_response(tcp: &mut IsoTcp) -> Result<Vec<u8>> {
         let t = tcp.recv_iso_packet()?;
         if t.get(1) == Some(&0xfe) {
             if crate::proto::parse_system_event(&t).is_ok_and(|ev| ev.is_fatal()) {
+                log::debug!(
+                    "legacy: fatal SystemEvent ({} bytes): {}",
+                    t.len(),
+                    crate::wire::pdu::UnredactedHex(&t)
+                );
                 return Err(Error::closed(
                     "PLC sent a fatal SystemEvent; connection must be re-established",
                 ));
             }
-            log::debug!("legacy: skipped SystemEvent ({} bytes)", t.len());
+            log::debug!(
+                "legacy: skipped SystemEvent ({} bytes): {}",
+                t.len(),
+                crate::wire::pdu::UnredactedHex(&t)
+            );
             continue;
         }
         return Ok(t);
@@ -320,6 +329,7 @@ fn accumulate_chunks(
         let len = u16::from_be_bytes([payload[i + 2], payload[i + 3]]) as usize;
         i += 4;
         if len == 0 {
+            log::trace!("legacy: trailer ({}-byte telegram)", payload.len());
             return Ok(true); // trailer => PDU complete
         }
         if i + len > payload.len() {
@@ -339,6 +349,13 @@ fn accumulate_chunks(
             None => partial.digests.insert(ResponseDigests::new(session_key)?),
         };
         digests.verify(digest, fragment)?;
+        // The chunk sizes a PLC uses, and how it packs chunks into telegrams, are what the mock
+        // PLC's profiles need; field logs are the only place to measure them.
+        log::trace!(
+            "legacy: chunk with {} fragment bytes ({}-byte telegram)",
+            fragment.len(),
+            payload.len()
+        );
         partial.body.extend_from_slice(fragment);
     }
     Ok(false) // no trailer in this telegram => more telegrams follow

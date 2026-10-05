@@ -24,7 +24,7 @@ pub fn info(conn: &mut Connection) -> Result<()> {
     match cpu_module(conn) {
         Ok(Some(m)) => out!(
             "CPU module:       {} — {} — firmware {}",
-            m.name.as_deref().unwrap_or("?"),
+            crate::privacy::name(m.name.as_deref().unwrap_or("?")),
             m.order_number.as_deref().unwrap_or("?"),
             m.firmware.as_deref().unwrap_or("?")
         ),
@@ -34,7 +34,7 @@ pub fn info(conn: &mut Connection) -> Result<()> {
     match conn.peer_certificate_sha256() {
         Some(fp) => out!(
             "transport:        TLS, certificate SHA-256 {}",
-            crate::hex(&fp).replace(' ', "")
+            crate::privacy::certificate(crate::hex(&fp).replace(' ', ""))
         ),
         None => out!("transport:        legacy (non-TLS)"),
     }
@@ -128,7 +128,8 @@ fn normalize_order(s: &str) -> String {
 
 /// The order number and firmware version in a module's identification record. On PLCSIM
 /// Advanced it reads `… "6ES7 511-1AK02-0AB0" + spaces, 00 00, 'V' 02 08 00 …`, which is
-/// firmware V2.8.0. Real CPUs may lay it out differently; the session log has the raw bytes.
+/// firmware V2.8.0. Other CPUs may lay it out differently; a session log written with --full-log
+/// has the raw bytes.
 fn identification(data: &[u8]) -> (Option<String>, Option<String>) {
     let Some(start) = data.windows(4).position(|w| w == b"6ES7") else {
         return (None, None);
@@ -168,7 +169,7 @@ pub fn report(conn: &mut Connection) -> Result<()> {
         ("device tree", |c| {
             let resp = c.explore(DEVICE_TREE, 1, 0, &[])?;
             out!(
-                "{} object(s); the session log has them in full",
+                "{} object(s); a session log written with --full-log has them in full",
                 resp.objects.len()
             );
             Ok(())

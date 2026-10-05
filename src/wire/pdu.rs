@@ -280,24 +280,54 @@ pub fn function_name(code: u16) -> &'static str {
 /// Most bytes [`Hex`] shows; a reassembled Explore can run to hundreds of kilobytes.
 const HEX_DUMP_MAX: usize = 64 * 1024;
 
-/// Bytes as space-separated hex for logs, cut off after [`HEX_DUMP_MAX`] bytes. Formatting is
-/// lazy, so a `log::trace!("{}", Hex(..))` costs nothing while trace logging is off.
+/// What [`Hex`] keeps of a telegram while log redaction is on: the `72 <ver> <len>` framing and
+/// the PDU header. A request's header ends at its transport flags (opcode, function, sequence
+/// number, session id); a response's is four bytes shorter, so its dump also shows the return
+/// value and at most the first item's number and flags, never a value (checked on the field logs).
+const REDACTED_DUMP_LEN: usize = 18;
+
+/// A telegram as space-separated hex for logs, cut off after [`HEX_DUMP_MAX`] bytes, or after its
+/// PDU header while [`crate::set_log_redaction`] is on (the rest carries project data). Formatting
+/// is lazy, so a `log::trace!("{}", Hex(..))` costs nothing while trace logging is off.
 pub(crate) struct Hex<'a>(pub &'a [u8]);
 
 impl std::fmt::Display for Hex<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let shown = &self.0[..self.0.len().min(HEX_DUMP_MAX)];
-        for (i, b) in shown.iter().enumerate() {
-            if i > 0 {
-                f.write_str(" ")?;
-            }
-            write!(f, "{b:02x}")?;
+        if crate::logging::redacting() {
+            write_hex(f, self.0, REDACTED_DUMP_LEN, "bytes not logged")
+        } else {
+            write_hex(f, self.0, HEX_DUMP_MAX, "more bytes")
         }
-        if shown.len() < self.0.len() {
-            write!(f, " … ({} more bytes)", self.0.len() - shown.len())?;
-        }
-        Ok(())
     }
+}
+
+/// Bytes that carry no project data (a SystemEvent, a session parameter), as hex for logs: like
+/// [`Hex`], but kept whole while redaction is on.
+pub(crate) struct UnredactedHex<'a>(pub &'a [u8]);
+
+impl std::fmt::Display for UnredactedHex<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write_hex(f, self.0, HEX_DUMP_MAX, "more bytes")
+    }
+}
+
+fn write_hex(
+    f: &mut std::fmt::Formatter<'_>,
+    bytes: &[u8],
+    max: usize,
+    rest: &str,
+) -> std::fmt::Result {
+    let shown = &bytes[..bytes.len().min(max)];
+    for (i, b) in shown.iter().enumerate() {
+        if i > 0 {
+            f.write_str(" ")?;
+        }
+        write!(f, "{b:02x}")?;
+    }
+    if shown.len() < bytes.len() {
+        write!(f, " … ({} {rest})", bytes.len() - shown.len())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -306,10 +336,53 @@ mod tests {
 
     #[test]
     fn hex_dumps_are_capped() {
-        assert_eq!(Hex(&[0x72, 0x02, 0xab]).to_string(), "72 02 ab");
-        assert_eq!(Hex(&[]).to_string(), "");
+        assert_eq!(UnredactedHex(&[0x72, 0x02, 0xab]).to_string(), "72 02 ab");
+        assert_eq!(UnredactedHex(&[]).to_string(), "");
         let long = vec![0u8; HEX_DUMP_MAX + 3];
-        assert!(Hex(&long).to_string().ends_with("00 … (3 more bytes)"));
+        assert!(UnredactedHex(&long)
+            .to_string()
+            .ends_with("00 … (3 more bytes)"));
+    }
+
+    // The only test that turns redaction on (it is process-wide); no other test checks what
+    // `Hex` or `logging::name` print.
+    #[test]
+    fn redaction_keeps_only_the_pdu_header() {
+        let telegram = frame_single_pdu(
+            protocol_version::V2,
+            &[
+                opcode::RESPONSE,
+                0,
+                0,
+                0x05,
+                0x4c,
+                0,
+                0,
+                0,
+                7,
+                0,
+                0,
+                0x03,
+                0xd2,
+                0x34,
+                0,
+                0xaa,
+                0xbb,
+            ],
+        );
+        crate::set_log_redaction(true);
+        let redacted = Hex(&telegram).to_string();
+        let name = crate::logging::name("Motor_1").to_owned();
+        let event = UnredactedHex(&telegram).to_string();
+        crate::set_log_redaction(false);
+        assert_eq!(
+            redacted,
+            "72 02 00 11 32 00 00 05 4c 00 00 00 07 00 00 03 d2 34 … (7 bytes not logged)"
+        );
+        assert_eq!(name, "<name>");
+        assert!(event.contains("aa bb"), "{event}");
+        assert!(Hex(&telegram).to_string().contains("aa bb"));
+        assert_eq!(crate::logging::name("Motor_1"), "Motor_1");
     }
 
     #[test]

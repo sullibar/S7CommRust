@@ -23,20 +23,23 @@ use s7commplus::{
     Alarm, Area, AssociatedValue, Connection, CpuState, Error, Result, SubscriptionItem, VarInfo,
 };
 
-/// Print a line, and record it in the session log.
+/// Print a line, and record it in the session log (where [`privacy::Private`] parts of it become
+/// placeholders).
 macro_rules! out {
     () => {
         out!("")
     };
     ($($arg:tt)*) => {{
         let line = format!($($arg)*);
-        println!("{line}");
+        println!("{}", crate::privacy::screen(&line));
         log::info!(target: "s7tool::out", "{line}");
     }};
 }
 
 mod diag;
 mod logfile;
+mod privacy;
+mod probe;
 
 const PROMPT: &str = "s7> ";
 
@@ -54,7 +57,7 @@ fn main() {
             logfile::to_stderr();
             None
         }
-        Log::File(path) => match logfile::to_file(path.as_deref()) {
+        Log::File(path) => match logfile::to_file(path.as_deref(), !cfg.full_log) {
             Ok(path) => {
                 eprintln!("session log: {}", path.display());
                 Some(path)
@@ -65,6 +68,8 @@ fn main() {
             }
         },
     };
+    // The address may come from the environment rather than the command line.
+    let _ = privacy::plc(&cfg.ip);
     logfile::header(&std::env::args().skip(1).collect::<Vec<_>>());
     let result = run(cfg);
     if let Err(e) = &result {
@@ -100,6 +105,8 @@ struct Config {
     /// Try TLS, then the legacy real-PLC and PLCSIM schemes, until one connects.
     auto: bool,
     log: Log,
+    /// Keep project data, addresses and paths in the session log (`--full-log`).
+    full_log: bool,
     command: Vec<String>,
 }
 
@@ -117,6 +124,7 @@ impl Config {
         let mut pin = std::env::var("S7_PLC_CERT_SHA256").ok();
         let mut auto = false;
         let mut log = Log::File(None);
+        let mut full_log = false;
         let mut command = Vec::new();
 
         let mut args = std::env::args().skip(1);
@@ -133,6 +141,7 @@ impl Config {
                 "--auto" => auto = true,
                 "--log" => log = Log::File(Some(args.next().ok_or("--log needs a path")?.into())),
                 "--no-log" => log = Log::Off,
+                "--full-log" => full_log = true,
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -173,6 +182,7 @@ impl Config {
             pin,
             auto,
             log,
+            full_log,
             command,
         })
     }
@@ -188,7 +198,11 @@ fn run(cfg: Config) -> Result<()> {
     } else {
         "TLS"
     };
-    out!("connecting to {}:{} ({mode}) ...", cfg.ip, cfg.port);
+    out!(
+        "connecting to {}:{} ({mode}) ...",
+        privacy::plc(&cfg.ip),
+        cfg.port
+    );
     let timeout = Duration::from_secs(10);
     let mut conn = if cfg.auto {
         connect_auto((cfg.ip.as_str(), cfg.port), timeout)?
@@ -217,7 +231,12 @@ fn run(cfg: Config) -> Result<()> {
     // Over TLS, show the certificate fingerprint to pin with --pin.
     let certificate = conn
         .peer_certificate_sha256()
-        .map(|fp| format!(", certificate SHA-256 = {}", hex(&fp).replace(' ', "")))
+        .map(|fp| {
+            format!(
+                ", certificate SHA-256 = {}",
+                privacy::certificate(hex(&fp).replace(' ', ""))
+            )
+        })
         .unwrap_or_default();
     out!(
         "connected — session_id = 0x{:08x}{certificate}",
@@ -336,7 +355,7 @@ fn repl(conn: &mut Connection) -> Result<()> {
 
 /// Run one command (`cmd[0]` is the verb, the rest are arguments).
 fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
-    log::info!(target: "s7tool", "> {}", logfile::mask_secrets(cmd).join(" "));
+    log::info!(target: "s7tool", "> {}", logfile::command_for_log(cmd));
     match cmd[0].as_str() {
         "help" | "?" => {
             print_help();
@@ -388,7 +407,11 @@ fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
                 };
                 std::fs::write(&path, data)
                     .map_err(|e| Error::Protocol(format!("write {path}: {e}")))?;
-                out!("wrote {} bytes (obj 0x{objrel:08x}) -> {path}", data.len());
+                out!(
+                    "wrote {} bytes (obj 0x{objrel:08x}) -> {}",
+                    data.len(),
+                    privacy::path(&path)
+                );
             }
             if blobs.is_empty() {
                 out!("no blob attribute {attr} found under 0x{relid:08x}");
@@ -420,7 +443,7 @@ fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
                         data.len()
                     );
                     match inflate_metadata_blob(&data) {
-                        Ok(xml) => out!("\n{xml}\n"),
+                        Ok(xml) => out!("\n{}\n", privacy::text(xml)),
                         Err(e) => out!(" <decompress failed: {e}>"),
                     }
                 }
@@ -435,6 +458,7 @@ fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
         "xverify" => xverify(conn),
         "info" => diag::info(conn),
         "report" => diag::report(conn),
+        "probe" => probe::probe(conn),
         "browse" => browse(conn, cmd.get(1).map(String::as_str)),
         "read" => {
             if cmd.len() < 2 {
@@ -506,7 +530,10 @@ fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
                 out!("usage: rawread <DB<n>|I|Q|M> <start> <len>");
                 return Ok(());
             };
-            out!("{}", hex(&conn.read_area(area, start, len)?));
+            out!(
+                "{}",
+                privacy::value(hex(&conn.read_area(area, start, len)?))
+            );
             Ok(())
         }
         "rawwrite" => {
@@ -526,7 +553,7 @@ fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
             Ok(())
         }
         other => {
-            out!("unknown command '{other}' — type 'help'");
+            out!("unknown command '{}' — type 'help'", privacy::name(other));
             Ok(())
         }
     }
@@ -550,7 +577,7 @@ fn xverify(conn: &mut Connection) -> Result<()> {
                 bad += 1;
                 out!(
                     "MISMATCH {}: browse lids={:?} area=0x{:x}  resolve lids={:?} area=0x{:x}",
-                    v.name,
+                    privacy::name(&v.name),
                     v.lids,
                     v.access_area,
                     addr.lid,
@@ -559,7 +586,7 @@ fn xverify(conn: &mut Connection) -> Result<()> {
             }
             Err(e) => {
                 bad += 1;
-                out!("UNRESOLVED {}: {e}", v.name);
+                out!("UNRESOLVED {}: {e}", privacy::name(&v.name));
             }
         }
     }
@@ -587,9 +614,9 @@ fn list_dbs(conn: &mut Connection) -> Result<()> {
     }
     for db in &dbs {
         out!(
-            "DB{:<5} {:<26} relid=0x{:08x}  ti=0x{:08x}",
+            "DB{:<5} {} relid=0x{:08x}  ti=0x{:08x}",
             db.number,
-            db.name,
+            privacy::name(&db.name).padded(26),
             db.relid,
             db.ti_relid
         );
@@ -612,7 +639,7 @@ fn browse(conn: &mut Connection, target: Option<&str>) -> Result<()> {
         }
         out!(
             "DB \"{}\" (DB{}, relid 0x{:08x}):",
-            db.name,
+            privacy::name(&db.name),
             db.number,
             db.relid
         );
@@ -672,8 +699,12 @@ fn print_values(conn: &mut Connection, vars: &[VarInfo], strip: Option<&str>) {
             None => &var.name,
         };
         let tname = sdt_name(var.softdatatype);
+        let disp = privacy::name(disp);
         match val {
-            Some(v) => out!("  {disp} : {tname} = {}", fmt_typed(var.softdatatype, &v)),
+            Some(v) => out!(
+                "  {disp} : {tname} = {}",
+                privacy::value(fmt_typed(var.softdatatype, &v))
+            ),
             None => out!("  {disp} : {tname} -> (no value / not readable)"),
         }
     }
@@ -740,14 +771,18 @@ fn subscribe_demo(
                 .get(ref_id)
                 .cloned()
                 .unwrap_or_else(|| (format!("ref#{ref_id}"), 0));
-            out!("   {name} = {}", fmt_typed(sdt, val));
+            out!(
+                "   {} = {}",
+                privacy::name(&name),
+                privacy::value(fmt_typed(sdt, val))
+            );
         }
         for (ref_id, code) in &n.errors {
             let name = meta
                 .get(ref_id)
                 .map(|(n, _)| n.clone())
                 .unwrap_or_else(|| format!("ref#{ref_id}"));
-            out!("   {name} -> error 0x{code:02x}");
+            out!("   {} -> error 0x{code:02x}", privacy::name(&name));
         }
     }
     Ok(())
@@ -798,11 +833,11 @@ fn print_alarm(a: &Alarm) {
         .message(1033)
         .or_else(|| a.texts.first().and_then(|t| a.message(t.language_id)));
     if let Some(msg) = text.filter(|m| !m.trim().is_empty()) {
-        out!("      text: {msg}");
+        out!("      text: {}", privacy::text(msg));
     }
     for (i, v) in a.associated_values.iter().enumerate() {
         if *v != AssociatedValue::Unused {
-            out!("      SD_{} = {v}", i + 1);
+            out!("      SD_{} = {}", i + 1, privacy::value(v));
         }
     }
 }
@@ -812,9 +847,14 @@ fn read_one(conn: &mut Connection, sym: &str) {
     let read = conn
         .resolve_var(sym)
         .and_then(|var| Ok((var.softdatatype, conn.read_tag(sym)?)));
+    let name = privacy::name(sym);
     match read {
-        Ok((ty, v)) => out!("  {sym} : {} = {}", sdt_name(ty), fmt_typed(ty, &v)),
-        Err(e) => out!("  {sym} -> ERROR: {e}"),
+        Ok((ty, v)) => out!(
+            "  {name} : {} = {}",
+            sdt_name(ty),
+            privacy::value(fmt_typed(ty, &v))
+        ),
+        Err(e) => out!("  {name} -> ERROR: {e}"),
     }
 }
 
@@ -852,7 +892,11 @@ fn write_one(conn: &mut Connection, sym: &str, input: &str) -> Result<()> {
             conn.write_tag(sym, value)?;
         }
     }
-    out!("  {sym} := {}", fmt_typed(ty, &conn.read_tag(sym)?));
+    out!(
+        "  {} := {}",
+        privacy::name(sym),
+        privacy::value(fmt_typed(ty, &conn.read_tag(sym)?))
+    );
     Ok(())
 }
 
@@ -1043,7 +1087,7 @@ fn print_usage() {
          \n\
          USAGE:\n\
          \x20   s7tool [--ip <addr>] [--port <n>] [--auto | --legacy | --real-plc | --pin <sha256>]\n\
-         \x20          [--log <file> | --no-log] [COMMAND ...]\n\
+         \x20          [--log <file>] [--full-log | --no-log] [COMMAND ...]\n\
          \n\
          CONNECTION (flags must precede the command):\n\
          \x20   -i, --ip <addr>     PLC address           (or env S7_PLC_IP)\n\
@@ -1062,8 +1106,12 @@ fn print_usage() {
          \n\
          SESSION LOG:\n\
          \x20   Every run writes s7tool-<UTC time>.log in the current directory: each request\n\
-         \x20   and response with its bytes, and everything s7tool prints. No passwords or keys.\n\
+         \x20   and response, and everything s7tool prints. It is safe to send on: tag and\n\
+         \x20   block names, values and alarm texts become placeholders, IP addresses, paths\n\
+         \x20   and your user name are replaced, and telegrams are logged only up to their\n\
+         \x20   header. The screen still shows everything. No passwords or keys, ever.\n\
          \x20       --log <file>    write it to <file> instead\n\
+         \x20       --full-log      keep names, values, addresses and whole telegrams in it\n\
          \x20       --no-log        don't write one\n\
          \n\
          With no COMMAND, s7tool connects and opens an interactive prompt.\n"
@@ -1100,6 +1148,8 @@ fn help_body() -> &'static str {
     "COMMANDS:\n\
      \x20   info                what the PLC is (order number, firmware) and the session\n\
      \x20   report              run every read-only command below in turn, for the log\n\
+     \x20   probe               read-only: how the PLC answers a read over its item limit and\n\
+     \x20                       byte reads at the edges of M and of each DB (for the mock PLC)\n\
      \x20   browse [DB|M|Q|I]   recursively list tags with their current values\n\
      \x20   dbs                 list the data blocks\n\
      \x20   read <sym>...       read one or more tags by symbol name\n\
