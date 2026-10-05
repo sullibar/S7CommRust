@@ -3318,7 +3318,8 @@ fn notification_subscription_id(buf: &[u8]) -> Option<u32> {
 /// follow the name (`"my arr"[2]`).
 ///
 /// Whitespace around a level is ignored (`DB . x` is `DB.x`), but kept inside a name and inside
-/// quotes. Each level must be a whole name: an empty level (`DB..x`, a leading or trailing `.`),
+/// quotes. Each level must be a whole name: an empty level (`DB..x`, a leading or trailing `.`;
+/// a member whose name really is empty is written `""`),
 /// a quoted name with anything but `.`, `[` or the end after it (`"DB"x`), a quote in the middle
 /// of a name, or an unterminated quote or `[` are errors — the old parser silently joined or
 /// dropped such parts, which could address another variable.
@@ -3346,9 +3347,8 @@ fn parse_symbol_path(symbol: &str) -> Result<Vec<(String, Vec<i32>)>> {
                     None => return Err(bad("unterminated quote".into())),
                 }
             }
-            if name.is_empty() {
-                return Err(bad("empty quoted name".into()));
-            }
+            // `""` is a deliberately empty name: the PLC has such members (an unnamed level
+            // inside a Program_Alarm instance, browsed as `alarm."".Alarm_ID`).
         } else {
             while let Some(c) = chars.next_if(|c| !matches!(c, '.' | '[' | ']' | '"')) {
                 name.push(c);
@@ -3575,11 +3575,22 @@ mod tests {
     #[test]
     fn parse_symbol_path_requires_whole_levels() {
         for bad in [
-            "\"DB\"x", "\"DB\" x", "ab\"cd\"", "DB..x", ".x", "x.", "DB. .x", "", "  ", "\"\".x",
-            "DB.x]", "DB.\"x",
+            "\"DB\"x", "\"DB\" x", "ab\"cd\"", "DB..x", ".x", "x.", "DB. .x", "", "  ", "DB.x]",
+            "DB.\"x",
         ] {
             assert!(parse_symbol_path(bad).is_err(), "{bad:?}");
         }
+        // An explicitly quoted empty name is a member whose name is empty (a Program_Alarm
+        // instance has one), not a typo.
+        assert_eq!(
+            levels("AlarmFB_DB.alarm.\"\".Alarm_ID"),
+            [
+                lv("AlarmFB_DB", &[]),
+                lv("alarm", &[]),
+                lv("", &[]),
+                lv("Alarm_ID", &[])
+            ]
+        );
         assert_eq!(levels(" DB . x "), [lv("DB", &[]), lv("x", &[])]);
         assert_eq!(
             levels("DB.arr [2] .y"),
@@ -3608,6 +3619,7 @@ mod tests {
             "br[ack]et",
             "quo\"te",
             "\"",
+            "",
             " lead",
             "trail ",
             "a\"\"b",

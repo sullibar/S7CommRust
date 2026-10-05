@@ -347,7 +347,8 @@ All notable changes to this project are documented here. The format is based on
   (`DB..x`, a leading or trailing `.`) was accepted, and spaces around a `.` became part of the
   names. Whitespace around a level is now ignored. A `"` inside a quoted name is written doubled
   (`"a""b"`), and browsed names containing a quote or starting or ending with whitespace are
-  quoted that way, so every browsed name round-trips through `resolve_symbol`.
+  quoted that way, so every browsed name round-trips through `resolve_symbol`. A member whose
+  name is empty (a Program_Alarm instance has one) is written `""`, as browse lists it.
 - TLS: a SystemEvent the PLC sends between the chunks of a response is cut out and handled on
   its own; it used to be joined to the response, corrupting it (FW 4.2 sent keep-alives between
   chunks on the legacy transport). The chunks and trailer of one telegram must now share a
