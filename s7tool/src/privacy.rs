@@ -986,8 +986,8 @@ mod tests {
         }
         let _ = name("Main Tank");
         assert_eq!(
-            for_log("could not resolve Main Tank.x", true),
-            format!("could not resolve {}.x", p("Main Tank"))
+            for_log("could not resolve Main Tank, stopped", true),
+            format!("could not resolve {}, stopped", p("Main Tank"))
         );
         // A placeholder already in the line stays as it is, even where it looks like a name.
         let _ = name("name1");
