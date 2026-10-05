@@ -214,13 +214,25 @@ fn vlq_u64_len(b: &[u8]) -> usize {
         .map_or(9, |i| i + 1)
 }
 
+/// The length field of the one V3 chunk that would carry the V2 framed PDU `v2_framed` (marker,
+/// digest and data), or an error if it doesn't fit: a legacy request travels as a single chunk,
+/// so its data must stay under 64 KiB. Checked before a request is given its ids, so a request
+/// that can't be sent doesn't use them up.
+pub(crate) fn v3_chunk_len(v2_framed: &[u8]) -> Result<u16> {
+    let data_len = v2_framed
+        .len()
+        .checked_sub(8)
+        .ok_or_else(|| Error::protocol("legacy request shorter than its framing"))?;
+    u16::try_from(1 + 32 + data_len)
+        .map_err(|_| Error::protocol("legacy request too large for one V3 chunk (64 KiB)"))
+}
+
 /// Wrap a normal (V2) framed PDU as a legacy ProtocolVersion-`0x03` PDU carrying the HMAC
 /// digest over its data part: `72 03 <1+32+len> 20 <digest> <data> 72 03 00 00`.
 pub fn frame_v3(session_key: &[u8; 24], v2_framed: &[u8]) -> Result<Vec<u8>> {
+    let chunk_len = v3_chunk_len(v2_framed)?;
     let data = &v2_framed[4..v2_framed.len() - 4];
     let digest = packet_digest(session_key, data)?;
-    let chunk_len = u16::try_from(1 + 32 + data.len())
-        .map_err(|_| Error::protocol("legacy request too large for one V3 chunk (64 KiB)"))?;
     let mut out = vec![0x72, 0x03];
     out.extend_from_slice(&chunk_len.to_be_bytes());
     out.push(0x20);

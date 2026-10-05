@@ -150,6 +150,20 @@ const REAL_PLC_PUBLIC_KEY_LEN: usize = 40;
 /// A resolved symbol: its address and the leaf member's type-info element (none for a bare DB).
 type ResolvedSymbol = (ItemAddress, Option<crate::proto::VartypeElement>);
 
+/// A request built by [`Connection::build_request`], with the ids it was given.
+struct BuiltRequest {
+    /// The framed request telegram.
+    framed: Vec<u8>,
+}
+
+/// A telegram encoded for the transport, ready to send.
+enum Encoded {
+    /// The legacy V3 digest frame.
+    Legacy(Vec<u8>),
+    /// TLS: the S7CommPlus chunks, one TLS record each.
+    Tls(Vec<Vec<u8>>),
+}
+
 /// Default per-operation socket timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -677,11 +691,64 @@ impl Connection {
         self.sequence_number
     }
 
+    /// Allocate the next sequence number and — when the session uses them — integrity id for a
+    /// request to `function_code`, and build the request with `build(sequence_number,
+    /// with_integrity, integrity_id)`.
+    ///
+    /// The counters only move on if the request builds and fits the transport. A request that
+    /// never leaves (a value that doesn't serialize, a legacy request over 64 KiB) must not use
+    /// up ids: the PLC would see a gap in them, which it may refuse (see the mock PLC's notes on
+    /// integrity-id sensitivity).
+    fn build_request(
+        &mut self,
+        function_code: u16,
+        build: impl FnOnce(u16, bool, u32) -> Result<Vec<u8>>,
+    ) -> Result<BuiltRequest> {
+        let saved = (
+            self.sequence_number,
+            self.integrity_id,
+            self.integrity_id_set,
+        );
+        let seq = self.next_sequence_number();
+        let with_integrity = self.with_integrity;
+        let integrity = if with_integrity {
+            self.next_integrity_id(function_code)
+        } else {
+            0
+        };
+        let built = build(seq, with_integrity, integrity).and_then(|framed| {
+            self.check_sendable(&framed)?;
+            Ok(framed)
+        });
+        match built {
+            Ok(framed) => Ok(BuiltRequest { framed }),
+            Err(e) => {
+                (
+                    self.sequence_number,
+                    self.integrity_id,
+                    self.integrity_id_set,
+                ) = saved;
+                Err(e)
+            }
+        }
+    }
+
+    /// Whether the transport can carry `framed` at all: a legacy request travels as one V3 chunk,
+    /// whose length field caps it at 64 KiB. (TLS splits any request into chunks.)
+    fn check_sendable(&self, framed: &[u8]) -> Result<()> {
+        if self.legacy_session_key.is_some() {
+            crate::legacy::session::v3_chunk_len(framed)?;
+        }
+        Ok(())
+    }
+
     /// Perform CreateObject for the null server session and record the new ids.
     fn create_session(&mut self) -> Result<CreateObjectResponse> {
-        let seq = self.next_sequence_number();
-        let req = proto::build_create_session_request(seq, self.session_id, false, 0)?;
-        let resp_bytes = self.request_response(&req)?;
+        let session = self.session_id;
+        let req = self.build_request(functioncode::CREATE_OBJECT, |seq, _, _| {
+            proto::build_create_session_request(seq, session, false, 0)
+        })?;
+        let resp_bytes = self.request_response(&req.framed)?;
         let resp = proto::parse_create_object_response(&resp_bytes)?;
         if !resp.header.is_ok() {
             return Err(Error::protocol(format!(
@@ -699,9 +766,11 @@ impl Connection {
     /// Step 4b: session setup. Echo the `ServerSessionVersion` Struct back to the session
     /// object via SetMultiVariables (no integrity id), completing session establishment.
     fn setup_session(&mut self, server_session_version: &PValue) -> Result<()> {
-        let seq = self.next_sequence_number();
-        let req = proto::build_session_setup_request(seq, self.session_id, server_session_version)?;
-        let resp_bytes = self.request_response(&req)?;
+        let session = self.session_id;
+        let req = self.build_request(functioncode::SET_MULTI_VARIABLES, |seq, _, _| {
+            proto::build_session_setup_request(seq, session, server_session_version)
+        })?;
+        let resp_bytes = self.request_response(&req.framed)?;
         let resp = proto::parse_set_multi_response(&resp_bytes)?;
         if !resp.header.is_ok() {
             return Err(Error::protocol(format!(
@@ -795,21 +864,14 @@ impl Connection {
         &mut self,
         addresses: &[ItemAddress],
     ) -> Result<GetMultiVariablesResponse> {
-        let seq = self.next_sequence_number();
-        let with_integrity = self.with_integrity;
-        let integrity = if with_integrity {
-            self.next_integrity_id(functioncode::GET_MULTI_VARIABLES)
-        } else {
-            0
-        };
-        let req = proto::build_get_multi_request(
-            seq,
-            self.session_id,
-            addresses,
-            with_integrity,
-            integrity,
+        let session = self.session_id;
+        let req = self.build_request(
+            functioncode::GET_MULTI_VARIABLES,
+            |seq, with_integrity, integrity| {
+                proto::build_get_multi_request(seq, session, addresses, with_integrity, integrity)
+            },
         )?;
-        let resp_bytes = self.request_response(&req)?;
+        let resp_bytes = self.request_response(&req.framed)?;
         let resp = proto::parse_get_multi_response(&resp_bytes)?;
         if !resp.header.is_ok() {
             return Err(Error::protocol(format!(
@@ -865,22 +927,21 @@ impl Connection {
         addresses: &[ItemAddress],
         values: &[PValue],
     ) -> Result<SetMultiVariablesResponse> {
-        let seq = self.next_sequence_number();
-        let with_integrity = self.with_integrity;
-        let integrity = if with_integrity {
-            self.next_integrity_id(functioncode::SET_MULTI_VARIABLES)
-        } else {
-            0
-        };
-        let req = proto::build_set_multi_request(
-            seq,
-            self.session_id,
-            addresses,
-            values,
-            with_integrity,
-            integrity,
+        let session = self.session_id;
+        let req = self.build_request(
+            functioncode::SET_MULTI_VARIABLES,
+            |seq, with_integrity, integrity| {
+                proto::build_set_multi_request(
+                    seq,
+                    session,
+                    addresses,
+                    values,
+                    with_integrity,
+                    integrity,
+                )
+            },
         )?;
-        let resp_bytes = self.request_response(&req)?;
+        let resp_bytes = self.request_response(&req.framed)?;
         let resp = proto::parse_set_multi_response(&resp_bytes)?;
         if !resp.header.is_ok() {
             return Err(Error::protocol(format!(
@@ -921,26 +982,25 @@ impl Connection {
         route_mode: u8,
         credit_limit: i16,
     ) -> Result<Subscription> {
-        let seq = self.next_sequence_number();
-        let with_integrity = self.with_integrity;
-        let integrity = if with_integrity {
-            self.next_integrity_id(functioncode::CREATE_OBJECT)
-        } else {
-            0
-        };
-        let req = proto::build_subscription_create_request(
-            seq,
-            self.session_id,
-            self.session_id2,
-            with_integrity,
-            integrity,
-            1, // change counter (first subscription on this connection)
-            route_mode,
-            cycle_time_ms,
-            credit_limit,
-            items,
+        let (session, session2) = (self.session_id, self.session_id2);
+        let req = self.build_request(
+            functioncode::CREATE_OBJECT,
+            |seq, with_integrity, integrity| {
+                proto::build_subscription_create_request(
+                    seq,
+                    session,
+                    session2,
+                    with_integrity,
+                    integrity,
+                    1, // change counter (first subscription on this connection)
+                    route_mode,
+                    cycle_time_ms,
+                    credit_limit,
+                    items,
+                )
+            },
         )?;
-        let resp_bytes = self.request_response(&req)?;
+        let resp_bytes = self.request_response(&req.framed)?;
         let resp = proto::parse_create_object_response(&resp_bytes)?;
         if !resp.header.is_ok() {
             return Err(Error::protocol(format!(
@@ -980,22 +1040,21 @@ impl Connection {
 
     /// Like [`Connection::subscribe_alarms`] but with an explicit credit limit (`-1` = unlimited).
     pub fn subscribe_alarms_with(&mut self, credit_limit: i16) -> Result<Subscription> {
-        let seq = self.next_sequence_number();
-        let with_integrity = self.with_integrity;
-        let integrity = if with_integrity {
-            self.next_integrity_id(functioncode::CREATE_OBJECT)
-        } else {
-            0
-        };
-        let req = proto::build_alarm_subscription_create_request(
-            seq,
-            self.session_id,
-            self.session_id2,
-            with_integrity,
-            integrity,
-            credit_limit,
+        let (session, session2) = (self.session_id, self.session_id2);
+        let req = self.build_request(
+            functioncode::CREATE_OBJECT,
+            |seq, with_integrity, integrity| {
+                proto::build_alarm_subscription_create_request(
+                    seq,
+                    session,
+                    session2,
+                    with_integrity,
+                    integrity,
+                    credit_limit,
+                )
+            },
         )?;
-        let resp_bytes = self.request_response(&req)?;
+        let resp_bytes = self.request_response(&req.framed)?;
         let resp = proto::parse_create_object_response(&resp_bytes)?;
         if !resp.header.is_ok() {
             return Err(Error::protocol(format!(
@@ -1014,21 +1073,20 @@ impl Connection {
     /// Delete a server object by id (e.g. tear down a subscription, freeing it on the PLC instead
     /// of relying on the connection dropping). Uses the set-class integrity counter.
     pub fn delete_object(&mut self, object_id: u32) -> Result<()> {
-        let seq = self.next_sequence_number();
-        let with_integrity = self.with_integrity;
-        let integrity = if with_integrity {
-            self.next_integrity_id(functioncode::DELETE_OBJECT)
-        } else {
-            0
-        };
-        let req = proto::build_delete_object_request(
-            seq,
-            self.session_id,
-            object_id,
-            with_integrity,
-            integrity,
+        let session = self.session_id;
+        let req = self.build_request(
+            functioncode::DELETE_OBJECT,
+            |seq, with_integrity, integrity| {
+                proto::build_delete_object_request(
+                    seq,
+                    session,
+                    object_id,
+                    with_integrity,
+                    integrity,
+                )
+            },
         )?;
-        let resp = self.request_response(&req)?;
+        let resp = self.request_response(&req.framed)?;
         let header = proto::parse_delete_object_response(&resp)?;
         if !header.is_ok() {
             return Err(Error::protocol(format!(
@@ -1121,22 +1179,21 @@ impl Connection {
         const STEP: i16 = 5;
         let next = ((limit + STEP) % 255).max(STEP);
         self.credit_limits.insert(object_id, next);
-        let seq = self.next_sequence_number();
-        let with_integrity = self.with_integrity;
-        let integrity = if with_integrity {
-            self.next_integrity_id(functioncode::SET_VARIABLE)
-        } else {
-            0
-        };
-        let req = proto::subscription::build_credit_limit_request(
-            seq,
-            self.session_id,
-            object_id,
-            with_integrity,
-            integrity,
-            next,
+        let session = self.session_id;
+        let req = self.build_request(
+            functioncode::SET_VARIABLE,
+            |seq, with_integrity, integrity| {
+                proto::subscription::build_credit_limit_request(
+                    seq,
+                    session,
+                    object_id,
+                    with_integrity,
+                    integrity,
+                    next,
+                )
+            },
         )?;
-        if let Err(e) = self.send_no_response(&req) {
+        if let Err(e) = self.send_no_response(&req.framed) {
             self.poisoned = true;
             return Err(e);
         }
@@ -1169,69 +1226,88 @@ impl Connection {
             framed.len()
         );
         log::trace!("→ {}", pdu::Hex(framed));
-        if let Some(key) = self.legacy_session_key {
-            let v3 = crate::legacy::session::frame_v3(&key, framed)?;
-            self.tcp.send_iso_packet(&v3)
-        } else {
-            self.send_tls(framed)
+        let wire = self.encode_for_transport(framed)?;
+        self.send_encoded(wire)
+    }
+
+    /// Prepare a framed telegram for the transport, without sending anything: the legacy V3
+    /// digest frame, or the TLS chunks. A failure here leaves the connection as it was (nothing
+    /// went out), so it must not poison it.
+    fn encode_for_transport(&self, framed: &[u8]) -> Result<Encoded> {
+        match &self.legacy_session_key {
+            Some(key) => Ok(Encoded::Legacy(crate::legacy::session::frame_v3(
+                key, framed,
+            )?)),
+            None => {
+                if self.tls.is_none() {
+                    return Err(Error::protocol("no TLS channel on a non-legacy connection"));
+                }
+                Ok(Encoded::Tls(pdu::split_framed_pdu(
+                    framed,
+                    pdu::MAX_CHUNK_PAYLOAD,
+                )))
+            }
         }
     }
 
-    /// Send a framed telegram over TLS, split into chunks that each fit one COTP frame (see
-    /// [`pdu::MAX_CHUNK_PAYLOAD`]), every chunk in its own TLS record.
-    fn send_tls(&mut self, framed: &[u8]) -> Result<()> {
-        let tls = self
-            .tls
-            .as_mut()
-            .ok_or_else(|| Error::protocol("no TLS channel on a non-legacy connection"))?;
-        for chunk in pdu::split_framed_pdu(framed, pdu::MAX_CHUNK_PAYLOAD) {
-            tls.send(&mut self.tcp, &chunk)?;
+    /// Send an encoded telegram. TLS chunks each fit one COTP frame (see
+    /// [`pdu::MAX_CHUNK_PAYLOAD`]) and go in their own TLS record.
+    fn send_encoded(&mut self, wire: Encoded) -> Result<()> {
+        match wire {
+            Encoded::Legacy(v3) => self.tcp.send_iso_packet(&v3),
+            Encoded::Tls(chunks) => {
+                let tls = self
+                    .tls
+                    .as_mut()
+                    .ok_or_else(|| Error::protocol("no TLS channel on a non-legacy connection"))?;
+                for chunk in chunks {
+                    tls.send(&mut self.tcp, &chunk)?;
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     /// Read a single object attribute via GetVarSubstreamed.
     pub fn get_var_substreamed(&mut self, address: u32) -> Result<GetVarSubstreamedResponse> {
-        let seq = self.next_sequence_number();
-        let with_integrity = self.with_integrity;
-        let integrity = if with_integrity {
-            self.next_integrity_id(functioncode::GET_VAR_SUBSTREAMED)
-        } else {
-            0
-        };
-        let req = proto::build_get_var_substreamed_request(
-            protocol_version::V2,
-            seq,
-            self.session_id,
-            self.session_id, // InObjectId: read attributes of the session object
-            address,
-            with_integrity,
-            integrity,
+        let session = self.session_id;
+        let req = self.build_request(
+            functioncode::GET_VAR_SUBSTREAMED,
+            |seq, with_integrity, integrity| {
+                proto::build_get_var_substreamed_request(
+                    protocol_version::V2,
+                    seq,
+                    session,
+                    session, // InObjectId: read attributes of the session object
+                    address,
+                    with_integrity,
+                    integrity,
+                )
+            },
         )?;
-        let resp_bytes = self.request_response(&req)?;
+        let resp_bytes = self.request_response(&req.framed)?;
         proto::parse_get_var_substreamed_response(&resp_bytes)
     }
 
     /// Write a single object attribute via SetVariable.
     pub fn set_variable(&mut self, address: u32, value: &PValue) -> Result<SetVariableResponse> {
-        let seq = self.next_sequence_number();
-        let with_integrity = self.with_integrity;
-        let integrity = if with_integrity {
-            self.next_integrity_id(functioncode::SET_VARIABLE)
-        } else {
-            0
-        };
-        let req = proto::build_set_variable_request(
-            protocol_version::V2,
-            seq,
-            self.session_id,
-            self.session_id, // InObjectId: write attributes of the session object
-            address,
-            value,
-            with_integrity,
-            integrity,
+        let session = self.session_id;
+        let req = self.build_request(
+            functioncode::SET_VARIABLE,
+            |seq, with_integrity, integrity| {
+                proto::build_set_variable_request(
+                    protocol_version::V2,
+                    seq,
+                    session,
+                    session, // InObjectId: write attributes of the session object
+                    address,
+                    value,
+                    with_integrity,
+                    integrity,
+                )
+            },
         )?;
-        let resp_bytes = self.request_response(&req)?;
+        let resp_bytes = self.request_response(&req.framed)?;
         proto::parse_set_variable_response(&resp_bytes)
     }
 
@@ -1260,26 +1336,22 @@ impl Connection {
         parents: u8,
         attrs: &[u32],
     ) -> Result<Vec<u8>> {
-        let seq = self.next_sequence_number();
-        let with_integrity = self.with_integrity;
-        let integrity = if with_integrity {
-            self.next_integrity_id(functioncode::EXPLORE)
-        } else {
-            0
-        };
-        let req = proto::build_explore_request(
-            protocol_version::V2,
-            seq,
-            self.session_id,
-            explore_id,
-            request_id,
-            recursive,
-            parents,
-            attrs,
-            with_integrity,
-            integrity,
-        )?;
-        self.request_response(&req)
+        let session = self.session_id;
+        let req = self.build_request(functioncode::EXPLORE, |seq, with_integrity, integrity| {
+            proto::build_explore_request(
+                protocol_version::V2,
+                seq,
+                session,
+                explore_id,
+                request_id,
+                recursive,
+                parents,
+                attrs,
+                with_integrity,
+                integrity,
+            )
+        })?;
+        self.request_response(&req.framed)
     }
 
     /// Whether requests currently carry an integrity id.
@@ -2277,8 +2349,10 @@ impl Connection {
         } else {
             log::trace!("→ {}", pdu::Hex(framed_request));
         }
+        // Nothing has gone out if the request can't be encoded, so the connection stays usable.
+        let wire = self.encode_for_transport(framed_request)?;
         let started = std::time::Instant::now();
-        let result = self.request_response_inner(framed_request);
+        let result = self.request_response_inner(framed_request, wire);
         let ms = started.elapsed().as_secs_f64() * 1000.0;
         match result {
             Ok(response) => {
@@ -2320,13 +2394,8 @@ impl Connection {
         self.poisoned
     }
 
-    fn request_response_inner(&mut self, framed_request: &[u8]) -> Result<Vec<u8>> {
-        if let Some(key) = self.legacy_session_key {
-            let v3 = crate::legacy::session::frame_v3(&key, framed_request)?;
-            self.tcp.send_iso_packet(&v3)?;
-        } else {
-            self.send_tls(framed_request)?;
-        }
+    fn request_response_inner(&mut self, framed_request: &[u8], wire: Encoded) -> Result<Vec<u8>> {
+        self.send_encoded(wire)?;
         let response = self.recv_response()?;
         check_response_header(framed_request, &response)?;
         Ok(response)
@@ -3259,6 +3328,55 @@ mod tests {
         assert!(matches!(e, Error::Closed(_)), "{e}");
         assert!(e.is_connection_lost());
         assert!(conn.is_poisoned());
+        plc.join().unwrap();
+    }
+
+    /// The sequence number and the (one-octet) integrity id of a Get/SetMultiVariables request
+    /// body: the id is the VLQ before the 4-byte fill.
+    fn ids_of(req: &[u8]) -> (u16, u8) {
+        (u16::from_be_bytes([req[7], req[8]]), req[req.len() - 5])
+    }
+
+    /// A request that fails before it is sent — a value that doesn't serialize, or a legacy
+    /// request over 64 KiB — uses up no ids and leaves the connection usable.
+    #[test]
+    fn a_request_that_cannot_be_sent_uses_no_ids() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            // The limits read was sequence 3, get-class integrity id 1. Nothing else reached the
+            // PLC before this write, so it carries the next ids of each counter.
+            let req = plc.recv_request();
+            assert_eq!(&req[3..5], &functioncode::SET_MULTI_VARIABLES.to_be_bytes());
+            assert_eq!(ids_of(&req), (4, 1), "sequence 4, set-class integrity id 1");
+            plc.send(&plc.response(functioncode::SET_MULTI_VARIABLES, &[0, 0]));
+            let req = plc.recv_request();
+            assert_eq!(ids_of(&req), (5, 2), "sequence 5, get-class integrity id 2");
+            let mut rest = vec![1];
+            PValue::Blob {
+                root_id: 0,
+                data: vec![7],
+            }
+            .serialize(&mut rest)
+            .unwrap();
+            rest.extend_from_slice(&[0, 0, 0]);
+            plc.send(&plc.response(functioncode::GET_MULTI_VARIABLES, &rest));
+        });
+        let bad_value = PValue::Array {
+            element_type: crate::value::datatype::tag::INT,
+            flags: 0,
+            items: vec![PValue::DInt(1)], // not an Int
+        };
+        let addr = ItemAddress::raw(Area::Memory, 0, 1);
+        assert!(conn
+            .write_variables(std::slice::from_ref(&addr), &[bad_value])
+            .is_err());
+        assert!(!conn.is_poisoned());
+        let e = conn
+            .write_area(Area::Memory, 0, &vec![0; 70_000])
+            .unwrap_err();
+        assert!(e.to_string().contains("64 KiB"), "{e}");
+        assert!(!conn.is_poisoned(), "nothing was sent: {e}");
+        conn.write_area(Area::Memory, 0, &[1]).unwrap();
+        assert_eq!(conn.read_area(Area::Memory, 0, 1).unwrap(), [7]);
         plc.join().unwrap();
     }
 
