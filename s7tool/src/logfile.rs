@@ -233,7 +233,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
 }
 
 /// The current UTC time as `YYYYMMDD-HHMMSS`, for log file names.
-fn file_stamp() -> String {
+pub(crate) fn file_stamp() -> String {
     let ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as i64);

@@ -36,6 +36,7 @@ macro_rules! out {
     }};
 }
 
+mod batch;
 mod diag;
 mod logfile;
 mod privacy;
@@ -52,6 +53,18 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if let Some(batch) = &cfg.batch {
+        // Each step runs as its own s7tool process with its own session log.
+        logfile::to_stderr();
+        match batch::run(batch) {
+            Ok(true) => std::process::exit(0),
+            Ok(false) => std::process::exit(1),
+            Err(msg) => {
+                eprintln!("s7tool: {msg}");
+                std::process::exit(2);
+            }
+        }
+    }
     let log_path = match &cfg.log {
         Log::Off => {
             logfile::to_stderr();
@@ -108,6 +121,8 @@ struct Config {
     /// Keep project data, addresses and paths in the session log (`--full-log`).
     full_log: bool,
     command: Vec<String>,
+    /// `--targets <file>`: run the command against every PLC in the file instead.
+    batch: Option<batch::Batch>,
 }
 
 impl Config {
@@ -126,6 +141,10 @@ impl Config {
         let mut log = Log::File(None);
         let mut full_log = false;
         let mut command = Vec::new();
+        let mut targets: Option<std::path::PathBuf> = None;
+        let mut out_dir: Option<std::path::PathBuf> = None;
+        let mut step_timeout = Duration::from_secs(20 * 60);
+        let mut explicit_log = false;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -139,9 +158,26 @@ impl Config {
                 "--real-plc" => real_plc = true,
                 "--pin" => pin = Some(args.next().ok_or("--pin needs a value")?),
                 "--auto" => auto = true,
-                "--log" => log = Log::File(Some(args.next().ok_or("--log needs a path")?.into())),
-                "--no-log" => log = Log::Off,
+                "--log" => {
+                    log = Log::File(Some(args.next().ok_or("--log needs a path")?.into()));
+                    explicit_log = true;
+                }
+                "--no-log" => {
+                    log = Log::Off;
+                    explicit_log = true;
+                }
                 "--full-log" => full_log = true,
+                "--targets" => targets = Some(args.next().ok_or("--targets needs a file")?.into()),
+                "--out" => out_dir = Some(args.next().ok_or("--out needs a folder")?.into()),
+                "--step-timeout" => {
+                    let v = args.next().ok_or("--step-timeout needs minutes")?;
+                    let min: u64 = v
+                        .parse()
+                        .ok()
+                        .filter(|&m| m > 0)
+                        .ok_or(format!("invalid --step-timeout: {v}"))?;
+                    step_timeout = Duration::from_secs(min * 60);
+                }
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -156,6 +192,34 @@ impl Config {
             }
         }
 
+        if let Some(targets_file) = targets {
+            if legacy || real_plc || auto || pin.is_some() || explicit_log {
+                return Err("with --targets, give the transport per PLC in the file \
+                            (--auto is the default); every step writes its own log in --out"
+                    .into());
+            }
+            return Ok(Config {
+                ip: String::new(),
+                port,
+                legacy,
+                real_plc,
+                pin: None,
+                auto,
+                log,
+                full_log,
+                command: Vec::new(),
+                batch: Some(batch::Batch {
+                    targets_file,
+                    steps: batch::split_steps(&command),
+                    out_dir,
+                    step_timeout,
+                    full_log,
+                }),
+            });
+        }
+        if out_dir.is_some() {
+            return Err("--out goes with --targets".into());
+        }
         let ip = ip.ok_or("no PLC address — pass --ip <addr> or set S7_PLC_IP")?;
         let pin = match pin {
             Some(hex) => Some(
@@ -184,6 +248,7 @@ impl Config {
             log,
             full_log,
             command,
+            batch: None,
         })
     }
 }
@@ -1183,6 +1248,18 @@ fn print_usage() {
          \x20       --full-log      keep names, values, addresses and whole telegrams in it\n\
          \x20       --no-log        don't write one\n\
          \n\
+         SEVERAL PLCs IN A ROW:\n\
+         \x20   s7tool --targets <file> [--out <folder>] [--step-timeout <min>] [--full-log]\n\
+         \x20          [STEP ...]\n\
+         \x20   The file lists one PLC per line: <ip>[:port] [label] [--auto | --real-plc |\n\
+         \x20   --legacy | --pin <sha256>]; --auto when no transport is given; # starts a\n\
+         \x20   comment. Each STEP runs against each PLC in turn, in a session of its own with\n\
+         \x20   its own log, all in --out (default s7tool-batch-<UTC time>), next to a\n\
+         \x20   summary.txt that names PLCs by label only. STEPs are single words\n\
+         \x20   (report probe), or whole commands separated by + (report + read \"DB\".x);\n\
+         \x20   default: report probe. A step still running after --step-timeout (default\n\
+         \x20   20) minutes is stopped.\n\
+         \n\
          With no COMMAND, s7tool connects and opens an interactive prompt.\n"
     );
     eprint!("{}", help_body());
@@ -1193,7 +1270,8 @@ fn print_usage() {
          \x20   s7tool --ip 192.168.0.1 read Data_block_1.toto Data_block_1.titi\n\
          \x20   s7tool --ip 192.168.0.1 write Data_block_1.titi 456\n\
          \x20   s7tool --ip 192.168.0.1 --legacy read Data_block_1.toto\n\
-         \x20   s7tool --ip 192.168.0.1 --auto report     # everything, read-only, for a bug report"
+         \x20   s7tool --ip 192.168.0.1 --auto report     # everything, read-only, for a bug report\n\
+         \x20   s7tool --targets plcs.txt                  # report, then probe, on every PLC"
     );
 }
 
