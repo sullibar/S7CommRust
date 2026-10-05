@@ -73,6 +73,25 @@ short or pass `-Root`. A new CPU's default access level rejects S7CommPlus sessi
 simulator's TLS certificate when downloading. A headless TIA Portal takes about 20 seconds to
 start, and each script starts one.
 
+For the password and program-change checks, work on a copy of the TLS project so the live
+suite's project stays unprotected:
+
+```powershell
+# Password login: no access without a password, full access with one.
+.\tia-protect.ps1 -ProjectPath $copy -Level NoAccess -FullAccessPassword '<test password>'
+.\tia-download.ps1 -ProjectPath $copy                       # PLC still unprotected
+.\tia-download.ps1 -ProjectPath $other -Password '<test password>'  # any later download
+
+# Program change in RUN: add a new block to the project, then download only the change.
+.\tia-import-scl.ps1 -ProjectPath $copy -SclPath new_db.scl
+.\tia-download.ps1 -ProjectPath $copy -ChangesOnly -NoStop
+```
+
+A download in RUN works for new blocks; a change to an existing block's interface needs
+reinitialization, which stops the CPU (and drops every session) unless the block's memory
+reserve was activated, which Openness can't do. At "Read access" the PLC still accepts tag writes
+from an S7CommPlus client; "No access" is the level where reads and writes need the password.
+
 ## Running the live tests
 
 ```sh
