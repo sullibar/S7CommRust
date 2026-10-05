@@ -78,12 +78,43 @@ fn run() -> s7commplus::Result<()> {
     Ok(())
 }
 
-/// Quote a CSV field per RFC 4180 when it contains a comma, quote, or newline.
+/// Quote a CSV field per RFC 4180 when it contains a comma, quote, or newline. A field that a
+/// spreadsheet would run as a formula (one starting with `=`, `+`, `-`, `@`, a tab or a carriage
+/// return: a string tag's value comes from the PLC) gets a leading `'` and quotes, so it shows
+/// as text. A plain number such as `-5` stays as it is.
 fn csv_field(s: &str) -> String {
-    if s.contains([',', '"', '\n', '\r']) {
+    let formula = s.starts_with(['=', '+', '-', '@', '\t', '\r']) && s.parse::<f64>().is_err();
+    if formula {
+        format!("\"'{}\"", s.replace('"', "\"\""))
+    } else if s.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::csv_field;
+
+    #[test]
+    fn formulas_become_text() {
+        assert_eq!(
+            csv_field("=HYPERLINK(\"http://x\")"),
+            "\"'=HYPERLINK(\"\"http://x\"\")\""
+        );
+        assert_eq!(
+            csv_field("+1+cmd|' /C calc'!A0"),
+            "\"'+1+cmd|' /C calc'!A0\""
+        );
+        assert_eq!(csv_field("@SUM(A1)"), "\"'@SUM(A1)\"");
+        assert_eq!(csv_field("\tx"), "\"'\tx\"");
+        assert_eq!(csv_field("-2+3"), "\"'-2+3\"");
+        // Numbers, and ordinary fields.
+        assert_eq!(csv_field("-5"), "-5");
+        assert_eq!(csv_field("-1.5e3"), "-1.5e3");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("Tank.level"), "Tank.level");
     }
 }
 

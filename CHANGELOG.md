@@ -177,6 +177,9 @@ All notable changes to this project are documented here. The format is based on
   (`Date`, `Time`, `Time_Of_Day`, `S5Time`, `Date_And_Time`, `LTime`, `LTOD`, `LDT`, `DTL`) are
   decoded; and a value whose type isn't decoded leaves its placeholder in the text instead of
   an empty string.
+- The `export_csv` example writes a field that a spreadsheet would run as a formula (a string
+  value starting with `=`, `+`, `-`, `@`, a tab or a carriage return) with a leading `'`, so it
+  opens as text.
 - `browse_vars` (and `prefetch_type_container`) no longer download the PLC's whole type-info
   container again on every call: it is fetched once per connection, until `clear_caches`. On an
   S7-1215C it is about 100 KB and took 6 s, three times per `s7tool report`.
