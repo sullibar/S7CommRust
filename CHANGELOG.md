@@ -269,6 +269,12 @@ All notable changes to this project are documented here. The format is based on
   multiply), and the element-id arithmetic could overflow. A browse now fails with an error past
   1,000,000 variables (new `Connection::set_browse_limit`), and element ids past 32 bits are
   rejected.
+- Symbol paths are parsed level by level, so a malformed path is an error instead of addressing
+  another variable: `"DB"x` used to be read as `DBx` and `ab"cd"` as `abcd`, an empty level
+  (`DB..x`, a leading or trailing `.`) was accepted, and spaces around a `.` became part of the
+  names. Whitespace around a level is now ignored. A `"` inside a quoted name is written doubled
+  (`"a""b"`), and browsed names containing a quote or starting or ending with whitespace are
+  quoted that way, so every browsed name round-trips through `resolve_symbol`.
 
 ## [0.1.0] - 2026-07-05
 

@@ -104,7 +104,8 @@ pub struct DataBlock {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VarInfo {
     /// Fully-qualified symbol path (e.g. `"Motor_DB.axis[2].speed"`; area tags have no DB prefix).
-    /// Levels containing `.`, `[` or `]` are double-quoted, so the path round-trips through
+    /// Levels containing `.`, `[`, `]` or `"` (written doubled), or starting or ending with
+    /// whitespace, are double-quoted, so the path round-trips through
     /// [`Connection::resolve_symbol`].
     pub name: String,
     /// `AccessArea` — the DB relation id, or the M/Q/I area RID.
@@ -2076,7 +2077,9 @@ impl Connection {
     /// block's type info. Handles nested structs/FBs and 1-D/M-D array indexing
     /// (`"DB.arr[2]"`, `"DB.m[1,2]"`). Paths can be written as TIA Portal shows them: names may
     /// be double-quoted, which is required when they contain `.`, `[` or `]`
-    /// (`"\"Data block.1\".\"value.1\""`), and array-DB elements are `"\"Array DB\"[2]"`.
+    /// (`"\"Data block.1\".\"value.1\""`), and array-DB elements are `"\"Array DB\"[2]"`. A `"`
+    /// inside a quoted name is written doubled. Whitespace around a level is ignored; an empty
+    /// level (`DB..x`) or anything but `.` or `[` right after a quoted name is an error.
     pub fn resolve_symbol(&mut self, symbol: &str) -> Result<ItemAddress> {
         Ok(self.resolve_full(symbol)?.0)
     }
@@ -2885,75 +2888,92 @@ fn notification_subscription_id(buf: &[u8]) -> Option<u32> {
 /// `DB.arr[2].x` → `[("DB", []), ("arr", [2]), ("x", [])]`, `DB.m[1,2]` → `[.., ("m", [1, 2])]`.
 ///
 /// A name may be wrapped in double quotes, as TIA Portal writes it, so it can contain `.`, `[`
-/// or `]`: `"Data block.1"."value.1"` → `[("Data block.1", []), ("value.1", [])]`. Indices
-/// follow the closing quote (`"my arr"[2]`). An unterminated quote is an error.
+/// or `]`: `"Data block.1"."value.1"` → `[("Data block.1", []), ("value.1", [])]`. Inside the
+/// quotes a `"` is written doubled (`"a""b"` is the name `a"b`): the convention [`quote_level`]
+/// writes, for a name that contains one (whether TIA Portal allows that is not known). Indices
+/// follow the name (`"my arr"[2]`).
+///
+/// Whitespace around a level is ignored (`DB . x` is `DB.x`), but kept inside a name and inside
+/// quotes. Each level must be a whole name: an empty level (`DB..x`, a leading or trailing `.`),
+/// a quoted name with anything but `.`, `[` or the end after it (`"DB"x`), a quote in the middle
+/// of a name, or an unterminated quote or `[` are errors — the old parser silently joined or
+/// dropped such parts, which could address another variable.
 fn parse_symbol_path(symbol: &str) -> Result<Vec<(String, Vec<i32>)>> {
+    let bad = |what: String| Error::protocol(format!("{what} in symbol '{symbol}'"));
     let mut levels = Vec::new();
-    let mut name = String::new();
-    let mut indices = Vec::new();
-    let mut chars = symbol.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => {
-                if !indices.is_empty() {
-                    return Err(Error::protocol(format!(
-                        "unexpected '\"' after an array index in symbol '{symbol}'"
-                    )));
-                }
-                loop {
-                    match chars.next() {
-                        Some('"') => break,
-                        Some(q) => name.push(q),
-                        None => {
-                            return Err(Error::protocol(format!(
-                                "unterminated quote in symbol '{symbol}'"
-                            )))
-                        }
-                    }
+    let mut chars = symbol.chars().peekable();
+    let skip_whitespace = |chars: &mut std::iter::Peekable<std::str::Chars>| {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+    };
+    loop {
+        skip_whitespace(&mut chars);
+        let mut name = String::new();
+        if chars.next_if_eq(&'"').is_some() {
+            loop {
+                match chars.next() {
+                    Some('"') if chars.next_if_eq(&'"').is_some() => name.push('"'),
+                    Some('"') => break,
+                    Some(c) => name.push(c),
+                    None => return Err(bad("unterminated quote".into())),
                 }
             }
-            '.' => levels.push((std::mem::take(&mut name), std::mem::take(&mut indices))),
-            '[' => {
-                let mut inner = String::new();
-                loop {
-                    match chars.next() {
-                        Some(']') => break,
-                        Some(c) => inner.push(c),
-                        None => {
-                            return Err(Error::protocol(format!(
-                                "unterminated '[' in symbol '{symbol}'"
-                            )))
-                        }
-                    }
-                }
-                // A bad index must not silently select the whole array.
-                for part in inner.split(',') {
-                    let index = part.trim().parse::<i32>().map_err(|_| {
-                        Error::protocol(format!(
-                            "bad array index '{}' in symbol '{symbol}'",
-                            part.trim()
-                        ))
-                    })?;
-                    indices.push(index);
+            if name.is_empty() {
+                return Err(bad("empty quoted name".into()));
+            }
+        } else {
+            while let Some(c) = chars.next_if(|c| !matches!(c, '.' | '[' | ']' | '"')) {
+                name.push(c);
+            }
+            let trimmed = name.trim_end();
+            if trimmed.is_empty() {
+                return Err(bad(format!("empty name at level {}", levels.len() + 1)));
+            }
+            name.truncate(trimmed.len());
+        }
+        skip_whitespace(&mut chars);
+        let mut indices = Vec::new();
+        while chars.next_if_eq(&'[').is_some() {
+            let mut inner = String::new();
+            loop {
+                match chars.next() {
+                    Some(']') => break,
+                    Some(c) => inner.push(c),
+                    None => return Err(bad("unterminated '['".into())),
                 }
             }
-            _ if !indices.is_empty() => {
-                return Err(Error::protocol(format!(
-                    "unexpected '{c}' after an array index in symbol '{symbol}'"
-                )))
+            // A bad index must not silently select the whole array.
+            for part in inner.split(',') {
+                let index = part
+                    .trim()
+                    .parse::<i32>()
+                    .map_err(|_| bad(format!("bad array index '{}'", part.trim())))?;
+                indices.push(index);
             }
-            _ => name.push(c),
+            skip_whitespace(&mut chars);
+        }
+        levels.push((name, indices));
+        match chars.next() {
+            None => return Ok(levels),
+            Some('.') => {}
+            Some(c) => {
+                let after = if levels.last().is_some_and(|l| !l.1.is_empty()) {
+                    "an array index"
+                } else {
+                    "a name"
+                };
+                return Err(bad(format!("unexpected '{c}' after {after}")));
+            }
         }
     }
-    levels.push((name, indices));
-    Ok(levels)
 }
 
-/// Format one browsed member name as a symbol path level, double-quoting it (TIA style) when it
-/// contains characters that [`parse_symbol_path`] would otherwise treat as syntax.
+/// Format one browsed member name as a symbol path level that [`parse_symbol_path`] reads back
+/// as that name: double-quoted (TIA style) when it contains `.`, `[`, `]` or `"` or starts or
+/// ends with whitespace, with a `"` inside it doubled.
 fn quote_level(name: &str) -> String {
-    if name.contains(['.', '[', ']']) {
-        format!("\"{name}\"")
+    let edge_space = name.starts_with(char::is_whitespace) || name.ends_with(char::is_whitespace);
+    if name.is_empty() || edge_space || name.contains(['.', '[', ']', '"']) {
+        format!("\"{}\"", name.replace('"', "\"\""))
     } else {
         name.to_string()
     }
@@ -3116,6 +3136,55 @@ mod tests {
         }
         // Repeated brackets still read as one multi-dimensional index.
         assert_eq!(levels("DB.m[1][2]"), [lv("DB", &[]), lv("m", &[1, 2])]);
+    }
+
+    /// Each level is one whole name: the old parser joined `"DB"x` into `DBx`, read `DB..x` as
+    /// an empty member and kept the spaces of `DB . x` as part of the names.
+    #[test]
+    fn parse_symbol_path_requires_whole_levels() {
+        for bad in [
+            "\"DB\"x", "\"DB\" x", "ab\"cd\"", "DB..x", ".x", "x.", "DB. .x", "", "  ", "\"\".x",
+            "DB.x]", "DB.\"x",
+        ] {
+            assert!(parse_symbol_path(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(levels(" DB . x "), [lv("DB", &[]), lv("x", &[])]);
+        assert_eq!(
+            levels("DB.arr [2] .y"),
+            [lv("DB", &[]), lv("arr", &[2]), lv("y", &[])]
+        );
+        assert_eq!(
+            levels("\"Data block 1\" . \"a b\""),
+            [lv("Data block 1", &[]), lv("a b", &[])]
+        );
+        // Spaces inside a plain name and inside quotes are kept.
+        assert_eq!(levels("My DB.x"), [lv("My DB", &[]), lv("x", &[])]);
+        assert_eq!(levels("\" x \""), [lv(" x ", &[])]);
+        // A doubled quote inside quotes is one quote.
+        assert_eq!(
+            levels("\"a\"\"b\".\"\"\"\""),
+            [lv("a\"b", &[]), lv("\"", &[])]
+        );
+    }
+
+    #[test]
+    fn quote_level_round_trips_any_name() {
+        for name in [
+            "plain",
+            "with space",
+            "dot.ted",
+            "br[ack]et",
+            "quo\"te",
+            "\"",
+            " lead",
+            "trail ",
+            "a\"\"b",
+        ] {
+            let path = format!("{}.{}[1]", quote_level(name), quote_level(name));
+            assert_eq!(levels(&path), [lv(name, &[]), lv(name, &[1])], "{name:?}");
+        }
+        assert_eq!(quote_level("with space"), "with space");
+        assert_eq!(quote_level("quo\"te"), "\"quo\"\"te\"");
     }
 
     #[test]
