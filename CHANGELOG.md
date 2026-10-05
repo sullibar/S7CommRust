@@ -309,6 +309,13 @@ All notable changes to this project are documented here. The format is based on
   allowed, and a wrap from just below a power-of-two boundary). A violation is an
   `Error::Integrity` and poisons the connection. `explore_raw` can't check its response;
   `explore` does.
+- The real-PLC legacy handshake no longer panics on a session-setup value in the PLC's
+  plaintext CreateObject response whose VLQ never ends: it was spliced whole into the auth
+  request, overflowing the request's TPKT length. A value over 10 octets is now ignored like a
+  missing one, and the auth request's lengths are checked instead of assumed to fit.
+- Legacy: bytes after a telegram's trailer in the same COTP TSDU, or 1–3 bytes too short for a
+  chunk header, are a framing error (the connection is lost) instead of being dropped silently,
+  which lost whatever telegram they belonged to.
 
 ## [0.1.0] - 2026-07-05
 
