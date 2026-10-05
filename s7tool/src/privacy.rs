@@ -1087,7 +1087,7 @@ mod tests {
         // Times, Rust paths and MAC addresses are not addresses.
         for kept in [
             "12:00:00.123456Z",
-            "[2026-10-05T12:00:00Z INFO  s7commplus::transport::tcp] x",
+            "[2000-01-01T00:00:00Z INFO  s7commplus::transport::tcp] x",
             "aa:bb:cc:dd:ee:ff",
             "Area::Db(5)",
         ] {
