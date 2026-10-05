@@ -244,6 +244,9 @@ pub struct Connection {
     subscriptions: HashSet<u32>,
     /// Whether [`Connection::legitimate`] succeeded on this session (a reconnect loses it).
     legitimated: bool,
+    /// The key of the last new-scheme legitimation on this session, which the next one hashes
+    /// again (see [`Connection::legitimate_with`]).
+    legitimation_key: Option<[u8; 32]>,
     /// This session's [`Connection::generation`].
     generation: u64,
     /// Legacy transport: a telegram whose chunks are still arriving (kept across a read timeout,
@@ -392,6 +395,7 @@ impl Connection {
             credit_limits: HashMap::new(),
             subscriptions: HashSet::new(),
             legitimated: false,
+            legitimation_key: None,
             generation: new_generation(),
             legacy_partial: Default::default(),
             max_read_tags: DEFAULT_TAGS_PER_REQUEST,
@@ -576,6 +580,7 @@ impl Connection {
             credit_limits: HashMap::new(),
             subscriptions: HashSet::new(),
             legitimated: false,
+            legitimation_key: None,
             generation: new_generation(),
             legacy_partial: Default::default(),
             max_read_tags: DEFAULT_TAGS_PER_REQUEST,
@@ -2504,46 +2509,81 @@ impl Connection {
         }
     }
 
-    /// Authenticate (the "new", firmware ≥ V3.1 path): fetch the server-session challenge,
-    /// AES-encrypt the credentials payload with the exported keying material, and submit it.
+    /// Authenticate with the PLC's password (empty `username`) or as a user, in the scheme the
+    /// PLC's firmware takes, chosen from [`Connection::plc_description`] as the reference driver
+    /// chooses it (see [`crate::legitimation::scheme_for`]):
+    ///
+    /// * the **new** scheme (S7-1500 FW ≥ V3.1, S7-1200 FW ≥ V4.7 and G2): the credentials,
+    ///   AES-encrypted with a key derived from the TLS session;
+    /// * the **legacy** scheme (S7-1500 FW V2.9–V3.0, S7-1200 FW V4.3–V4.6, software
+    ///   controllers): `sha1(password) XOR challenge`. It knows no users: a `username` is
+    ///   ignored, as the reference ignores it.
+    ///
+    /// Older firmware, and a description that doesn't say which applies, are an error; use
+    /// [`Connection::legitimate_with`] to choose the scheme yourself.
+    ///
+    /// Legitimation requires a TLS connection ([`Connection::connect`]) and fails at once, before
+    /// anything is sent, on a legacy one: there the challenge and the answer would cross the
+    /// network unencrypted, which gives away `sha1(password)` — all the PLC checks. A reconnect
+    /// loses the legitimation (see [`Connection::reconnect`]).
     pub fn legitimate(&mut self, username: &str, password: &str) -> Result<()> {
+        self.require_tls_for_legitimation()?;
+        let description = self.plc_description.as_deref().ok_or_else(|| {
+            Error::protocol(
+                "legitimation: the PLC sent no description, so the scheme is unknown; \
+                 use legitimate_with",
+            )
+        })?;
+        let scheme = crate::legitimation::scheme_for(description)?;
+        log::debug!("legitimation scheme for {description:?}: {scheme:?}");
+        self.legitimate_with(scheme, username, password)
+    }
+
+    /// Like [`Connection::legitimate`], but in the given `scheme` whatever the firmware.
+    pub fn legitimate_with(
+        &mut self,
+        scheme: crate::legitimation::LegitimationScheme,
+        username: &str,
+        password: &str,
+    ) -> Result<()> {
+        use crate::legitimation::LegitimationScheme;
+        self.require_tls_for_legitimation()?;
         // 1. Fetch the challenge.
-        let challenge_resp = self.get_var_substreamed(ids::SERVER_SESSION_REQUEST)?;
-        if !challenge_resp.header.is_ok() {
-            return Err(Error::protocol(format!(
-                "challenge request rejected: return_value=0x{:016x}",
-                challenge_resp.header.return_value
-            )));
-        }
-        let challenge = match challenge_resp.value {
-            PValue::USIntArray(bytes) => bytes,
-            other => {
-                return Err(Error::protocol(format!(
-                    "unexpected challenge value type: {other:?}"
-                )))
+        let challenge = self.legitimation_challenge()?;
+        // 2. Answer it, keeping the answer out of the log.
+        let (address, answer) = match scheme {
+            LegitimationScheme::Legacy => {
+                if !username.is_empty() {
+                    log::warn!("legacy legitimation is by password only; the username is ignored");
+                }
+                let answer = crate::legitimation::legacy_challenge_response(password, &challenge)?;
+                (ids::SERVER_SESSION_RESPONSE, PValue::USIntArray(answer))
+            }
+            LegitimationScheme::New => {
+                if challenge.len() < crypto::AES_BLOCK_LEN {
+                    return Err(Error::protocol("challenge shorter than one AES block"));
+                }
+                // The reference "rolls" the key: each legitimation on a session hashes the
+                // previous key again, starting from the exported secret.
+                let base = match self.legitimation_key {
+                    Some(key) => key,
+                    None => self.export_oms_secret()?,
+                };
+                let key = crypto::sha256(&base);
+                self.legitimation_key = Some(key);
+                let iv = &challenge[..crypto::AES_BLOCK_LEN];
+                let mut payload = Vec::new();
+                build_legitimation_payload(username, password).serialize(&mut payload)?;
+                let ciphertext = crypto::encrypt_aes256_cbc_pkcs7(&key, iv, &payload)?;
+                let blob = PValue::Blob {
+                    root_id: 0,
+                    data: ciphertext,
+                };
+                (ids::LEGITIMATE, blob)
             }
         };
-        if challenge.len() < crypto::AES_BLOCK_LEN {
-            return Err(Error::protocol("challenge shorter than one AES block"));
-        }
-
-        // 2. Derive key/IV and encrypt the credentials payload.
-        let secret = self.export_oms_secret()?;
-        let key = crypto::sha256(&secret);
-        let iv = &challenge[..crypto::AES_BLOCK_LEN];
-        let mut payload = Vec::new();
-        build_legitimation_payload(username, password).serialize(&mut payload)?;
-        let ciphertext = crypto::encrypt_aes256_cbc_pkcs7(&key, iv, &payload)?;
-
-        // 3. Submit the encrypted response, keeping it out of the log.
         self.redact_next_request = true;
-        let resp = self.set_variable(
-            ids::LEGITIMATE,
-            &PValue::Blob {
-                root_id: 0,
-                data: ciphertext,
-            },
-        )?;
+        let resp = self.set_variable(address, &answer)?;
         // Denied if the error bit is set OR the low 16 bits (as a signed int) are negative — the
         // reference treats `(Int16)ReturnValue < 0` as access-denied, and `is_ok` checks both.
         if !resp.header.is_ok() {
@@ -2554,6 +2594,34 @@ impl Connection {
         }
         self.legitimated = true;
         Ok(())
+    }
+
+    /// Legitimation needs TLS: see [`Connection::legitimate`].
+    fn require_tls_for_legitimation(&self) -> Result<()> {
+        if self.tls.is_none() {
+            return Err(Error::protocol(
+                "legitimation requires a TLS connection: on a legacy (non-TLS) connection the \
+                 challenge and its answer would cross the network unencrypted",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The PLC's legitimation challenge (`ServerSessionRequest`).
+    fn legitimation_challenge(&mut self) -> Result<Vec<u8>> {
+        let challenge_resp = self.get_var_substreamed(ids::SERVER_SESSION_REQUEST)?;
+        if !challenge_resp.header.is_ok() {
+            return Err(Error::protocol(format!(
+                "challenge request rejected: return_value=0x{:016x}",
+                challenge_resp.header.return_value
+            )));
+        }
+        match challenge_resp.value {
+            PValue::USIntArray(bytes) => Ok(bytes),
+            other => Err(Error::protocol(format!(
+                "unexpected challenge value type: {other:?}"
+            ))),
+        }
     }
 
     /// Send a framed request telegram and read the next response telegram. Uses TLS, or — for a
@@ -4247,6 +4315,114 @@ mod tests {
         let e = conn.read_area(Area::Memory, 0, 1).unwrap_err();
         assert!(matches!(e, Error::Closed(_)), "{e}");
         assert!(e.to_string().contains("SystemEvent"), "{e}");
+        plc.join().unwrap();
+    }
+
+    /// Serve a legitimation on the mock TLS PLC: hand out `challenge`, then return the attribute
+    /// the answer was written to and the value written.
+    fn serve_legitimation(
+        plc: &mut crate::mock_tls::MockTlsPlc,
+        challenge: &[u8],
+    ) -> (u32, PValue) {
+        let req = plc.recv_request();
+        assert_eq!(&req[3..5], &functioncode::GET_VAR_SUBSTREAMED.to_be_bytes());
+        let mut rest = vec![0];
+        PValue::USIntArray(challenge.to_vec())
+            .serialize(&mut rest)
+            .unwrap();
+        rest.push(0);
+        plc.send(&plc.response(functioncode::GET_VAR_SUBSTREAMED, &rest));
+        let req = plc.recv_request();
+        assert_eq!(&req[3..5], &functioncode::SET_VARIABLE.to_be_bytes());
+        // Header (14 bytes), InObjectId, `1`, then the attribute address and the value.
+        let mut cur = std::io::Cursor::new(&req[19..]);
+        let address = crate::wire::vlq::decode_u32(&mut cur).unwrap();
+        let value = PValue::deserialize(&mut cur).unwrap();
+        (address, value)
+    }
+
+    /// The legacy scheme, chosen for an S7-1200 FW V4.5 as the reference chooses it, answers
+    /// with `sha1(password) XOR challenge` to `ServerSessionResponse`.
+    #[test]
+    fn legitimate_legacy_scheme() {
+        use crate::mock_tls::mock_tls_connection;
+        let challenge: Vec<u8> = (100u8..120).collect();
+        let (mut conn, plc) =
+            mock_tls_connection("1;6ES7 214-1AG40-0XB0 ;V4.5", TIMEOUT, move |mut plc| {
+                let (address, value) = serve_legitimation(&mut plc, &challenge);
+                assert_eq!(address, ids::SERVER_SESSION_RESPONSE);
+                let hash = crypto::sha1(b"secret");
+                let expected: Vec<u8> = hash.iter().zip(&challenge).map(|(h, c)| h ^ c).collect();
+                assert_eq!(value, PValue::USIntArray(expected));
+                plc.send(&plc.response(functioncode::SET_VARIABLE, &[0]));
+            });
+        conn.legitimate("", "secret").unwrap();
+        assert!(conn.legitimated);
+        plc.join().unwrap();
+    }
+
+    /// The new scheme, chosen for an S7-1500 FW V3.1: the credentials payload, AES-256-CBC with
+    /// `sha256(exported secret)` and the challenge's first 16 bytes as IV, to `Legitimate`; a
+    /// second legitimation on the session hashes the key again, as the reference does. A
+    /// rejection is an error.
+    #[test]
+    fn legitimate_new_scheme_rolls_the_key() {
+        use crate::legitimation::build_legitimation_payload;
+        use crate::mock_tls::mock_tls_connection;
+        let (mut conn, plc) =
+            mock_tls_connection("1;6ES7 511-1AK02-0AB0;V3.1", TIMEOUT, |mut plc| {
+                let mut key = crypto::sha256(&plc.oms_secret());
+                for (user, password, rv) in [("", "pw", 0u8), ("admin", "pw2", 0), ("", "x", 1)] {
+                    let challenge = [0x11; 20];
+                    let (address, value) = serve_legitimation(&mut plc, &challenge);
+                    assert_eq!(address, ids::LEGITIMATE);
+                    let PValue::Blob { data, .. } = value else {
+                        panic!("{value:?}")
+                    };
+                    let plain =
+                        crypto::decrypt_aes256_cbc_pkcs7(&key, &challenge[..16], &data).unwrap();
+                    let mut expected = Vec::new();
+                    build_legitimation_payload(user, password)
+                        .serialize(&mut expected)
+                        .unwrap();
+                    assert_eq!(plain, expected, "{user:?}");
+                    key = crypto::sha256(&key);
+                    let mut body = plc.response(functioncode::SET_VARIABLE, &[0]);
+                    if rv != 0 {
+                        // Access denied: a negative error code in the low 16 bits.
+                        body.truncate(body.len() - 2);
+                        crate::wire::vlq::encode_u64(&mut body, 0x8104_0000_0000_ffd2).unwrap();
+                        body.push(0);
+                    }
+                    plc.send(&body);
+                }
+            });
+        conn.legitimate("", "pw").unwrap();
+        conn.legitimate("admin", "pw2").unwrap();
+        let e = conn.legitimate("", "x").unwrap_err();
+        assert!(e.to_string().contains("access denied"), "{e}");
+        assert!(!conn.is_poisoned());
+        plc.join().unwrap();
+    }
+
+    /// On a legacy (non-TLS) connection legitimation fails before anything is sent: the answer
+    /// would give `sha1(password)` away.
+    #[test]
+    fn legitimate_requires_tls() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            // The next request is this read, not a challenge fetch.
+            answer_read(&mut plc, 3);
+        });
+        for scheme in [
+            crate::legitimation::LegitimationScheme::Legacy,
+            crate::legitimation::LegitimationScheme::New,
+        ] {
+            let e = conn.legitimate_with(scheme, "", "pw").unwrap_err();
+            assert!(e.to_string().contains("requires a TLS connection"), "{e}");
+        }
+        assert!(conn.legitimate("", "pw").is_err());
+        assert!(!conn.is_poisoned());
+        assert_eq!(conn.read_area(Area::Memory, 0, 1).unwrap(), [3]);
         plc.join().unwrap();
     }
 

@@ -41,7 +41,8 @@ It supports both protocol versions:
 - **CPU state** (RUN / STOP)
 - **Subscriptions** (values pushed by the PLC)
 - **Alarms**: pending alarms and alarm events
-- **Password login** (`legitimate`)
+- **Password login** (`legitimate`), in the legacy or new scheme the firmware takes; TLS
+  connections only
 - **Reconnect** after a lost connection, by hand or automatically
 
 Not supported: the `Variant` and `S7String` types.

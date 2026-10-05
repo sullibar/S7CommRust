@@ -48,7 +48,10 @@
 //!   [`Connection::subscribe_alarms`] register for the PLC's `0x33` push
 //!   [`Notification`]s; [`Alarm`] parses and formats alarm events.
 //! - **Legitimation** — [`Connection::legitimate`] authenticates against a
-//!   password-protected program.
+//!   password-protected program, in the legacy (password hash) or new (encrypted credentials)
+//!   scheme the firmware takes, chosen as the reference driver chooses it. It needs a TLS
+//!   connection: on a legacy one it fails before sending anything, since the exchange would give
+//!   away the password's hash.
 //!
 //! Values move through the [`value::PValue`] type system (~90 PLC datatypes).
 //!

@@ -216,6 +216,13 @@ impl MockTlsPlc {
         self.flush_tls();
     }
 
+    /// The TLS exporter secret the client derives its legitimation key from.
+    pub(crate) fn oms_secret(&self) -> [u8; 32] {
+        self.tls
+            .export_keying_material([0u8; 32], b"EXPERIMENTAL_OMS", None)
+            .unwrap()
+    }
+
     /// Answer the session setup: CreateObject, its SetMultiVariables and the limits read.
     fn serve_session_setup(&mut self, description: &str) {
         let req = self.recv_request();

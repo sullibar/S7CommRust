@@ -41,6 +41,17 @@ All notable changes to this project are documented here. The format is based on
 - TLS session keys are written to `SSLKEYLOGFILE` only after the new
   `s7commplus::set_tls_key_logging(true)`; the environment variable alone, which other programs
   honour too, no longer exposes a session's keys (and with them the legitimation password).
+- `legitimate` supports both of the reference driver's schemes and picks one from the PLC's
+  description as the reference does (`legitimation::scheme_for`): the new scheme (encrypted
+  credentials; S7-1500 FW ≥ V3.1, S7-1200 FW ≥ V4.7 and G2), which was the only one, and the
+  legacy one (`sha1(password) XOR challenge` to `ServerSessionResponse`; S7-1500 FW V2.9–V3.0,
+  S7-1200 FW V4.3–V4.6, software controllers), which those PLCs need. Firmware the reference
+  doesn't support, or a description it can't read, is now an error; the new
+  `legitimate_with(LegitimationScheme, …)` chooses the scheme by hand. A second new-scheme
+  legitimation on a session hashes the previous key again, as the reference does (it used to
+  derive the first key again). Legitimation on a legacy (non-TLS) connection fails at once,
+  before the challenge is fetched: the answer would cross the network unencrypted and give away
+  `sha1(password)`, which is all the PLC checks.
 
 ### Added
 
