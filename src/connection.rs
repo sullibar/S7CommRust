@@ -14,8 +14,9 @@
 //! Legitimation and the data operations (Explore, Get/SetMultiVariables) build on the
 //! `request_response` helper and follow.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -132,12 +133,35 @@ impl VarInfo {
 }
 
 /// A handle to an active subscription on the PLC. Poll it with [`Connection::next_notification`].
-/// The subscription lives until [`Connection::delete_subscription`] or the connection is dropped;
-/// the connection tracks its credit, so the handle is a plain id.
+/// The subscription lives until [`Connection::delete_subscription`] or the session ends; the
+/// connection tracks its credit, so the handle is a plain id.
+///
+/// A subscription belongs to the session that created it ([`Subscription::generation`]). A
+/// [`Connection::reconnect`] starts a new session in which it no longer exists: polling it then
+/// fails with [`Error::Closed`] ("subscription lost by reconnect") instead of waiting for
+/// notifications that will never come. Subscribe again on the new session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Subscription {
     /// The subscription object id the PLC allocated.
     pub object_id: u32,
+    /// The session it was created in (see [`Connection::generation`]).
+    generation: u64,
+}
+
+impl Subscription {
+    /// The session this subscription was created in: the [`Connection::generation`] at the time.
+    /// Once that changes (a reconnect), the subscription is gone.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// Source of [`Connection::generation`]s: unique across every session this process opens, so a
+/// handle from one session is never mistaken for another's, on any connection.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn new_generation() -> u64 {
+    NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Most notifications kept for subscriptions that are not being polled right now (see
@@ -213,6 +237,12 @@ pub struct Connection {
     pending_notifications: VecDeque<(u32, Vec<u8>)>,
     /// Current credit limit of each finite-credit subscription, topped up as notifications arrive.
     credit_limits: HashMap<u32, i16>,
+    /// The subscriptions created on this session and not deleted: what a reconnect would lose.
+    subscriptions: HashSet<u32>,
+    /// Whether [`Connection::legitimate`] succeeded on this session (a reconnect loses it).
+    legitimated: bool,
+    /// This session's [`Connection::generation`].
+    generation: u64,
     /// Legacy transport: a telegram whose chunks are still arriving (kept across a read timeout,
     /// like the TLS path's `rbuf`).
     legacy_partial: crate::legacy::session::PartialResponse,
@@ -246,6 +276,12 @@ enum ReconnectTarget {
         /// The public key that authenticated (so reconnect skips the auto-key trial). `None`
         /// means "auto-detect/look up by fingerprint again".
         key: Option<Vec<u8>>,
+    },
+    /// A mock legacy PLC ([`crate::mock_plc`]), which skips the login it can't do.
+    #[cfg(test)]
+    Mock {
+        addrs: Vec<SocketAddr>,
+        timeout: Duration,
     },
 }
 
@@ -329,6 +365,9 @@ impl Connection {
             auto_reconnect: false,
             pending_notifications: VecDeque::new(),
             credit_limits: HashMap::new(),
+            subscriptions: HashSet::new(),
+            legitimated: false,
+            generation: new_generation(),
             legacy_partial: Default::default(),
             max_read_tags: DEFAULT_TAGS_PER_REQUEST,
             max_write_tags: DEFAULT_TAGS_PER_REQUEST,
@@ -509,6 +548,9 @@ impl Connection {
             auto_reconnect: false,
             pending_notifications: VecDeque::new(),
             credit_limits: HashMap::new(),
+            subscriptions: HashSet::new(),
+            legitimated: false,
+            generation: new_generation(),
             legacy_partial: Default::default(),
             max_read_tags: DEFAULT_TAGS_PER_REQUEST,
             max_write_tags: DEFAULT_TAGS_PER_REQUEST,
@@ -614,35 +656,88 @@ impl Connection {
     }
 
     /// Re-establish the connection using the parameters it was created with, after a network drop.
-    /// This starts a **fresh session**: a new session id, the sequence/integrity counters reset,
-    /// and the type-info/DB caches are cleared. Any prior legitimation and subscriptions are lost
-    /// and must be redone by the caller. Clears the poisoned state on success.
+    /// This starts a **fresh session**: a new session id and [`Connection::generation`], the
+    /// sequence/integrity counters reset, and the type-info/DB caches are cleared. Any prior
+    /// legitimation and subscriptions are lost and must be redone by the caller: a
+    /// [`Subscription`] of the old session then fails with [`Error::Closed`] when polled. Clears
+    /// the poisoned state on success.
+    ///
+    /// The old socket is shut down first, so the old session doesn't hold one of the PLC's
+    /// connection slots (an S7-1200 has few) while the new one is opened. If the reconnect
+    /// fails, the connection is left poisoned; a timeout is then reported as [`Error::Closed`]
+    /// (not [`Error::is_timeout`]), since the connection is unusable until a reconnect succeeds.
     ///
     /// For the legacy real-PLC transport this reuses the key that authenticated, so it skips the
     /// slow auto-key trial.
     pub fn reconnect(&mut self) -> Result<()> {
+        if let Some(lost) = self.reconnect_would_lose() {
+            log::warn!("reconnecting drops the session's {lost}; they must be set up again");
+        }
+        // The old session is over whatever happens next.
+        self.poisoned = true;
+        self.tcp.shutdown();
         let auto = self.auto_reconnect;
-        let fresh = match self.reconnect_target.clone() {
+        let fresh = self.connect_again().map_err(|e| {
+            if e.is_timeout() {
+                Error::closed(format!("reconnect failed: {e}"))
+            } else {
+                e
+            }
+        })?;
+        *self = fresh;
+        self.auto_reconnect = auto;
+        Ok(())
+    }
+
+    /// A new connection to where this one was established.
+    fn connect_again(&self) -> Result<Self> {
+        match self.reconnect_target.clone() {
             ReconnectTarget::Tls {
                 addrs,
                 timeout,
                 pin,
-            } => Self::connect_tls(addrs, timeout, pin)?,
+            } => Self::connect_tls(addrs, timeout, pin),
             ReconnectTarget::LegacyPlcsim { addrs, timeout } => {
-                Self::connect_legacy(addrs.as_slice(), timeout)?
+                Self::connect_legacy(addrs.as_slice(), timeout)
             }
             ReconnectTarget::RealPlc {
                 addrs,
                 timeout,
                 key,
             } => match key {
-                Some(k) => Self::connect_real_plc_with_key(addrs.as_slice(), timeout, &k)?,
-                None => Self::connect_real_plc(addrs.as_slice(), timeout)?,
+                Some(k) => Self::connect_real_plc_with_key(addrs.as_slice(), timeout, &k),
+                None => Self::connect_real_plc(addrs.as_slice(), timeout),
             },
-        };
-        *self = fresh;
-        self.auto_reconnect = auto;
-        Ok(())
+            #[cfg(test)]
+            ReconnectTarget::Mock { addrs, timeout } => {
+                let tcp = IsoTcp::connect(addrs.as_slice(), timeout)?;
+                let target = ReconnectTarget::Mock { addrs, timeout };
+                Self::new_legacy(tcp, crate::mock_plc::mock_session(), target)
+            }
+        }
+    }
+
+    /// What a reconnect would lose that the caller has to restore: the subscriptions and
+    /// legitimation of this session, if any.
+    fn reconnect_would_lose(&self) -> Option<String> {
+        let subs = self.subscriptions.len();
+        match (subs, self.legitimated) {
+            (0, false) => None,
+            (0, true) => Some("legitimation".into()),
+            (n, legitimated) => Some(format!(
+                "{n} subscription(s){}",
+                if legitimated { " and legitimation" } else { "" }
+            )),
+        }
+    }
+
+    /// Identifies the current session: a number unique to it in this process, which changes with
+    /// every [`Connection::reconnect`] (including an automatic one). A [`Subscription`] carries
+    /// the generation it was created in, so a caller can tell whether it is still alive
+    /// (`sub.generation() == conn.generation()`), and that state tied to the session — its
+    /// subscriptions and legitimation — has to be set up again after a change.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// End the session cleanly, as the reference driver's `Disconnect` does: delete the server
@@ -668,6 +763,13 @@ impl Connection {
     /// once. Writes and subscriptions are never auto-retried — a write may already have been applied,
     /// and a subscription is bound to the old session — so handle those with an explicit
     /// [`Connection::reconnect`] plus your own re-subscribe / re-issue.
+    ///
+    /// A reconnect loses the session's subscriptions and legitimation, so while the session has
+    /// either, a read does **not** reconnect by itself: it fails with the error that lost the
+    /// connection (logged as a warning), and the caller reconnects explicitly and restores them.
+    /// Otherwise a reconnect would leave the subscriptions silent and the reads running with
+    /// fewer rights, without a word. Check [`Connection::generation`] to notice an automatic
+    /// reconnect.
     pub fn set_auto_reconnect(&mut self, enabled: bool) {
         self.auto_reconnect = enabled;
     }
@@ -852,7 +954,14 @@ impl Connection {
         addresses: &[ItemAddress],
     ) -> Result<GetMultiVariablesResponse> {
         match self.read_variables_once(addresses) {
-            Err(_) if self.auto_reconnect && self.poisoned => {
+            Err(e) if self.auto_reconnect && self.poisoned => {
+                if let Some(lost) = self.reconnect_would_lose() {
+                    log::warn!(
+                        "not reconnecting automatically: the session's {lost} would be lost; \
+                         reconnect explicitly and set them up again ({e})"
+                    );
+                    return Err(e);
+                }
                 self.reconnect()?;
                 self.read_variables_once(addresses)
             }
@@ -1021,7 +1130,22 @@ impl Connection {
         if credit_limit >= 0 {
             self.credit_limits.insert(object_id, credit_limit);
         }
-        Subscription { object_id }
+        self.subscriptions.insert(object_id);
+        Subscription {
+            object_id,
+            generation: self.generation,
+        }
+    }
+
+    /// The error for a subscription that belongs to another session.
+    fn stale_subscription(&self, sub: &Subscription) -> Option<Error> {
+        (sub.generation != self.generation).then(|| {
+            Error::closed(format!(
+                "subscription lost by reconnect: 0x{:08x} belonged to an earlier session \
+                 (generation {}, now {}); subscribe again",
+                sub.object_id, sub.generation, self.generation
+            ))
+        })
     }
 
     /// Create an **alarm** subscription (program/system alarms). The PLC then pushes alarm
@@ -1096,14 +1220,24 @@ impl Connection {
         }
         // If it was a subscription, forget its credit and anything still queued for it.
         self.credit_limits.remove(&object_id);
+        self.subscriptions.remove(&object_id);
         self.pending_notifications
             .retain(|(id, _)| *id != object_id);
         Ok(())
     }
 
     /// Delete a subscription (from [`Connection::subscribe`] / [`Connection::subscribe_alarms`]),
-    /// freeing it on the PLC.
+    /// freeing it on the PLC. A subscription of an earlier session (see
+    /// [`Subscription::generation`]) ended with that session, so this does nothing for it — in
+    /// particular, it doesn't delete whatever object of the new session has the same id.
     pub fn delete_subscription(&mut self, sub: &Subscription) -> Result<()> {
+        if self.stale_subscription(sub).is_some() {
+            log::debug!(
+                "subscription 0x{:08x} ended with its session; nothing to delete",
+                sub.object_id
+            );
+            return Ok(());
+        }
         self.delete_object(sub.object_id)
     }
 
@@ -1119,7 +1253,13 @@ impl Connection {
     /// For a subscription with a *finite* credit limit this tops the credit up (a no-response
     /// `SetVariable`) before the credit tick reaches the limit, keeping the flow going. With the
     /// default unlimited credit there is nothing to do.
+    ///
+    /// A subscription of an earlier session (one a [`Connection::reconnect`] ended) fails at once
+    /// with [`Error::Closed`]: the PLC will never send it another notification.
     pub fn next_notification(&mut self, sub: &Subscription) -> Result<proto::Notification> {
+        if let Some(e) = self.stale_subscription(sub) {
+            return Err(e);
+        }
         self.next_notification_for(Some(sub.object_id))
     }
 
@@ -1193,11 +1333,7 @@ impl Connection {
                 )
             },
         )?;
-        if let Err(e) = self.send_no_response(&req.framed) {
-            self.poisoned = true;
-            return Err(e);
-        }
-        Ok(())
+        self.send_no_response(&req.framed)
     }
 
     /// Keep a notification for a later `next_notification` call. The queue is bounded: a
@@ -1217,8 +1353,15 @@ impl Connection {
     }
 
     /// Send a framed request without waiting for a reply (for `0x74` "no response" requests like
-    /// the subscription credit top-up). Transport-aware (legacy V3 digest vs TLS).
+    /// the subscription credit top-up). Transport-aware (legacy V3 digest vs TLS). A failure once
+    /// sending has started poisons the connection; a timeout is then reported as
+    /// [`Error::Closed`], as for a request.
     fn send_no_response(&mut self, framed: &[u8]) -> Result<()> {
+        if self.poisoned {
+            return Err(Error::closed(
+                "connection poisoned by an earlier transport failure; reconnect required",
+            ));
+        }
         let (_, function, seq) = pdu::header_fields(framed).unwrap_or_default();
         log::debug!(
             "→ {} seq={seq} ({} bytes, no response expected)",
@@ -1227,7 +1370,19 @@ impl Connection {
         );
         log::trace!("→ {}", pdu::Hex(framed));
         let wire = self.encode_for_transport(framed)?;
-        self.send_encoded(wire)
+        self.send_encoded(wire).map_err(|e| self.poison(e))
+    }
+
+    /// Mark the connection poisoned after `e` left it out of step with the PLC, and return the
+    /// error to report: a timeout becomes [`Error::Closed`], since unlike a quiet notification
+    /// poll the connection can't simply be used again.
+    fn poison(&mut self, e: Error) -> Error {
+        self.poisoned = true;
+        if e.is_timeout() {
+            Error::closed(format!("timed out ({e}); reconnect required"))
+        } else {
+            e
+        }
     }
 
     /// Prepare a framed telegram for the transport, without sending anything: the legacy V3
@@ -2326,6 +2481,7 @@ impl Connection {
                 resp.header.return_value
             )));
         }
+        self.legitimated = true;
         Ok(())
     }
 
@@ -2977,8 +3133,8 @@ mod tests {
             plc.send(&notification(0xb, 0));
             plc.send(&notification(0xa, 0));
         });
-        let a = Subscription { object_id: 0xa };
-        let b = Subscription { object_id: 0xb };
+        let a = conn.register_subscription(0xa, -1);
+        let b = conn.register_subscription(0xb, -1);
         // B's notification is behind one of A's; A's is kept for its own call.
         let first = conn.next_notification(&b).unwrap();
         assert_eq!(first.subscription_object_id, 0xb);
@@ -3083,7 +3239,7 @@ mod tests {
             plc.stream.write_all(&frame[20..]).unwrap();
             std::thread::sleep(Duration::from_millis(200));
         });
-        let a = Subscription { object_id: 0xa };
+        let a = conn.register_subscription(0xa, -1);
         let e = conn.next_notification(&a).unwrap_err();
         assert!(e.is_timeout(), "{e}");
         assert!(!conn.is_poisoned());
@@ -3377,6 +3533,145 @@ mod tests {
         assert!(!conn.is_poisoned(), "nothing was sent: {e}");
         conn.write_area(Area::Memory, 0, &[1]).unwrap();
         assert_eq!(conn.read_area(Area::Memory, 0, 1).unwrap(), [7]);
+        plc.join().unwrap();
+    }
+
+    /// Answer a one-byte `read_area` with `byte`.
+    fn answer_read(plc: &mut MockPlc, byte: u8) {
+        let req = plc.recv_request();
+        assert_eq!(&req[3..5], &functioncode::GET_MULTI_VARIABLES.to_be_bytes());
+        let mut rest = vec![1];
+        PValue::Blob {
+            root_id: 0,
+            data: vec![byte],
+        }
+        .serialize(&mut rest)
+        .unwrap();
+        rest.extend_from_slice(&[0, 0, 0]);
+        plc.send(&plc.response(functioncode::GET_MULTI_VARIABLES, &rest));
+    }
+
+    /// A mock PLC that takes one request and hangs up without answering.
+    fn hang_up_after_one_request(mut plc: MockPlc) {
+        plc.recv_request();
+    }
+
+    #[test]
+    fn a_subscription_of_an_earlier_session_fails_after_reconnect() {
+        let (mut conn, first) = mock_connection(Duration::from_secs(5), |_| {});
+        let (addr, second) = crate::mock_plc::mock_listener(|mut plc| {
+            // The stale subscription's delete sends nothing: the next request is this read.
+            answer_read(&mut plc, 7);
+        });
+        conn.reconnect_target = ReconnectTarget::Mock {
+            addrs: vec![addr],
+            timeout: Duration::from_secs(5),
+        };
+        let sub = conn.register_subscription(0xa, 10);
+        let old = conn.generation();
+        assert_eq!(sub.generation(), old);
+        first.join().unwrap();
+
+        conn.reconnect().unwrap();
+        assert_ne!(conn.generation(), old);
+        let e = conn.next_notification(&sub).unwrap_err();
+        assert!(matches!(e, Error::Closed(_)), "{e}");
+        assert!(e.to_string().contains("lost by reconnect"), "{e}");
+        assert!(!e.is_timeout());
+        conn.delete_subscription(&sub).unwrap();
+        assert_eq!(conn.read_area(Area::Memory, 0, 1).unwrap(), [7]);
+        second.join().unwrap();
+    }
+
+    /// A reconnect would lose the session's subscriptions or legitimation, so a read doesn't
+    /// reconnect by itself then; without them, it does.
+    #[test]
+    fn auto_reconnect_refuses_to_drop_subscriptions_or_legitimation() {
+        for (subscribed, legitimated) in [(true, false), (false, true)] {
+            let (mut conn, plc) =
+                mock_connection(Duration::from_secs(5), hang_up_after_one_request);
+            let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            silent.set_nonblocking(true).unwrap();
+            conn.reconnect_target = ReconnectTarget::Mock {
+                addrs: vec![silent.local_addr().unwrap()],
+                timeout: Duration::from_secs(5),
+            };
+            conn.set_auto_reconnect(true);
+            if subscribed {
+                conn.register_subscription(0xa, -1);
+            }
+            conn.legitimated = legitimated;
+            let generation = conn.generation();
+            let e = conn.read_area(Area::Memory, 0, 1).unwrap_err();
+            assert!(e.is_connection_lost(), "{e}");
+            assert!(conn.is_poisoned());
+            assert_eq!(conn.generation(), generation, "no reconnect");
+            assert!(silent.accept().is_err(), "no connection attempt");
+            plc.join().unwrap();
+        }
+
+        let (mut conn, first) = mock_connection(Duration::from_secs(5), hang_up_after_one_request);
+        let (addr, second) = crate::mock_plc::mock_listener(|mut plc| answer_read(&mut plc, 9));
+        conn.reconnect_target = ReconnectTarget::Mock {
+            addrs: vec![addr],
+            timeout: Duration::from_secs(5),
+        };
+        conn.set_auto_reconnect(true);
+        let generation = conn.generation();
+        assert_eq!(conn.read_area(Area::Memory, 0, 1).unwrap(), [9]);
+        assert_ne!(conn.generation(), generation);
+        first.join().unwrap();
+        second.join().unwrap();
+    }
+
+    /// A reconnect that times out leaves the connection poisoned, so it reports `Closed`, not a
+    /// retryable timeout — explicitly and from an automatic reconnect alike.
+    #[test]
+    fn a_failed_reconnect_reports_closed_not_a_timeout() {
+        // Accepts the TCP connection but never confirms COTP.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = silent.local_addr().unwrap();
+        let holder = std::thread::spawn(move || {
+            let held: Vec<_> = (0..2).map(|_| silent.accept().unwrap()).collect();
+            std::thread::sleep(Duration::from_millis(800));
+            drop(held);
+        });
+        let timeout = Duration::from_millis(200);
+
+        let (mut conn, plc) = mock_connection(timeout, |_| {});
+        conn.reconnect_target = ReconnectTarget::Mock {
+            addrs: vec![addr],
+            timeout,
+        };
+        plc.join().unwrap();
+        let e = conn.reconnect().unwrap_err();
+        assert!(matches!(e, Error::Closed(_)), "{e}");
+        assert!(!e.is_timeout());
+        assert!(conn.is_poisoned());
+
+        let (mut conn, plc) = mock_connection(timeout, hang_up_after_one_request);
+        conn.reconnect_target = ReconnectTarget::Mock {
+            addrs: vec![addr],
+            timeout,
+        };
+        conn.set_auto_reconnect(true);
+        let e = conn.read_area(Area::Memory, 0, 1).unwrap_err();
+        assert!(matches!(e, Error::Closed(_)), "{e}");
+        assert!(!e.is_timeout());
+        assert!(conn.is_poisoned());
+        plc.join().unwrap();
+        holder.join().unwrap();
+    }
+
+    #[test]
+    fn a_timeout_reported_by_a_poisoning_failure_is_closed() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |_| {});
+        let timeout = Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        let e = conn.poison(timeout);
+        assert!(matches!(e, Error::Closed(_)), "{e}");
+        assert!(conn.is_poisoned());
+        let other = conn.poison(Error::integrity("bad digest"));
+        assert!(matches!(other, Error::Integrity(_)), "{other}");
         plc.join().unwrap();
     }
 

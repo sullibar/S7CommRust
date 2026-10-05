@@ -816,6 +816,22 @@ pub(crate) fn mock_connection(
     (conn, plc)
 }
 
+/// A scripted mock PLC waiting on a port of its own for one client — a `Connection::reconnect`
+/// to it — which it serves like [`mock_connection`]'s: it answers the limits read, then runs
+/// `script`.
+pub(crate) fn mock_listener(
+    script: impl FnOnce(MockPlc) + Send + 'static,
+) -> (std::net::SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let plc = std::thread::spawn(move || {
+        let mut plc = MockPlc::accept(&listener, SCRIPTED);
+        plc.answer_limits(100);
+        script(plc);
+    });
+    (addr, plc)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Request parsing (the mock's own, so a bug in the crate's codec can't pass on both sides)
 // ---------------------------------------------------------------------------------------------

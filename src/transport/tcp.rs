@@ -153,6 +153,12 @@ impl IsoTcp {
         Ok(())
     }
 
+    /// Shut the socket down in both directions (best effort), so the PLC sees the connection end
+    /// now rather than when this value is dropped.
+    pub fn shutdown(&self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+
     /// Send `payload` as ONE COTP DT frame, however large: what the driver must not do, for
     /// measuring how a PLC reacts to it (tests only).
     #[cfg(test)]

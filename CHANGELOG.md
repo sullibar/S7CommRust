@@ -230,6 +230,25 @@ All notable changes to this project are documented here. The format is based on
   bytes and the blob type that precede its length, as the reference does; they used to be read
   as the length. Serializing such a `Blob` is now an error rather than a form the PLC reads
   differently.
+- A request that fails before anything is sent (a value that doesn't serialize, a legacy request
+  over 64 KiB) no longer uses up a sequence number and integrity id, which left a gap the PLC
+  could refuse, and on a legacy connection no longer poisons it.
+- A subscription no longer waits forever after a reconnect. A reconnect starts a new session, in
+  which the PLC has no such subscription: polling it with `next_notification` now fails at once
+  with `Error::Closed` ("subscription lost by reconnect"), and `delete_subscription` does nothing
+  for it rather than delete an object of the new session that happens to have the same id. Each
+  `Subscription` records the session it belongs to (new `Subscription::generation`, compared
+  with the new `Connection::generation`, which changes with every reconnect). `Subscription`
+  gained a private field, so it can no longer be built with a struct literal.
+- Auto-reconnect (`set_auto_reconnect`) no longer silently drops the session's subscriptions or
+  legitimation: while the session has either, a read that loses the connection fails with that
+  error (logged as a warning) instead of reconnecting, and the caller reconnects and restores
+  them.
+- An error that poisons the connection no longer reports `is_timeout()`: a reconnect that timed
+  out, and a timed-out credit top-up for a subscription, are now `Error::Closed`, like a request
+  without a response. A failed reconnect leaves the connection poisoned.
+- `reconnect` shuts the old socket down before connecting, so the old session no longer holds
+  one of the PLC's connection slots (an S7-1200 has few) until the `Connection` is dropped.
 
 ## [0.1.0] - 2026-07-05
 
