@@ -58,10 +58,8 @@ const OMS_TYPE_INFO_CONTAINER_RID: u32 = 537;
 /// Recursion guard for the browse walk (nested structs; S7 types are not cyclic).
 const MAX_BROWSE_DEPTH: usize = 16;
 /// How many variables to read per `GetMultiVariables` request when reading a browsed batch, at
-/// most. 48 was the measured sweet spot on a live S7-1200 (~12% faster than 32); the batch is also
-/// capped at the PLC's own item limit. [`Connection::read_var_values`] adaptively splits any batch
-/// a PLC refuses, so a larger value never loses data — it just costs a retry. Override with
-/// `S7_READ_BATCH`.
+/// most, by default. 48 was the measured sweet spot on an S7-1200 (~12% faster than 32); the batch
+/// is also capped at the PLC's own item limit. See [`Connection::set_read_batch_size`].
 const READ_BATCH: usize = 48;
 /// Items per Get/SetMultiVariables request until the PLC's own limits are read (the reference's
 /// `CommRessources` default).
@@ -229,8 +227,8 @@ pub struct Connection {
     poisoned: bool,
     /// How this connection was established, so [`Connection::reconnect`] can re-create it.
     reconnect_target: ReconnectTarget,
-    /// When set, read operations transparently reconnect + retry once on a lost connection.
-    auto_reconnect: bool,
+    /// The caller's settings, kept across a reconnect.
+    settings: Settings,
     /// Notification telegrams (with their subscription id) received while waiting for something
     /// else — a response, or another subscription's notification; delivered in order by
     /// [`Connection::next_notification`].
@@ -255,6 +253,24 @@ pub struct Connection {
     plc_description: Option<String>,
     /// Keep the next request's contents out of the log (it carries credentials).
     redact_next_request: bool,
+}
+
+/// What the caller set on a [`Connection`]; a reconnect keeps it.
+#[derive(Debug, Clone)]
+struct Settings {
+    /// When set, read operations transparently reconnect + retry once on a lost connection.
+    auto_reconnect: bool,
+    /// Most items [`Connection::read_var_values`] puts in one request.
+    read_batch: usize,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            auto_reconnect: false,
+            read_batch: READ_BATCH,
+        }
+    }
 }
 
 /// Captures how a [`Connection`] was created so it can be re-established after a network drop.
@@ -362,7 +378,7 @@ impl Connection {
                 timeout,
                 pin,
             },
-            auto_reconnect: false,
+            settings: Settings::default(),
             pending_notifications: VecDeque::new(),
             credit_limits: HashMap::new(),
             subscriptions: HashSet::new(),
@@ -545,7 +561,7 @@ impl Connection {
             symbol_cache: HashMap::new(),
             poisoned: false,
             reconnect_target,
-            auto_reconnect: false,
+            settings: Settings::default(),
             pending_notifications: VecDeque::new(),
             credit_limits: HashMap::new(),
             subscriptions: HashSet::new(),
@@ -676,7 +692,6 @@ impl Connection {
         // The old session is over whatever happens next.
         self.poisoned = true;
         self.tcp.shutdown();
-        let auto = self.auto_reconnect;
         let fresh = self.connect_again().map_err(|e| {
             if e.is_timeout() {
                 Error::closed(format!("reconnect failed: {e}"))
@@ -684,8 +699,9 @@ impl Connection {
                 e
             }
         })?;
+        let settings = self.settings.clone();
         *self = fresh;
-        self.auto_reconnect = auto;
+        self.settings = settings;
         Ok(())
     }
 
@@ -771,7 +787,7 @@ impl Connection {
     /// fewer rights, without a word. Check [`Connection::generation`] to notice an automatic
     /// reconnect.
     pub fn set_auto_reconnect(&mut self, enabled: bool) {
-        self.auto_reconnect = enabled;
+        self.settings.auto_reconnect = enabled;
     }
 
     /// The exported `EXPERIMENTAL_OMS` keying material (for TLS legitimation). Errors on a legacy
@@ -953,8 +969,17 @@ impl Connection {
         &mut self,
         addresses: &[ItemAddress],
     ) -> Result<GetMultiVariablesResponse> {
-        match self.read_variables_once(addresses) {
-            Err(e) if self.auto_reconnect && self.poisoned => {
+        check_read_header(self.read_variables_unchecked_retrying(addresses)?)
+    }
+
+    /// [`Connection::read_variables_retrying`] without the check of the response header, so the
+    /// caller can tell a whole request the PLC refused by its return value.
+    fn read_variables_unchecked_retrying(
+        &mut self,
+        addresses: &[ItemAddress],
+    ) -> Result<GetMultiVariablesResponse> {
+        match self.read_variables_unchecked(addresses) {
+            Err(e) if self.settings.auto_reconnect && self.poisoned => {
                 if let Some(lost) = self.reconnect_would_lose() {
                     log::warn!(
                         "not reconnecting automatically: the session's {lost} would be lost; \
@@ -963,13 +988,21 @@ impl Connection {
                     return Err(e);
                 }
                 self.reconnect()?;
-                self.read_variables_once(addresses)
+                self.read_variables_unchecked(addresses)
             }
             other => other,
         }
     }
 
     fn read_variables_once(
+        &mut self,
+        addresses: &[ItemAddress],
+    ) -> Result<GetMultiVariablesResponse> {
+        check_read_header(self.read_variables_unchecked(addresses)?)
+    }
+
+    /// One GetMultiVariables, its response returned whatever its return value.
+    fn read_variables_unchecked(
         &mut self,
         addresses: &[ItemAddress],
     ) -> Result<GetMultiVariablesResponse> {
@@ -981,14 +1014,7 @@ impl Connection {
             },
         )?;
         let resp_bytes = self.request_response(&req.framed)?;
-        let resp = proto::parse_get_multi_response(&resp_bytes)?;
-        if !resp.header.is_ok() {
-            return Err(Error::protocol(format!(
-                "GetMultiVariables rejected: return_value=0x{:016x}",
-                resp.header.return_value
-            )));
-        }
-        Ok(resp)
+        proto::parse_get_multi_response(&resp_bytes)
     }
 
     /// Write one or more symbolic variables via SetMultiVariables (paired by position).
@@ -1947,71 +1973,55 @@ impl Connection {
         Ok(())
     }
 
-    /// Read the current values of browsed variables in batched `GetMultiVariables` requests.
-    /// Returns one entry per input var (in order): `Some(value)` if read, `None` if that item
-    /// genuinely errored on the PLC. A whole batch failing propagates as `Err`.
+    /// Read the current values of browsed variables in batched `GetMultiVariables` requests of
+    /// at most [`Connection::set_read_batch_size`] items (48 by default) and the PLC's own limit.
+    /// Returns one entry per input var (in order): `Some(value)` if read, `None` if the PLC
+    /// reported an error for that item.
     ///
-    /// A batch whose items *all* come back errored is treated as "the PLC refused a batch this
-    /// large" and is retried in halves down to single items — so a per-request item cap degrades
-    /// to correct (if slower) reads rather than spurious "not readable" results.
+    /// A request the PLC refuses as a whole fails the call with that error — except the refusal
+    /// of a request with more items than the PLC accepts, which is retried in halves (a PLC whose
+    /// real limit is below the one it advertises still reads everything, just slower).
     pub fn read_var_values(&mut self, vars: &[VarInfo]) -> Result<Vec<Option<PValue>>> {
-        let batch = std::env::var("S7_READ_BATCH")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(READ_BATCH)
-            .min(self.max_read_tags.max(1));
+        let batch = self.settings.read_batch.min(self.max_read_tags).max(1);
         let mut out = Vec::with_capacity(vars.len());
         for chunk in vars.chunks(batch) {
-            self.read_chunk_adaptive(chunk, &mut out)?;
+            self.read_chunk(chunk, &mut out)?;
         }
         Ok(out)
     }
 
-    /// Read one chunk, tolerating a PLC per-request cap: an over-large batch is refused either as
-    /// a header-level rejection (`Err`) or as every item erroring — in both cases (when the chunk
-    /// has more than one item) we split in half and retry. A genuinely unreadable *single* item
-    /// becomes `None` rather than aborting the whole read; only a lost connection propagates.
-    fn read_chunk_adaptive(
-        &mut self,
-        chunk: &[VarInfo],
-        out: &mut Vec<Option<PValue>>,
-    ) -> Result<()> {
+    /// Most items [`Connection::read_var_values`] puts in one request (default 48, the measured
+    /// sweet spot on an S7-1200: ~12% faster than 32), capped by
+    /// [`Connection::max_tags_per_read`] whatever is set here. 0 is taken as 1.
+    pub fn set_read_batch_size(&mut self, items: usize) {
+        self.settings.read_batch = items.max(1);
+    }
+
+    /// Read one chunk of [`Connection::read_var_values`], halving it while the PLC says it has too
+    /// many items.
+    fn read_chunk(&mut self, chunk: &[VarInfo], out: &mut Vec<Option<PValue>>) -> Result<()> {
         if chunk.is_empty() {
             return Ok(());
         }
         let addrs: Vec<ItemAddress> = chunk.iter().map(VarInfo::address).collect();
-        match self.read_variables(&addrs) {
-            Ok(resp) => {
-                let vals: Vec<Option<PValue>> = resp
-                    .into_items(chunk.len())
-                    .into_iter()
-                    .map(std::result::Result::ok)
-                    .collect();
-                if chunk.len() > 1 && vals.iter().all(Option::is_none) {
-                    self.split_and_read(chunk, out)
-                } else {
-                    out.extend(vals);
-                    Ok(())
-                }
-            }
-            // A real transport loss must propagate; a protocol rejection of an over-cap batch is
-            // recoverable by splitting. A single item that still fails is recorded as `None`.
-            Err(e) if self.poisoned => Err(e),
-            Err(_) if chunk.len() > 1 => self.split_and_read(chunk, out),
-            Err(_) => {
-                out.push(None);
-                Ok(())
-            }
+        let resp = self.read_variables_unchecked_retrying(&addrs)?;
+        let rv = resp.header.return_value;
+        if !resp.header.is_ok() && is_too_many_items(rv) && chunk.len() > 1 {
+            log::debug!(
+                "the PLC refused {} items in one read (return_value=0x{rv:016x}); halving",
+                chunk.len()
+            );
+            let mid = chunk.len() / 2;
+            self.read_chunk(&chunk[..mid], out)?;
+            return self.read_chunk(&chunk[mid..], out);
         }
-    }
-
-    /// Split a chunk in half and read each half (used by the adaptive read to back off an
-    /// over-large batch).
-    fn split_and_read(&mut self, chunk: &[VarInfo], out: &mut Vec<Option<PValue>>) -> Result<()> {
-        let mid = chunk.len() / 2;
-        self.read_chunk_adaptive(&chunk[..mid], out)?;
-        self.read_chunk_adaptive(&chunk[mid..], out)
+        let resp = check_read_header(resp)?;
+        out.extend(
+            resp.into_items(chunk.len())
+                .into_iter()
+                .map(std::result::Result::ok),
+        );
+        Ok(())
     }
 
     /// Resolve a symbol like `"Data_block_1.toto"` to its [`ItemAddress`] by walking the
@@ -2706,6 +2716,26 @@ fn scan_telegram(buf: &[u8]) -> Result<Option<(u8, usize, usize)>> {
     Ok(None)
 }
 
+/// A GetMultiVariables response, or the error for a request the PLC refused as a whole.
+fn check_read_header(resp: GetMultiVariablesResponse) -> Result<GetMultiVariablesResponse> {
+    if resp.header.is_ok() {
+        Ok(resp)
+    } else {
+        Err(Error::protocol(format!(
+            "GetMultiVariables rejected: return_value=0x{:016x}",
+            resp.header.return_value
+        )))
+    }
+}
+
+/// Whether `return_value` is a PLC's answer to a read of more items than it accepts in one
+/// request. Measured on PLCSIM Advanced (PLCSIM live run) and on S7-1200 FW 4.2 to 4.7 (probe
+/// run): `0xa027_a600_00XX_fffc`, the middle 16 bits varying by firmware (`0x7b`, `0x54`,
+/// `0x70`, `0x71`, `0x78`).
+fn is_too_many_items(return_value: u64) -> bool {
+    return_value >> 32 == 0xa027_a600 && return_value & 0xffff == 0xfffc
+}
+
 /// Check a subscription's credit limit: `-1` (unlimited) or `1..=255`. The PLC reports the credit
 /// used in a one-byte tick, so a larger limit is never topped up, and 0 would need a top-up after
 /// every notification (the reference documents 255 as the maximum).
@@ -3183,6 +3213,95 @@ mod tests {
         conn.next_notification(&a).unwrap();
         assert_eq!(conn.credit_limits.get(&0xa), Some(&15));
         plc.join().unwrap();
+    }
+
+    /// A browsed variable of DB 1 at LID `lid`.
+    fn var(lid: u32) -> VarInfo {
+        VarInfo {
+            name: format!("DB.v{lid}"),
+            access_area: 0x8a0e_0001,
+            access_sub_area: DB_VALUE_ACTUAL,
+            lids: vec![lid],
+            softdatatype: 7,
+            string_max_len: 0,
+        }
+    }
+
+    /// The number of items in a GetMultiVariables request body (after the link id).
+    fn item_count(req: &[u8]) -> u8 {
+        assert_eq!(&req[3..5], &functioncode::GET_MULTI_VARIABLES.to_be_bytes());
+        req[18]
+    }
+
+    /// Answer a GetMultiVariables of `n` items with DInt values 1..=n, item 2 as an error.
+    fn answer_items(plc: &mut MockPlc, n: u8) {
+        let mut rest = Vec::new();
+        for i in (1..=n).filter(|&i| i != 2) {
+            rest.push(i);
+            PValue::DInt(i32::from(i)).serialize(&mut rest).unwrap();
+        }
+        rest.push(0);
+        if n >= 2 {
+            rest.push(2);
+            crate::wire::vlq::encode_u64(&mut rest, 0x8206_8d00_02bf_ffc3).unwrap();
+        }
+        rest.extend_from_slice(&[0, 0]);
+        plc.send(&plc.response(functioncode::GET_MULTI_VARIABLES, &rest));
+    }
+
+    /// Answer the last request with a rejection carrying `rv`.
+    fn reject_request(plc: &mut MockPlc, rv: u64) {
+        let mut body = plc.response(functioncode::GET_MULTI_VARIABLES, &[]);
+        body.pop(); // the return value 0 `response` wrote
+        crate::wire::vlq::encode_u64(&mut body, rv).unwrap();
+        body.extend_from_slice(&[0, 0, 0]);
+        plc.send(&body);
+    }
+
+    /// `read_var_values` halves a batch only when the PLC says it has too many items; any other
+    /// refusal of the whole request is an error, and item errors are `None`s without retries.
+    #[test]
+    fn read_var_values_splits_only_on_too_many_items() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            // Three items: refused as too many (PLCSIM's value), then read as 1 + 2.
+            assert_eq!(item_count(&plc.recv_request()), 3);
+            reject_request(&mut plc, 0xa027_a600_007b_fffc);
+            assert_eq!(item_count(&plc.recv_request()), 1);
+            answer_items(&mut plc, 1);
+            assert_eq!(item_count(&plc.recv_request()), 2);
+            answer_items(&mut plc, 2);
+            // Item errors only: one request, no retries.
+            assert_eq!(item_count(&plc.recv_request()), 3);
+            answer_items(&mut plc, 3);
+            // Another refusal of the whole request: an error, after one request.
+            assert_eq!(item_count(&plc.recv_request()), 3);
+            reject_request(&mut plc, 0x8104_1234_0000_ffc3);
+        });
+        conn.set_read_batch_size(3);
+        let vars = [var(1), var(2), var(3)];
+        let got = conn.read_var_values(&vars).unwrap();
+        assert_eq!(got, [Some(PValue::DInt(1)), Some(PValue::DInt(1)), None]);
+        let got = conn.read_var_values(&vars).unwrap();
+        assert_eq!(got, [Some(PValue::DInt(1)), None, Some(PValue::DInt(3))]);
+        let e = conn.read_var_values(&vars).unwrap_err();
+        assert!(e.to_string().contains("0x81041234"), "{e}");
+        assert!(!conn.is_poisoned());
+        plc.join().unwrap();
+    }
+
+    #[test]
+    fn too_many_items_matches_the_measured_return_values() {
+        for rv in [
+            0xa027_a600_007b_fffc, // PLCSIM
+            0xa027_a600_0054_fffc, // S7-1200 FW 4.2, 4.3
+            0xa027_a600_0070_fffc, // FW 4.4
+            0xa027_a600_0071_fffc, // FW 4.5, 4.6
+            0xa027_a600_0078_fffc, // FW 4.7
+        ] {
+            assert!(is_too_many_items(rv), "0x{rv:016x}");
+        }
+        assert!(!is_too_many_items(0x8206_8d00_02bf_ffc3));
+        assert!(!is_too_many_items(0));
     }
 
     /// A credit limit the one-byte credit tick can't count, or 0, is refused before anything is

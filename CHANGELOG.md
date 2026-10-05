@@ -253,6 +253,13 @@ All notable changes to this project are documented here. The format is based on
   or 1..=255 before sending anything. A larger limit was never topped up (the PLC counts credit
   in a one-byte tick), so the subscription stalled; 0 sent a top-up after every notification;
   and a limit near `i16::MAX` overflowed the top-up arithmetic.
+- `read_var_values` reports a request the PLC refuses as a whole as an error. It used to retry
+  every refusal in halves down to single items (about twice as many requests as variables) and
+  then return `None` for all of them, as if each variable were unreadable; it also re-read a
+  batch whose items all had errors. It now halves a batch only when the PLC answers that it has
+  too many items, and an item error is a `None` at once. The batch size is set with the new
+  `Connection::set_read_batch_size` instead of the `S7_READ_BATCH` environment variable, which
+  was read on every call and is no longer consulted.
 
 ## [0.1.0] - 2026-07-05
 
