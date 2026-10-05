@@ -13,10 +13,11 @@
 //! control characters, and where its markers are broken the log gets `<redacted>` (it fails
 //! closed).
 //!
-//! The writer also goes over every log line, the driver's too: IPv4 addresses become `<ip1>`,
-//! `<ip2>`, … (the PLC's own is `<plc>`), the home directory becomes `~`, an absolute path keeps
-//! only its file name, and a name s7tool has already printed (each level of a symbol path on its
-//! own too) or learned ([`remember`], every data block's) is replaced wherever it shows up again.
+//! The writer also goes over every log line, the driver's too: IP addresses (v4 and v6) become
+//! `<ip1>`, `<ip2>`, … (the PLC's own, or its host name in any letter case, is `<plc>`), the home
+//! directory becomes `~`, an absolute path keeps only its file name, and a name s7tool has
+//! already printed (each level of a symbol path on its own too) or learned ([`remember`], every
+//! data block's) is replaced wherever it shows up again.
 //! An error message printed through [`error`] has what it quotes left out of the log. The driver
 //! itself cuts its telegram dumps after the PDU header and leaves names out
 //! ([`s7commplus::set_log_redaction`]). `--full-log` turns all of this off.
@@ -28,6 +29,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
+use std::net::Ipv6Addr;
 use std::sync::{LazyLock, Mutex};
 
 // The markers are private-use characters: env_logger drops control characters on the way to
@@ -391,8 +393,10 @@ struct Registry {
     names: HashMap<String, String>,
     /// The names to look for in log lines, by their [`head`], longest first.
     by_head: HashMap<String, Vec<String>>,
-    /// IPv4 addresses seen so far, and their placeholders.
+    /// IP addresses seen so far (IPv6 ones in their canonical form), and their placeholders.
     ips: HashMap<String, String>,
+    /// The PLC's host name, when it was given as one, lowercase.
+    hosts: Vec<String>,
     /// The tester's home directory and user name, from the environment.
     home: Option<String>,
     user: Option<String>,
@@ -409,6 +413,7 @@ fn registry() -> std::sync::MutexGuard<'static, Registry> {
             names: HashMap::new(),
             by_head: HashMap::new(),
             ips: HashMap::new(),
+            hosts: Vec::new(),
             home: env(&["HOME", "USERPROFILE"]),
             user: env(&["USER", "USERNAME", "LOGNAME"]),
         })
@@ -445,10 +450,18 @@ impl Registry {
     }
 
     fn plc(&mut self, addr: &str) {
+        let bare = addr.trim_start_matches('[').trim_end_matches(']');
+        let bare = bare.split_once('%').map_or(bare, |(ip, _zone)| ip);
         if is_ipv4(addr) {
             self.ips.insert(addr.to_owned(), "<plc>".into());
-        } else {
-            self.insert(addr, Some("<plc>"));
+        } else if let Ok(ip) = bare.parse::<Ipv6Addr>() {
+            self.ips.insert(ip.to_string(), "<plc>".into());
+        } else if !addr.trim().is_empty() {
+            let host = addr.trim().to_ascii_lowercase();
+            if !self.hosts.contains(&host) {
+                self.hosts.push(host);
+                self.hosts.sort_by_key(|h| std::cmp::Reverse(h.len()));
+            }
         }
     }
 
@@ -457,6 +470,8 @@ impl Registry {
             Some(home) => line.replace(home.as_str(), "~"),
             None => line.to_owned(),
         };
+        let line = self.scrub_hosts(&line);
+        let line = self.scrub_ipv6(&line);
         let line = self.scrub_ips(&line);
         let line = self.scrub_names(&line);
         let mut out = String::with_capacity(line.len());
@@ -471,6 +486,102 @@ impl Registry {
             }
         }
         out.push_str(&self.scrub_token(&token));
+        out
+    }
+
+    /// Replace the PLC's host name in `line`, in any letter case and wherever it is a whole
+    /// name (`plc-7.example.com:102` too).
+    fn scrub_hosts(&self, line: &str) -> String {
+        if self.hosts.is_empty() {
+            return line.to_owned();
+        }
+        let is_host_char = |c: char| c.is_alphanumeric() || matches!(c, '-' | '_');
+        let mut out = String::with_capacity(line.len());
+        let mut prev: Option<char> = None;
+        let mut i = 0;
+        while let Some(c) = line[i..].chars().next() {
+            let rest = &line[i..];
+            let skip = (c == '<').then(|| placeholder_len(rest)).flatten();
+            let host = (!prev.is_some_and(|p| is_host_char(p) || p == '.'))
+                .then(|| {
+                    self.hosts.iter().find(|h| {
+                        rest.len() >= h.len()
+                            && rest.is_char_boundary(h.len())
+                            && rest[..h.len()].eq_ignore_ascii_case(h)
+                            && !rest[h.len()..].starts_with(is_host_char)
+                    })
+                })
+                .flatten();
+            if let Some(len) = skip {
+                out.push_str(&rest[..len]);
+                prev = Some('>');
+                i += len;
+            } else if let Some(host) = host {
+                out.push_str("<plc>");
+                prev = Some('>');
+                i += host.len();
+            } else {
+                out.push(c);
+                prev = Some(c);
+                i += c.len_utf8();
+            }
+        }
+        out
+    }
+
+    /// Replace each IPv6 address in `line` (with its zone, `fe80::1%eth0`), except `::` and
+    /// loopback.
+    fn scrub_ipv6(&mut self, line: &str) -> String {
+        let b = line.as_bytes();
+        let is_part = |c: u8| c.is_ascii_hexdigit() || c == b':' || c == b'.';
+        let mut out = String::with_capacity(line.len());
+        let mut copied = 0;
+        let mut i = 0;
+        while i < b.len() {
+            let starts = is_part(b[i])
+                && b[i] != b'.'
+                && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b"_:.".contains(&b[i - 1])));
+            if !starts {
+                i += 1;
+                continue;
+            }
+            let mut end = i + b[i..].iter().take_while(|&&c| is_part(c)).count();
+            let run_end = end;
+            // A full stop or colon after the address ("fe80::1: refused") isn't part of it.
+            let mut ip = line[i..end].parse::<Ipv6Addr>();
+            while ip.is_err() && end > i + 1 && matches!(b[end - 1], b'.' | b':') {
+                end -= 1;
+                ip = line[i..end].parse::<Ipv6Addr>();
+            }
+            let followed_by_word = end == run_end
+                && b.get(end)
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_');
+            let ip = match ip {
+                Ok(ip) if !followed_by_word => ip,
+                _ => {
+                    i = run_end;
+                    continue;
+                }
+            };
+            if b.get(end) == Some(&b'%') {
+                end += 1 + b[end + 1..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_alphanumeric() || b"_-.".contains(c))
+                    .count();
+            }
+            if !(ip.is_unspecified() || ip.is_loopback()) {
+                let n = self.ips.len() + 1;
+                let placeholder = self
+                    .ips
+                    .entry(ip.to_string())
+                    .or_insert_with(|| format!("<ip{n}>"));
+                out.push_str(&line[copied..i]);
+                out.push_str(placeholder);
+                copied = end;
+            }
+            i = end;
+        }
+        out.push_str(&line[copied..]);
         out
     }
 
@@ -951,6 +1062,53 @@ mod tests {
             assert_eq!(for_log(kept, true), kept);
         }
         assert!(!is_ipv4("256.1.1.1"));
+    }
+
+    #[test]
+    fn ipv6_addresses_are_replaced() {
+        let _ = plc("2001:DB8:0::42");
+        let logged = for_log(
+            "TCP connected to [2001:db8::42]:102 via fe80::1%eth0, ::ffff:192.0.2.7. Not ::1 or ::",
+            true,
+        );
+        let ip = |n: &str| registry().ips[n].clone();
+        assert_eq!(
+            logged,
+            format!(
+                "TCP connected to [<plc>]:102 via {}, {}. Not ::1 or ::",
+                ip("fe80::1"),
+                ip("::ffff:192.0.2.7")
+            )
+        );
+        assert_eq!(
+            for_log("at fe80::1: refused", true),
+            format!("at {}: refused", ip("fe80::1"))
+        );
+        // Times, Rust paths and MAC addresses are not addresses.
+        for kept in [
+            "12:00:00.123456Z",
+            "[2026-10-05T12:00:00Z INFO  s7commplus::transport::tcp] x",
+            "aa:bb:cc:dd:ee:ff",
+            "Area::Db(5)",
+        ] {
+            assert_eq!(for_log(kept, true), kept);
+        }
+    }
+
+    #[test]
+    fn the_plc_host_name_is_replaced_in_any_case() {
+        let _ = plc("PLC-7.Example.com");
+        assert_eq!(
+            for_log(
+                "connecting to plc-7.example.com:102 (PLC-7.EXAMPLE.COM) at <plc>",
+                true
+            ),
+            "connecting to <plc>:102 (<plc>) at <plc>"
+        );
+        assert_eq!(
+            for_log("myplc-7.example.com, plc-7.example.com2", true),
+            "myplc-7.example.com, plc-7.example.com2"
+        );
     }
 
     #[test]

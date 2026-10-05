@@ -152,6 +152,9 @@ All notable changes to this project are documented here. The format is based on
   every data block's name when a command fails, so the driver's hint naming the block to quote
   is caught; and errors s7tool prints have their quoted parts and `(got …)` values left out of
   the log.
+- s7tool's session log replaces IPv6 addresses too (with their zone, also in brackets with a
+  port), not only IPv4 ones, and the PLC's host name, when `--ip` gives one, wherever it shows up
+  and in any letter case (`plc.example.com:102`), not only as a whole word in the same case.
 - `browse_vars` (and `prefetch_type_container`) no longer download the PLC's whole type-info
   container again on every call: it is fetched once per connection, until `clear_caches`. On an
   S7-1215C it is about 100 KB and took 6 s, three times per `s7tool report`.
