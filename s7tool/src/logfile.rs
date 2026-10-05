@@ -11,9 +11,12 @@
 //! itself records.
 
 use std::fs::File;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use env_logger::fmt::{ConfigurableFormat, Formatter};
+use env_logger::TimestampPrecision;
 use log::LevelFilter;
 use s7commplus::value::datetime::S7DateTime;
 
@@ -35,7 +38,7 @@ pub fn to_file(path: Option<&Path>, redact: bool) -> std::io::Result<PathBuf> {
         .filter_module("s7commplus", LevelFilter::Trace)
         .filter_module("s7tool", LevelFilter::Trace)
         .parse_env(env_logger::Env::default())
-        .format_timestamp_micros()
+        .format(redacting_format(TimestampPrecision::Micros, redact))
         .target(env_logger::Target::Pipe(Box::new(RedactingWriter::new(
             file, redact,
         ))))
@@ -46,11 +49,36 @@ pub fn to_file(path: Option<&Path>, redact: bool) -> std::io::Result<PathBuf> {
 /// Without a session log: warnings to stderr, as before (`RUST_LOG` raises the level).
 pub fn to_stderr() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .format(redacting_format(TimestampPrecision::Seconds, false))
         .target(env_logger::Target::Pipe(Box::new(RedactingWriter::new(
             std::io::stderr(),
             false,
         ))))
         .init();
+}
+
+/// env_logger's default format, with each message passed through [`privacy::for_log`] first.
+/// That happens before env_logger's output layer strips escape sequences, which could otherwise
+/// swallow the markers of a [`privacy::Private`] and leave its real text behind.
+fn redacting_format(
+    timestamp: TimestampPrecision,
+    redact: bool,
+) -> impl Fn(&mut Formatter, &log::Record<'_>) -> io::Result<()> + Send + Sync + 'static {
+    let mut format = ConfigurableFormat::default();
+    format.timestamp(Some(timestamp));
+    move |buf, record| {
+        let message = privacy::for_log(&record.args().to_string(), redact);
+        format.format(
+            buf,
+            &log::Record::builder()
+                .args(format_args!("{message}"))
+                .metadata(record.metadata().clone())
+                .module_path(record.module_path())
+                .file(record.file())
+                .line(record.line())
+                .build(),
+        )
+    }
 }
 
 /// Record what is being run and with what, at the top of the log.
@@ -104,7 +132,12 @@ pub fn command_for_log(cmd: &[String]) -> String {
         return String::new();
     };
     let args = &cmd[1..];
-    let shown: Vec<String> = match verb.as_str() {
+    let key = if verb.eq_ignore_ascii_case("legit") {
+        "legit"
+    } else {
+        verb.as_str()
+    };
+    let shown: Vec<String> = match key {
         "legit" => args
             .iter()
             .enumerate()
@@ -149,6 +182,13 @@ pub fn command_for_log(cmd: &[String]) -> String {
                 _ => a.clone(),
             })
             .collect(),
+        // A mistyped `legit` (or a verb from another tool, `login`) may carry a password.
+        _ if is_credential_verb(verb) => {
+            return std::iter::once(privacy::name(verb).to_string())
+                .chain(args.iter().map(|_| "<password>".to_owned()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
         // Anything else may be a mistyped tag name.
         _ => {
             return std::iter::once(verb)
@@ -162,6 +202,34 @@ pub fn command_for_log(cmd: &[String]) -> String {
         .chain(shown)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Whether an unknown verb looks like a command that takes a password: within two typing
+/// mistakes of `legit` or another tool's word for it, in any letter case.
+fn is_credential_verb(verb: &str) -> bool {
+    const VERBS: [&str; 7] = [
+        "legit", "login", "logon", "auth", "password", "passwd", "pass",
+    ];
+    let verb = verb.to_lowercase();
+    VERBS.iter().any(|v| edit_distance(&verb, v) <= 2)
+}
+
+/// The Levenshtein distance between `a` and `b`, in characters.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (above + 1)
+                .min(row[j] + 1)
+                .min(diagonal + usize::from(ca != cb));
+            diagonal = above;
+        }
+    }
+    row[b.len()]
 }
 
 /// The current UTC time as `YYYYMMDD-HHMMSS`, for log file names.
@@ -214,6 +282,31 @@ mod tests {
         assert_eq!(command_for_log(&strings(&["legit"])), "legit");
     }
 
+    /// A mistyped `legit`, or another tool's word for it, doesn't put the password in a log
+    /// written with `--full-log` (where the log shows what the screen does).
+    #[test]
+    fn mistyped_legit_commands_mask_their_arguments() {
+        for verb in ["Legit", "LEGIT"] {
+            assert_eq!(
+                privacy::screen(&command_for_log(&strings(&[verb, "admin", "hunter2"]))),
+                format!("{verb} admin <password>")
+            );
+        }
+        for verb in [
+            "login", "Login", "legti", "lgeit", "logon", "auth", "pasword", "passwd",
+        ] {
+            let shown = privacy::screen(&command_for_log(&strings(&[verb, "admin", "hunter2"])));
+            assert_eq!(shown, format!("{verb} <password> <password>"));
+        }
+        // Other unknown commands may be tag names: private, but not masked.
+        assert_eq!(
+            privacy::screen(&command_for_log(&strings(&["Tank_level", "x"]))),
+            "Tank_level x"
+        );
+        assert_eq!(edit_distance("legit", "lgeit"), 2);
+        assert_eq!(edit_distance("", "abc"), 3);
+    }
+
     #[test]
     fn project_data_and_paths_are_private() {
         let line = command_line_for_log(&strings(&[
@@ -248,6 +341,63 @@ mod tests {
 
     fn logged_command(cmd: &[&str]) -> String {
         logged(command_for_log(&strings(cmd)))
+    }
+
+    /// What a log record with `line` in it looks like in the log file.
+    fn through_env_logger(line: &str) -> String {
+        #[derive(Clone, Default)]
+        struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl io::Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Shared::default();
+        let logger = env_logger::Builder::new()
+            .filter_level(LevelFilter::Info)
+            .format(redacting_format(TimestampPrecision::Micros, true))
+            .target(env_logger::Target::Pipe(Box::new(RedactingWriter::new(
+                buf.clone(),
+                true,
+            ))))
+            .build();
+        log::Log::log(
+            &logger,
+            &log::Record::builder()
+                .args(format_args!("{line}"))
+                .level(log::Level::Info)
+                .target("s7tool::out")
+                .build(),
+        );
+        log::Log::flush(&logger);
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        logged
+    }
+
+    #[test]
+    fn multi_line_texts_and_escape_sequences_stay_out_of_the_log() {
+        // `xidents` prints a block's comment XML, `alarms` an alarm text over several lines.
+        let xml = "<LineComments>\r\n  <Comment>Secret_pump</Comment>\n</LineComments>";
+        let logged = through_env_logger(&format!("\n{}\n", privacy::text(xml)));
+        assert!(!logged.contains("Secret_pump"), "{logged}");
+        assert!(logged.contains("<text>"), "{logged}");
+        // An escape sequence before a `Private`, outside it: env_logger's output layer strips it
+        // only after the redaction.
+        for line in [
+            format!("\u{1b}[{} = 1", privacy::value("secretvalue")),
+            format!("\u{1b}]0;{} = 1", privacy::value("secretvalue")),
+            format!("x = {}", privacy::value("v\u{1b}]8;;secretvalue")),
+        ] {
+            let logged = through_env_logger(&line);
+            assert!(!logged.contains("secretvalue"), "{logged}");
+            // Redacted before the escape sequences are stripped, so the writer finds no broken
+            // `Private` to drop the line for.
+            assert!(logged.contains(" s7tool::out] "), "{logged}");
+        }
     }
 
     #[test]

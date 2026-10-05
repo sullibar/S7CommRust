@@ -85,7 +85,7 @@ fn report(conn: &mut Connection, label: &str, result: Result<()>) -> Result<()> 
     match result {
         Ok(()) => out!("{label}: ok"),
         Err(e) => {
-            out!("{label}: refused: {e}");
+            out!("{label}: refused: {}", crate::privacy::error(e));
             if conn.is_poisoned() {
                 out!("{label}: the connection was lost; reconnecting");
                 conn.reconnect()?;

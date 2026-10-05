@@ -589,8 +589,10 @@ impl PValue {
             _ => {}
         }
         let count = vlq::decode_u32(r)? as usize;
-        if datatype == dt::USINT {
-            // Preserve the raw-byte representation (used by legitimation).
+        if datatype == dt::USINT && flags == flags::ARRAY {
+            // Preserve the raw-byte representation (used by legitimation). `USIntArray` always
+            // serializes with the regular-array flags, so an address array of USInt (or any other
+            // flags) stays a `PValue::Array`, which keeps its flags byte.
             let data = crate::wire::primitives::decode_octets(r, count)?;
             return Ok(PValue::USIntArray(data));
         }
@@ -1120,6 +1122,25 @@ mod tests {
         // flags 10 (array), datatype 02 (USInt), count VLQ 03, bytes
         assert_eq!(out, vec![flags::ARRAY, dt::USINT, 0x03, 0x01, 0x02, 0x03]);
         assert_eq!(PValue::deserialize(&mut Cursor::new(&out)).unwrap(), v);
+    }
+
+    /// An address array of USInt keeps its flags: it used to decode as a `USIntArray`, which
+    /// re-encodes as a regular array (`10 02 …`).
+    #[test]
+    fn usint_address_array_keeps_its_flags() {
+        let bytes = vec![flags::ADDRESS_ARRAY, dt::USINT, 0x02, 0xaa, 0xbb];
+        let v = PValue::deserialize(&mut Cursor::new(&bytes)).unwrap();
+        assert_eq!(
+            v,
+            PValue::Array {
+                element_type: dt::USINT,
+                flags: flags::ADDRESS_ARRAY,
+                items: vec![PValue::USInt(0xaa), PValue::USInt(0xbb)],
+            }
+        );
+        let mut out = Vec::new();
+        v.serialize(&mut out).unwrap();
+        assert_eq!(out, bytes);
     }
 
     #[test]

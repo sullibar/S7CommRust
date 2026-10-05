@@ -38,6 +38,8 @@ All notable changes to this project are documented here. The format is based on
   of a name skips the type-info walk; cached type info is shared instead of deep-copied per
   lookup. A cached type-info object no longer carries its nested objects (each is cached under
   its own relid).
+- `AssociatedValue` is `#[non_exhaustive]` and has a `UInt(u64)` variant for `ULInt` and `LWord`
+  alarm values; `Alarm` has `associated_value_types`, the type-info id of each associated value.
 
 ### Added
 
@@ -137,6 +139,47 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- s7tool's session log no longer leaks a multi-line text (the comment XML `xidents` prints, an
+  alarm text over several lines): the log writer goes line by line, and a placeholder's markers
+  ended on the first line, so the following lines went out as they were. A line break in such a
+  text is now carried as a marker character, control characters (escape sequences, which could
+  make the log's output layer swallow the markers) become U+FFFD, and log records are redacted
+  before that layer. Where a marker is still missing, the log fails closed: it gets
+  `<redacted>` and drops the rest of the text up to the end marker.
+- Names in error messages no longer reach s7tool's session log: the log looked for a printed
+  name only as a whole whitespace-separated word, so a level of a typed symbol (`member 'lvl'
+  not found`), a quoted block name or a name with a space in it went out as it was. Every level
+  of a symbol is now looked for on its own, as a whole identifier anywhere in a line (short and
+  plain lowercase names where they are quoted or part of a path), longest first; s7tool learns
+  every data block's name when a command fails, so the driver's hint naming the block to quote
+  is caught; and errors s7tool prints have their quoted parts and `(got …)` values left out of
+  the log.
+- s7tool's session log replaces IPv6 addresses too (with their zone, also in brackets with a
+  port), not only IPv4 ones, and the PLC's host name, when `--ip` gives one, wherever it shows up
+  and in any letter case (`plc.example.com:102`), not only as a whole word in the same case.
+- A session log written with `--full-log` no longer records the password of a mistyped `legit`:
+  `Legit` in another letter case is masked like `legit`, and an unknown command within two
+  typing mistakes of `legit`, `login`, `auth` or `password` has all its arguments masked.
+- `datetime::format` returns `None` for a value out of its type's range instead of a wrong
+  date or time: a `DATE` wider than 16 bits used to wrap (70000 days showed as 2002-03-23), a
+  `TIME_OF_DAY` or `LTOD` past midnight wrapped round (90,000,000 ms showed as 01:00:00), and a
+  `DATE_AND_TIME` with a millisecond nibble that isn't BCD or a field out of range (month 13)
+  was shown anyway. `S7DateTime::from_date_and_time` takes exactly 8 bytes.
+- s7tool shows every element of a whole `Array of WString` and `Array of Date_And_Time`, as it
+  did for `Array of String`, instead of only the first.
+- An address array (or any array but a regular one) of `USInt` decodes as a `PValue::Array`
+  that keeps its flags byte, so it re-encodes as it came (`20 02 …`); it used to decode as a
+  `PValue::USIntArray`, which always encodes as a regular array (`10 02 …`).
+- Alarm associated values: a `Real` shows as the value it holds (12.756, not
+  12.755999565124512); `%f` and `%e` in an alarm text default to C's precision of 6 and `%e`
+  has C's form (`1.275600e+01`); `%x` of a negative value shows it in its type's width (`fffe`
+  for an `Int` of -2, not 16 digits); `LInt`, `ULInt`, `LWord` and the date and time types
+  (`Date`, `Time`, `Time_Of_Day`, `S5Time`, `Date_And_Time`, `LTime`, `LTOD`, `LDT`, `DTL`) are
+  decoded; and a value whose type isn't decoded leaves its placeholder in the text instead of
+  an empty string.
+- The `export_csv` example writes a field that a spreadsheet would run as a formula (a string
+  value starting with `=`, `+`, `-`, `@`, a tab or a carriage return) with a leading `'`, so it
+  opens as text.
 - `browse_vars` (and `prefetch_type_container`) no longer download the PLC's whole type-info
   container again on every call: it is fetched once per connection, until `clear_caches`. On an
   S7-1215C it is about 100 KB and took 6 s, three times per `s7tool report`.
