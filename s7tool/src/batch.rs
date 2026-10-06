@@ -37,6 +37,8 @@ pub struct Batch {
     pub out_dir: Option<PathBuf>,
     pub step_timeout: Duration,
     pub full_log: bool,
+    /// `--timeout` seconds, passed on to every step.
+    pub timeout: Option<u64>,
 }
 
 /// Parse a targets file: one PLC per line, `<ip>[:port] [label] [flags]`, in any order after the
@@ -223,6 +225,9 @@ pub fn run(batch: &Batch) -> Result<bool, String> {
             cmd.args(&target.flags).arg("--log").arg(&log_path);
             if batch.full_log {
                 cmd.arg("--full-log");
+            }
+            if let Some(secs) = batch.timeout {
+                cmd.arg("--timeout").arg(secs.to_string());
             }
             cmd.args(step).stdin(Stdio::null());
             let started = Instant::now();

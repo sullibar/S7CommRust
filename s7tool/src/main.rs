@@ -123,6 +123,8 @@ struct Config {
     command: Vec<String>,
     /// `--targets <file>`: run the command against every PLC in the file instead.
     batch: Option<batch::Batch>,
+    /// Socket timeout for connecting and for each request (`--timeout`, default 10 s).
+    timeout: Duration,
 }
 
 impl Config {
@@ -144,6 +146,7 @@ impl Config {
         let mut targets: Option<std::path::PathBuf> = None;
         let mut out_dir: Option<std::path::PathBuf> = None;
         let mut step_timeout = Duration::from_secs(20 * 60);
+        let mut timeout: Option<u64> = None;
         let mut explicit_log = false;
 
         let mut args = std::env::args().skip(1);
@@ -178,6 +181,15 @@ impl Config {
                         .ok_or(format!("invalid --step-timeout: {v}"))?;
                     step_timeout = Duration::from_secs(min * 60);
                 }
+                "--timeout" => {
+                    let v = args.next().ok_or("--timeout needs seconds")?;
+                    timeout = Some(
+                        v.parse()
+                            .ok()
+                            .filter(|s| (1..=600).contains(s))
+                            .ok_or(format!("invalid --timeout (1–600 s): {v}"))?,
+                    );
+                }
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -208,12 +220,14 @@ impl Config {
                 log,
                 full_log,
                 command: Vec::new(),
+                timeout: Duration::from_secs(timeout.unwrap_or(10)),
                 batch: Some(batch::Batch {
                     targets_file,
                     steps: batch::split_steps(&command),
                     out_dir,
                     step_timeout,
                     full_log,
+                    timeout,
                 }),
             });
         }
@@ -248,6 +262,7 @@ impl Config {
             log,
             full_log,
             command,
+            timeout: Duration::from_secs(timeout.unwrap_or(10)),
             batch: None,
         })
     }
@@ -268,7 +283,7 @@ fn run(cfg: Config) -> Result<()> {
         privacy::plc(&cfg.ip),
         cfg.port
     );
-    let timeout = Duration::from_secs(10);
+    let timeout = cfg.timeout;
     let mut conn = if cfg.auto {
         connect_auto((cfg.ip.as_str(), cfg.port), timeout)?
     } else if cfg.real_plc {
@@ -1237,6 +1252,8 @@ fn print_usage() {
          \x20                                                  (or env S7_PLC_CERT_SHA256)\n\
          \x20       --auto          try TLS, then --real-plc, then --legacy: for a PLC whose\n\
          \x20                       path you don't know\n\
+         \x20       --timeout <s>   how long to wait for the PLC (connect and each answer),\n\
+         \x20                       default 10; more for a slow or busy CPU\n\
          \n\
          SESSION LOG:\n\
          \x20   Every run writes s7tool-<UTC time>.log in the current directory: each request\n\
