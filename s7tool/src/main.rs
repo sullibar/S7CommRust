@@ -36,6 +36,7 @@ macro_rules! out {
     }};
 }
 
+mod batch;
 mod diag;
 mod logfile;
 mod privacy;
@@ -52,6 +53,18 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if let Some(batch) = &cfg.batch {
+        // Each step runs as its own s7tool process with its own session log.
+        logfile::to_stderr();
+        match batch::run(batch) {
+            Ok(true) => std::process::exit(0),
+            Ok(false) => std::process::exit(1),
+            Err(msg) => {
+                eprintln!("s7tool: {msg}");
+                std::process::exit(2);
+            }
+        }
+    }
     let log_path = match &cfg.log {
         Log::Off => {
             logfile::to_stderr();
@@ -73,7 +86,7 @@ fn main() {
     logfile::header(&std::env::args().skip(1).collect::<Vec<_>>());
     let result = run(cfg);
     if let Err(e) = &result {
-        log::error!(target: "s7tool", "{e}");
+        log::error!(target: "s7tool", "{}", privacy::error(e));
         eprintln!("error: {e}");
     }
     if let Some(path) = &log_path {
@@ -108,6 +121,10 @@ struct Config {
     /// Keep project data, addresses and paths in the session log (`--full-log`).
     full_log: bool,
     command: Vec<String>,
+    /// `--targets <file>`: run the command against every PLC in the file instead.
+    batch: Option<batch::Batch>,
+    /// Socket timeout for connecting and for each request (`--timeout`, default 10 s).
+    timeout: Duration,
 }
 
 impl Config {
@@ -126,6 +143,11 @@ impl Config {
         let mut log = Log::File(None);
         let mut full_log = false;
         let mut command = Vec::new();
+        let mut targets: Option<std::path::PathBuf> = None;
+        let mut out_dir: Option<std::path::PathBuf> = None;
+        let mut step_timeout = Duration::from_secs(20 * 60);
+        let mut timeout: Option<u64> = None;
+        let mut explicit_log = false;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -139,9 +161,35 @@ impl Config {
                 "--real-plc" => real_plc = true,
                 "--pin" => pin = Some(args.next().ok_or("--pin needs a value")?),
                 "--auto" => auto = true,
-                "--log" => log = Log::File(Some(args.next().ok_or("--log needs a path")?.into())),
-                "--no-log" => log = Log::Off,
+                "--log" => {
+                    log = Log::File(Some(args.next().ok_or("--log needs a path")?.into()));
+                    explicit_log = true;
+                }
+                "--no-log" => {
+                    log = Log::Off;
+                    explicit_log = true;
+                }
                 "--full-log" => full_log = true,
+                "--targets" => targets = Some(args.next().ok_or("--targets needs a file")?.into()),
+                "--out" => out_dir = Some(args.next().ok_or("--out needs a folder")?.into()),
+                "--step-timeout" => {
+                    let v = args.next().ok_or("--step-timeout needs minutes")?;
+                    let min: u64 = v
+                        .parse()
+                        .ok()
+                        .filter(|&m| m > 0)
+                        .ok_or(format!("invalid --step-timeout: {v}"))?;
+                    step_timeout = Duration::from_secs(min * 60);
+                }
+                "--timeout" => {
+                    let v = args.next().ok_or("--timeout needs seconds")?;
+                    timeout = Some(
+                        v.parse()
+                            .ok()
+                            .filter(|s| (1..=600).contains(s))
+                            .ok_or(format!("invalid --timeout (1–600 s): {v}"))?,
+                    );
+                }
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -156,6 +204,36 @@ impl Config {
             }
         }
 
+        if let Some(targets_file) = targets {
+            if legacy || real_plc || auto || pin.is_some() || explicit_log {
+                return Err("with --targets, give the transport per PLC in the file \
+                            (--auto is the default); every step writes its own log in --out"
+                    .into());
+            }
+            return Ok(Config {
+                ip: String::new(),
+                port,
+                legacy,
+                real_plc,
+                pin: None,
+                auto,
+                log,
+                full_log,
+                command: Vec::new(),
+                timeout: Duration::from_secs(timeout.unwrap_or(10)),
+                batch: Some(batch::Batch {
+                    targets_file,
+                    steps: batch::split_steps(&command),
+                    out_dir,
+                    step_timeout,
+                    full_log,
+                    timeout,
+                }),
+            });
+        }
+        if out_dir.is_some() {
+            return Err("--out goes with --targets".into());
+        }
         let ip = ip.ok_or("no PLC address — pass --ip <addr> or set S7_PLC_IP")?;
         let pin = match pin {
             Some(hex) => Some(
@@ -184,6 +262,8 @@ impl Config {
             log,
             full_log,
             command,
+            timeout: Duration::from_secs(timeout.unwrap_or(10)),
+            batch: None,
         })
     }
 }
@@ -203,7 +283,7 @@ fn run(cfg: Config) -> Result<()> {
         privacy::plc(&cfg.ip),
         cfg.port
     );
-    let timeout = Duration::from_secs(10);
+    let timeout = cfg.timeout;
     let mut conn = if cfg.auto {
         connect_auto((cfg.ip.as_str(), cfg.port), timeout)?
     } else if cfg.real_plc {
@@ -265,14 +345,16 @@ fn connect_auto(addr: (&str, u16), timeout: Duration) -> Result<Connection> {
         // "InitSsl rejected" covers both no-TLS signals real hardware sends: a genuine
         // InitSsl response carrying an error return value, and an error/abort function code
         // (Error2 0x05a9) from firmware that predates TLS S7CommPlus. Either way, fall through.
-        Err(e) if e.to_string().contains("InitSsl rejected") => out!("  no TLS: {e}"),
+        Err(e) if e.to_string().contains("InitSsl rejected") => {
+            out!("  no TLS: {}", privacy::error(e))
+        }
         Err(e) => return Err(e),
     }
     out!("trying the legacy scheme of real S7-1200/1500 CPUs ...");
     match Connection::connect_real_plc(addr, timeout) {
         Ok(conn) => return Ok(conn),
         Err(e) if e.to_string().contains("no 00:/01: fingerprint") => {
-            out!("  not a real CPU's key family: {e}")
+            out!("  not a real CPU's key family: {}", privacy::error(e))
         }
         Err(e) => return Err(e),
     }
@@ -344,7 +426,7 @@ fn repl(conn: &mut Connection) -> Result<()> {
             Some("quit" | "exit" | "q") => break,
             Some(_) => {
                 if let Err(e) = dispatch(conn, &parts) {
-                    log::error!(target: "s7tool", "{e}");
+                    log::error!(target: "s7tool", "{}", privacy::error(&e));
                     eprintln!("error: {e}");
                 }
             }
@@ -356,6 +438,26 @@ fn repl(conn: &mut Connection) -> Result<()> {
 /// Run one command (`cmd[0]` is the verb, the rest are arguments).
 fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
     log::info!(target: "s7tool", "> {}", logfile::command_for_log(cmd));
+    let result = run_command(conn, cmd);
+    if result.is_err() {
+        // The error may name a data block s7tool hasn't printed.
+        remember_db_names(conn);
+    }
+    result
+}
+
+/// Have the session log look out for every data block's name, which a driver error may show (a
+/// symbol that isn't found names the block it should have been quoted as, say). The list is
+/// cached by the connection, so this costs a request only if nothing has needed it before.
+fn remember_db_names(conn: &mut Connection) {
+    if let Ok(dbs) = conn.datablock_list() {
+        for db in &dbs {
+            privacy::remember(&db.name);
+        }
+    }
+}
+
+fn run_command(conn: &mut Connection, cmd: &[String]) -> Result<()> {
     match cmd[0].as_str() {
         "help" | "?" => {
             print_help();
@@ -406,7 +508,7 @@ fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
                     cmd[3].clone()
                 };
                 std::fs::write(&path, data)
-                    .map_err(|e| Error::Protocol(format!("write {path}: {e}")))?;
+                    .map_err(|e| Error::Protocol(format!("write {path:?}: {e}")))?;
                 out!(
                     "wrote {} bytes (obj 0x{objrel:08x}) -> {}",
                     data.len(),
@@ -444,7 +546,7 @@ fn dispatch(conn: &mut Connection, cmd: &[String]) -> Result<()> {
                     );
                     match inflate_metadata_blob(&data) {
                         Ok(xml) => out!("\n{}\n", privacy::text(xml)),
-                        Err(e) => out!(" <decompress failed: {e}>"),
+                        Err(e) => out!(" <decompress failed: {}>", privacy::error(e)),
                     }
                 }
             }
@@ -586,7 +688,11 @@ fn xverify(conn: &mut Connection) -> Result<()> {
             }
             Err(e) => {
                 bad += 1;
-                out!("UNRESOLVED {}: {e}", privacy::name(&v.name));
+                out!(
+                    "UNRESOLVED {}: {}",
+                    privacy::name(&v.name),
+                    privacy::error(e)
+                );
             }
         }
     }
@@ -645,10 +751,16 @@ fn browse(conn: &mut Connection, target: Option<&str>) -> Result<()> {
         );
         match conn.browse_datablock(db.relid, db.ti_relid, &db.name) {
             Ok(vars) => print_values(conn, &vars, Some(&db.name)),
+            // A lost connection fails every block after it: say so once instead of calling each
+            // remaining block know-how protected.
+            Err(e) if e.is_connection_lost() || conn.is_poisoned() => return Err(e),
             // A DB whose interface the PLC withholds (TComSize=0, no VartypeList) is the signature
             // of a know-how-protected FB — not recoverable without the block's know-how password.
             Err(e) => {
-                out!("  (skipped — interface withheld by PLC, likely know-how protected: {e})")
+                out!(
+                    "  (skipped — interface withheld by PLC, likely know-how protected: {})",
+                    privacy::error(e)
+                )
             }
         }
         out!();
@@ -665,7 +777,8 @@ fn browse(conn: &mut Connection, target: Option<&str>) -> Result<()> {
         }
         let vars = match conn.browse_controller_area(area_rid, ti_relid) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(e) if e.is_connection_lost() || conn.is_poisoned() => return Err(e),
+            Err(_) => continue, // an area the PLC doesn't describe (empty)
         };
         if vars.is_empty() && target.is_none() {
             continue; // skip empty areas in a full dump
@@ -683,7 +796,7 @@ fn print_values(conn: &mut Connection, vars: &[VarInfo], strip: Option<&str>) {
     let values = match conn.read_var_values(vars) {
         Ok(v) => v,
         Err(e) => {
-            out!("  (read failed: {e})");
+            out!("  (read failed: {})", privacy::error(e));
             return;
         }
     };
@@ -854,7 +967,10 @@ fn read_one(conn: &mut Connection, sym: &str) {
             sdt_name(ty),
             privacy::value(fmt_typed(ty, &v))
         ),
-        Err(e) => out!("  {name} -> ERROR: {e}"),
+        Err(e) => {
+            remember_db_names(conn);
+            out!("  {name} -> ERROR: {}", privacy::error(e))
+        }
     }
 }
 
@@ -974,6 +1090,43 @@ fn fmt_typed(ty: u8, v: &PValue) -> String {
             let items: Vec<String> = b
                 .chunks(stride)
                 .map(|c| format!("{:?}", strings::decode_s7_string(c)))
+                .collect();
+            return format!("[{}]", items.join(", "));
+        }
+    }
+    // Likewise a whole array of WSTRINGs (`max_len + 2` code units each) and of DATE_AND_TIMEs
+    // (8 bytes each).
+    if let (sdt::WSTRING, PValue::Array { items, .. }) = (ty, v) {
+        let stride = match items.first() {
+            Some(PValue::UInt(max)) => usize::from(*max) + 2,
+            _ => 0,
+        };
+        if stride > 0 && items.len() > stride && items.len() % stride == 0 {
+            let items: Vec<String> = items
+                .chunks(stride)
+                .map(|c| {
+                    let element = PValue::Array {
+                        element_type: v.datatype(),
+                        flags: 0,
+                        items: c.to_vec(),
+                    };
+                    format!(
+                        "{:?}",
+                        strings::decode_wstring(&element).unwrap_or_default()
+                    )
+                })
+                .collect();
+            return format!("[{}]", items.join(", "));
+        }
+    }
+    if let (sdt::DATE_AND_TIME, PValue::USIntArray(b)) = (ty, v) {
+        if b.len() > 8 && b.len() % 8 == 0 {
+            let items: Vec<String> = b
+                .chunks(8)
+                .map(|c| {
+                    datetime::format(ty, &PValue::USIntArray(c.to_vec()))
+                        .unwrap_or_else(|| format!("{c:?}"))
+                })
                 .collect();
             return format!("[{}]", items.join(", "));
         }
@@ -1103,6 +1256,8 @@ fn print_usage() {
          \x20                                                  (or env S7_PLC_CERT_SHA256)\n\
          \x20       --auto          try TLS, then --real-plc, then --legacy: for a PLC whose\n\
          \x20                       path you don't know\n\
+         \x20       --timeout <s>   how long to wait for the PLC (connect and each answer),\n\
+         \x20                       default 10; more for a slow or busy CPU\n\
          \n\
          SESSION LOG:\n\
          \x20   Every run writes s7tool-<UTC time>.log in the current directory: each request\n\
@@ -1114,6 +1269,18 @@ fn print_usage() {
          \x20       --full-log      keep names, values, addresses and whole telegrams in it\n\
          \x20       --no-log        don't write one\n\
          \n\
+         SEVERAL PLCs IN A ROW:\n\
+         \x20   s7tool --targets <file> [--out <folder>] [--step-timeout <min>] [--full-log]\n\
+         \x20          [STEP ...]\n\
+         \x20   The file lists one PLC per line: <ip>[:port] [label] [--auto | --real-plc |\n\
+         \x20   --legacy | --pin <sha256>]; --auto when no transport is given; # starts a\n\
+         \x20   comment. Each STEP runs against each PLC in turn, in a session of its own with\n\
+         \x20   its own log, all in --out (default s7tool-batch-<UTC time>), next to a\n\
+         \x20   summary.txt that names PLCs by label only. STEPs are single words\n\
+         \x20   (report probe), or whole commands separated by + (report + read \"DB\".x);\n\
+         \x20   default: report probe. A step still running after --step-timeout (default\n\
+         \x20   20) minutes is stopped.\n\
+         \n\
          With no COMMAND, s7tool connects and opens an interactive prompt.\n"
     );
     eprint!("{}", help_body());
@@ -1124,7 +1291,8 @@ fn print_usage() {
          \x20   s7tool --ip 192.168.0.1 read Data_block_1.toto Data_block_1.titi\n\
          \x20   s7tool --ip 192.168.0.1 write Data_block_1.titi 456\n\
          \x20   s7tool --ip 192.168.0.1 --legacy read Data_block_1.toto\n\
-         \x20   s7tool --ip 192.168.0.1 --auto report     # everything, read-only, for a bug report"
+         \x20   s7tool --ip 192.168.0.1 --auto report     # everything, read-only, for a bug report\n\
+         \x20   s7tool --targets plcs.txt                  # report, then probe, on every PLC"
     );
 }
 
@@ -1201,6 +1369,44 @@ mod tests {
         assert_eq!(unquote("\"DB\".x"), "\"DB\".x");
         assert_eq!(unquote("\"a\".\"b\""), "\"a\".\"b\"");
         assert_eq!(unquote("plain"), "plain");
+    }
+
+    /// A whole array of WSTRINGs or DATE_AND_TIMEs shows every element, not just the first.
+    #[test]
+    fn whole_arrays_of_wstrings_and_date_and_times() {
+        let wstring = |max: u16, s: &str| {
+            let mut units = vec![max, s.encode_utf16().count() as u16];
+            units.extend(s.encode_utf16());
+            units.resize(usize::from(max) + 2, 0);
+            units
+        };
+        let mut units = wstring(4, "ab");
+        units.extend(wstring(4, "Wé"));
+        units.extend(wstring(4, ""));
+        let array = PValue::Array {
+            element_type: s7commplus::value::datatype::tag::UINT,
+            flags: s7commplus::value::datatype::flags::ARRAY,
+            items: units.into_iter().map(PValue::UInt).collect(),
+        };
+        assert_eq!(fmt_typed(sdt::WSTRING, &array), r#"["ab", "Wé", ""]"#);
+        let single = PValue::Array {
+            element_type: s7commplus::value::datatype::tag::UINT,
+            flags: s7commplus::value::datatype::flags::ARRAY,
+            items: wstring(4, "ab").into_iter().map(PValue::UInt).collect(),
+        };
+        assert_eq!(fmt_typed(sdt::WSTRING, &single), r#""ab""#);
+
+        let dt = [0x24, 0x03, 0x15, 0x13, 0x45, 0x30, 0x12, 0x36];
+        let mut bytes = dt.to_vec();
+        bytes.extend([0x99, 0x12, 0x31, 0x23, 0x59, 0x59, 0x00, 0x05]);
+        assert_eq!(
+            fmt_typed(sdt::DATE_AND_TIME, &PValue::USIntArray(bytes)),
+            "[2024-03-15 13:45:30.123, 1999-12-31 23:59:59]"
+        );
+        assert_eq!(
+            fmt_typed(sdt::DATE_AND_TIME, &PValue::USIntArray(dt.to_vec())),
+            "2024-03-15 13:45:30.123"
+        );
     }
 
     #[test]

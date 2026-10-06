@@ -251,9 +251,11 @@ fn a_large_recursive_explore_decodes() {
 fn reconnect_starts_a_new_session() {
     let _plc = lock();
     let mut conn = connect();
-    let before = conn.session_id();
+    let before = conn.generation();
     conn.reconnect().unwrap();
-    assert_ne!(conn.session_id(), before);
+    // Not the session id: reconnect closes the old socket first, and the PLC
+    // may then hand out the freed id again (PLCSIM does).
+    assert_ne!(conn.generation(), before);
     read_int(&mut conn, TOTO);
 }
 

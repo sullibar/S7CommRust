@@ -38,9 +38,52 @@ All notable changes to this project are documented here. The format is based on
   of a name skips the type-info walk; cached type info is shared instead of deep-copied per
   lookup. A cached type-info object no longer carries its nested objects (each is cached under
   its own relid).
+- `AssociatedValue` is `#[non_exhaustive]` and has a `UInt(u64)` variant for `ULInt` and `LWord`
+  alarm values; `Alarm` has `associated_value_types`, the type-info id of each associated value.
+- Secrets are wiped from memory when no longer needed (with the `zeroize` crate, already a
+  dependency of rustls): the legacy session key and the legitimation key when the `Connection`
+  is dropped or replaced by a reconnect, and the legitimation credentials (the plaintext
+  payload and the password hash) once encrypted or sent. The password the caller passes in is
+  the caller's to wipe.
+- TLS session keys are written to `SSLKEYLOGFILE` only after the new
+  `s7commplus::set_tls_key_logging(true)`; the environment variable alone, which other programs
+  honour too, no longer exposes a session's keys (and with them the legitimation password).
+- `legitimate` supports both of the reference driver's schemes and picks one from the PLC's
+  description as the reference does (`legitimation::scheme_for`): the new scheme (encrypted
+  credentials; S7-1500 FW ≥ V3.1, S7-1200 FW ≥ V4.7 and G2), which was the only one, and the
+  legacy one (`sha1(password) XOR challenge` to `ServerSessionResponse`; S7-1500 FW V2.9–V3.0,
+  S7-1200 FW V4.3–V4.6, software controllers), which those PLCs need. Firmware the reference
+  doesn't support, or a description it can't read, is now an error; the new
+  `legitimate_with(LegitimationScheme, …)` chooses the scheme by hand. A second new-scheme
+  legitimation on a session hashes the previous key again, as the reference does (it used to
+  derive the first key again). Legitimation on a legacy (non-TLS) connection fails at once,
+  before the challenge is fetched: the answer would cross the network unencrypted and give away
+  `sha1(password)`, which is all the PLC checks.
 
 ### Added
 
+- `Connection::set_timeouts(request, notification_poll)`: separate socket timeouts for requests
+  and for notification polls (until now the connect timeout bounded both), so a poll loop can
+  wait briefly without shortening the time a request may take, or the other way round. Kept
+  across a reconnect.
+- `Connection::refresh_caches_if_program_changed`: clears the cached data-block list, type info
+  and resolved symbols if the PLC program changed — the data blocks' names, numbers or ids, or
+  the modification time of a cached block's type info (attribute 529). Resolved addresses carry
+  no symbol CRC (as in the reference driver), so the PLC doesn't notice a stale one: after a
+  download that renumbers a block or changes its members, a cached address could read or write
+  another variable. `clear_caches`, `resolve_symbol`, `write_tag` and `VarInfo` now say so.
+  The check is opt-in. On PLCSIM it notices a block downloaded while the CPU stays in RUN;
+  changing an existing block's members needs a download that stops the CPU, which ends every
+  session anyway.
+- s7tool `--targets <file>`: runs the same steps (default `report`, then `probe`) against every
+  PLC listed in a text file, one after the other — one PLC per line, `<ip>[:port]`, an optional
+  label and an optional transport (`--auto` when none). Each step runs in a session of its own
+  with its own session log, and `summary.txt` names the PLCs by label only, so the run's folder
+  can be sent on as it is. A step that got no connection is tried once more, then the PLC's
+  remaining steps are skipped.
+- s7tool `--timeout <s>` (default 10): how long to wait for the PLC to connect and to answer, for
+  a slow CPU — an S7-1214C in a field run answered each request in about half a second and left
+  some long answers unfinished for more than 10 s.
 - `s7commplus::set_log_redaction`: keeps the PLC's project data out of the driver's log records
   (telegram dumps stop after the PDU header; symbol and data-block names are left out). s7tool
   turns it on for its session log, which no longer carries tag and block names, values, alarm
@@ -137,6 +180,49 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- s7tool's `browse` (and `report`) stops at a lost connection instead of listing every remaining
+  data block as "interface withheld by PLC, likely know-how protected".
+- s7tool's session log no longer leaks a multi-line text (the comment XML `xidents` prints, an
+  alarm text over several lines): the log writer goes line by line, and a placeholder's markers
+  ended on the first line, so the following lines went out as they were. A line break in such a
+  text is now carried as a marker character, control characters (escape sequences, which could
+  make the log's output layer swallow the markers) become U+FFFD, and log records are redacted
+  before that layer. Where a marker is still missing, the log fails closed: it gets
+  `<redacted>` and drops the rest of the text up to the end marker.
+- Names in error messages no longer reach s7tool's session log: the log looked for a printed
+  name only as a whole whitespace-separated word, so a level of a typed symbol (`member 'lvl'
+  not found`), a quoted block name or a name with a space in it went out as it was. Every level
+  of a symbol is now looked for on its own, as a whole identifier anywhere in a line (short and
+  plain lowercase names where they are quoted or part of a path), longest first; s7tool learns
+  every data block's name when a command fails, so the driver's hint naming the block to quote
+  is caught; and errors s7tool prints have their quoted parts and `(got …)` values left out of
+  the log.
+- s7tool's session log replaces IPv6 addresses too (with their zone, also in brackets with a
+  port), not only IPv4 ones, and the PLC's host name, when `--ip` gives one, wherever it shows up
+  and in any letter case (`plc.example.com:102`), not only as a whole word in the same case.
+- A session log written with `--full-log` no longer records the password of a mistyped `legit`:
+  `Legit` in another letter case is masked like `legit`, and an unknown command within two
+  typing mistakes of `legit`, `login`, `auth` or `password` has all its arguments masked.
+- `datetime::format` returns `None` for a value out of its type's range instead of a wrong
+  date or time: a `DATE` wider than 16 bits used to wrap (70000 days showed as 2002-03-23), a
+  `TIME_OF_DAY` or `LTOD` past midnight wrapped round (90,000,000 ms showed as 01:00:00), and a
+  `DATE_AND_TIME` with a millisecond nibble that isn't BCD or a field out of range (month 13)
+  was shown anyway. `S7DateTime::from_date_and_time` takes exactly 8 bytes.
+- s7tool shows every element of a whole `Array of WString` and `Array of Date_And_Time`, as it
+  did for `Array of String`, instead of only the first.
+- An address array (or any array but a regular one) of `USInt` decodes as a `PValue::Array`
+  that keeps its flags byte, so it re-encodes as it came (`20 02 …`); it used to decode as a
+  `PValue::USIntArray`, which always encodes as a regular array (`10 02 …`).
+- Alarm associated values: a `Real` shows as the value it holds (12.756, not
+  12.755999565124512); `%f` and `%e` in an alarm text default to C's precision of 6 and `%e`
+  has C's form (`1.275600e+01`); `%x` of a negative value shows it in its type's width (`fffe`
+  for an `Int` of -2, not 16 digits); `LInt`, `ULInt`, `LWord` and the date and time types
+  (`Date`, `Time`, `Time_Of_Day`, `S5Time`, `Date_And_Time`, `LTime`, `LTOD`, `LDT`, `DTL`) are
+  decoded; and a value whose type isn't decoded leaves its placeholder in the text instead of
+  an empty string.
+- The `export_csv` example writes a field that a spreadsheet would run as a formula (a string
+  value starting with `=`, `+`, `-`, `@`, a tab or a carriage return) with a leading `'`, so it
+  opens as text.
 - `browse_vars` (and `prefetch_type_container`) no longer download the PLC's whole type-info
   container again on every call: it is fetched once per connection, until `clear_caches`. On an
   S7-1215C it is about 100 KB and took 6 s, three times per `s7tool report`.
@@ -230,6 +316,84 @@ All notable changes to this project are documented here. The format is based on
   bytes and the blob type that precede its length, as the reference does; they used to be read
   as the length. Serializing such a `Blob` is now an error rather than a form the PLC reads
   differently.
+- A request that fails before anything is sent (a value that doesn't serialize, a legacy request
+  over 64 KiB) no longer uses up a sequence number and integrity id, which left a gap the PLC
+  could refuse, and on a legacy connection no longer poisons it.
+- A subscription no longer waits forever after a reconnect. A reconnect starts a new session, in
+  which the PLC has no such subscription: polling it with `next_notification` now fails at once
+  with `Error::Closed` ("subscription lost by reconnect"), and `delete_subscription` does nothing
+  for it rather than delete an object of the new session that happens to have the same id. Each
+  `Subscription` records the session it belongs to (new `Subscription::generation`, compared
+  with the new `Connection::generation`, which changes with every reconnect). `Subscription`
+  gained a private field, so it can no longer be built with a struct literal.
+- Auto-reconnect (`set_auto_reconnect`) no longer silently drops the session's subscriptions or
+  legitimation: while the session has either, a read that loses the connection fails with that
+  error (logged as a warning) instead of reconnecting, and the caller reconnects and restores
+  them.
+- An error that poisons the connection no longer reports `is_timeout()`: a reconnect that timed
+  out, and a timed-out credit top-up for a subscription, are now `Error::Closed`, like a request
+  without a response. A failed reconnect leaves the connection poisoned.
+- `reconnect` shuts the old socket down before connecting, so the old session no longer holds
+  one of the PLC's connection slots (an S7-1200 has few) until the `Connection` is dropped.
+- `subscribe_with` and `subscribe_alarms_with` refuse a credit limit other than -1 (unlimited)
+  or 1..=255 before sending anything. A larger limit was never topped up (the PLC counts credit
+  in a one-byte tick), so the subscription stalled; 0 sent a top-up after every notification;
+  and a limit near `i16::MAX` overflowed the top-up arithmetic.
+- `read_var_values` reports a request the PLC refuses as a whole as an error. It used to retry
+  every refusal in halves down to single items (about twice as many requests as variables) and
+  then return `None` for all of them, as if each variable were unreadable; it also re-read a
+  batch whose items all had errors. It now halves a batch only when the PLC answers that it has
+  too many items, and an item error is a `None` at once. The batch size is set with the new
+  `Connection::set_read_batch_size` instead of the `S7_READ_BATCH` environment variable, which
+  was read on every call and is no longer consulted.
+- An element of a multi-dimensional `Bool` array resolves to the element the browse lists under
+  that name. The PLC starts each row on a byte boundary, which `browse_vars` accounted for but
+  symbol resolution didn't: in an `Array[0..1, 0..2] of Bool`, `[1,0]` read or wrote element 3
+  (a padding bit) instead of 8.
+- A malformed or hostile type info can no longer exhaust memory or panic the browse: the array
+  element counts it declares were expanded without bound (arrays of structs with arrays
+  multiply), and the element-id arithmetic could overflow. A browse now fails with an error past
+  1,000,000 variables (new `Connection::set_browse_limit`), and element ids past 32 bits are
+  rejected.
+- Symbol paths are parsed level by level, so a malformed path is an error instead of addressing
+  another variable: `"DB"x` used to be read as `DBx` and `ab"cd"` as `abcd`, an empty level
+  (`DB..x`, a leading or trailing `.`) was accepted, and spaces around a `.` became part of the
+  names. Whitespace around a level is now ignored. A `"` inside a quoted name is written doubled
+  (`"a""b"`), and browsed names containing a quote or starting or ending with whitespace are
+  quoted that way, so every browsed name round-trips through `resolve_symbol`. A member whose
+  name is empty (a Program_Alarm instance has one) is written `""`, as browse lists it.
+- TLS: a SystemEvent the PLC sends between the chunks of a response is cut out and handled on
+  its own; it used to be joined to the response, corrupting it (FW 4.2 sent keep-alives between
+  chunks on the legacy transport). The chunks and trailer of one telegram must now share a
+  protocol version.
+- TLS: a response arriving as one ISO packet with more than 16 KiB of data no longer fails with
+  "received plaintext buffer full"; decrypted data is taken out of rustls after every record,
+  and data already decrypted is returned before the socket is read again.
+- A PLC that closes the connection is noticed by a notification poll: the TLS `close_notify`
+  and the TCP connection closing are `Error::Closed` (the latter was `Io(UnexpectedEof)`), and
+  the poll no longer waits out one timeout after another. TCP keep-alive is on (first probe
+  after 20 s idle, then every 5 s), so the OS also notices a PLC that vanished without closing
+  the connection; this adds the `socket2` dependency.
+- Legacy connections detect replayed telegrams. The digest proves a telegram came from the PLC,
+  not that it is new: an accepted Get/SetMultiVariables, Explore, GetVarSubstreamed or
+  SetVariable response must now carry the integrity id that answers its request (the request's
+  integrity id plus its sequence number, as every response in the PLCSIM captures and the
+  S7-1200 logs does), and each subscription's notification sequence numbers must go up (gaps
+  allowed, and a wrap from just below a power-of-two boundary). A violation is an
+  `Error::Integrity` and poisons the connection. `explore_raw` can't check its response;
+  `explore` does.
+- The `connect_real_plc` handshake no longer panics on a session-setup value in the PLC's
+  plaintext CreateObject response whose VLQ never ends: it was spliced whole into the auth
+  request, overflowing the request's TPKT length. A value over 10 octets is now ignored like a
+  missing one, and the auth request's lengths are checked instead of assumed to fit.
+- Legacy: bytes after a telegram's trailer in the same COTP TSDU, or 1–3 bytes too short for a
+  chunk header, are a framing error (the connection is lost) instead of being dropped silently,
+  which lost whatever telegram they belonged to.
+- `explore_dump` / `explore_dump_attrs` (s7tool `xexplore`) no longer panic on a long attribute
+  value with non-ASCII text: it was shortened at byte 80, which can fall inside a character.
+- With `set_log_redaction` on, symbol-resolution errors (`not found`, `could not fully
+  resolve`, a bad path or array index, the browse limit) show `<name>` instead of the names,
+  and the "must be double-quoted" hint, which names a data block, is left out.
 
 ## [0.1.0] - 2026-07-05
 

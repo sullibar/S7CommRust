@@ -14,8 +14,9 @@
 //! Legitimation and the data operations (Explore, Get/SetMultiVariables) build on the
 //! `request_response` helper and follow.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,6 +32,7 @@ use crate::transport::{IsoTcp, TlsChannel};
 use crate::value::strings::{decode_s7_string, decode_wstring, encode_s7_string, encode_wstring};
 use crate::value::PValue;
 use crate::wire::pdu::{self, functioncode, ids, protocol_version};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Controller areas browsable by symbol: `(AccessArea RID, type-info relid, label)`, in the
 /// order the reference tries them (M, then Q, then I).
@@ -45,6 +47,10 @@ const DB_CLASS_RID: u32 = 2574;
 const PLC_PROGRAM_RID: u32 = 3;
 /// Attribute id `ObjectVariableTypeName` (an object's name).
 const OBJECT_VARIABLE_TYPE_NAME: u32 = 233;
+/// Attribute `VariableTypeStructModificationTime` (a ULInt) of a type-info object: when its
+/// layout last changed. Both type-info objects captured from PLCSIM carry it (with different
+/// values); the name is from the Wireshark dissector's id table.
+const STRUCT_MODIFICATION_TIME: u32 = 529;
 /// Attributes requested when browsing for data blocks (so DB objects are returned).
 const BROWSE_ATTRS: [u32; 3] = [
     OBJECT_VARIABLE_TYPE_NAME,
@@ -54,13 +60,13 @@ const BROWSE_ATTRS: [u32; 3] = [
 /// RID of the OMS type-info container (`Ids.ObjectOMSTypeInfoContainer`) — one Explore returns
 /// every block's type info at once.
 const OMS_TYPE_INFO_CONTAINER_RID: u32 = 537;
+/// Default for [`Connection::set_browse_limit`].
+const DEFAULT_MAX_BROWSE_VARS: usize = 1_000_000;
 /// Recursion guard for the browse walk (nested structs; S7 types are not cyclic).
 const MAX_BROWSE_DEPTH: usize = 16;
 /// How many variables to read per `GetMultiVariables` request when reading a browsed batch, at
-/// most. 48 was the measured sweet spot on a live S7-1200 (~12% faster than 32); the batch is also
-/// capped at the PLC's own item limit. [`Connection::read_var_values`] adaptively splits any batch
-/// a PLC refuses, so a larger value never loses data — it just costs a retry. Override with
-/// `S7_READ_BATCH`.
+/// most, by default. 48 was the measured sweet spot on an S7-1200 (~12% faster than 32); the batch
+/// is also capped at the PLC's own item limit. See [`Connection::set_read_batch_size`].
 const READ_BATCH: usize = 48;
 /// Items per Get/SetMultiVariables request until the PLC's own limits are read (the reference's
 /// `CommRessources` default).
@@ -100,10 +106,14 @@ pub struct DataBlock {
 /// A variable discovered by the browse walk (or resolved by [`Connection::resolve_var`]): its
 /// fully-qualified symbol path, the access address parts, and its datatype. Read/write it via
 /// [`VarInfo::address`].
+///
+/// The address is only good for the program it was browsed from: after a download that changes
+/// the blocks, it may name another variable (see [`Connection::clear_caches`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VarInfo {
     /// Fully-qualified symbol path (e.g. `"Motor_DB.axis[2].speed"`; area tags have no DB prefix).
-    /// Levels containing `.`, `[` or `]` are double-quoted, so the path round-trips through
+    /// Levels containing `.`, `[`, `]` or `"` (written doubled), or starting or ending with
+    /// whitespace, are double-quoted, so the path round-trips through
     /// [`Connection::resolve_symbol`].
     pub name: String,
     /// `AccessArea` — the DB relation id, or the M/Q/I area RID.
@@ -132,12 +142,35 @@ impl VarInfo {
 }
 
 /// A handle to an active subscription on the PLC. Poll it with [`Connection::next_notification`].
-/// The subscription lives until [`Connection::delete_subscription`] or the connection is dropped;
-/// the connection tracks its credit, so the handle is a plain id.
+/// The subscription lives until [`Connection::delete_subscription`] or the session ends; the
+/// connection tracks its credit, so the handle is a plain id.
+///
+/// A subscription belongs to the session that created it ([`Subscription::generation`]). A
+/// [`Connection::reconnect`] starts a new session in which it no longer exists: polling it then
+/// fails with [`Error::Closed`] ("subscription lost by reconnect") instead of waiting for
+/// notifications that will never come. Subscribe again on the new session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Subscription {
     /// The subscription object id the PLC allocated.
     pub object_id: u32,
+    /// The session it was created in (see [`Connection::generation`]).
+    generation: u64,
+}
+
+impl Subscription {
+    /// The session this subscription was created in: the [`Connection::generation`] at the time.
+    /// Once that changes (a reconnect), the subscription is gone.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// Source of [`Connection::generation`]s: unique across every session this process opens, so a
+/// handle from one session is never mistaken for another's, on any connection.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn new_generation() -> u64 {
+    NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Most notifications kept for subscriptions that are not being polled right now (see
@@ -149,6 +182,31 @@ const REAL_PLC_PUBLIC_KEY_LEN: usize = 40;
 
 /// A resolved symbol: its address and the leaf member's type-info element (none for a bare DB).
 type ResolvedSymbol = (ItemAddress, Option<crate::proto::VartypeElement>);
+
+/// Which of the [`Connection::set_timeouts`] a socket wait uses.
+#[derive(Clone, Copy)]
+enum Timeout {
+    Request,
+    NotificationPoll,
+}
+
+/// A request built by [`Connection::build_request`], with the ids it was given.
+struct BuiltRequest {
+    /// The framed request telegram.
+    framed: Vec<u8>,
+    /// Its sequence number.
+    seq: u16,
+    /// Its integrity id, if the session uses them.
+    integrity_id: Option<u32>,
+}
+
+/// A telegram encoded for the transport, ready to send.
+enum Encoded {
+    /// The legacy V3 digest frame.
+    Legacy(Vec<u8>),
+    /// TLS: the S7CommPlus chunks, one TLS record each.
+    Tls(Vec<Vec<u8>>),
+}
 
 /// Default per-operation socket timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -185,20 +243,34 @@ pub struct Connection {
     /// Resolved symbols, so a repeated [`Connection::read_tag`] / `write_tag` of the same name
     /// skips the walk through the type info.
     symbol_cache: HashMap<String, ResolvedSymbol>,
+    /// Set when a browse reached [`Connection::set_browse_limit`], so its nested walks stop too.
+    browse_limit_hit: bool,
     /// Set once a request/response fails partway through. A poisoned connection has an
     /// unknown sequence/integrity-id state relative to the PLC, so every subsequent
     /// [`Connection::request_response`] short-circuits with [`Error::Closed`].
     poisoned: bool,
     /// How this connection was established, so [`Connection::reconnect`] can re-create it.
     reconnect_target: ReconnectTarget,
-    /// When set, read operations transparently reconnect + retry once on a lost connection.
-    auto_reconnect: bool,
+    /// The caller's settings, kept across a reconnect.
+    settings: Settings,
     /// Notification telegrams (with their subscription id) received while waiting for something
     /// else — a response, or another subscription's notification; delivered in order by
     /// [`Connection::next_notification`].
     pending_notifications: VecDeque<(u32, Vec<u8>)>,
     /// Current credit limit of each finite-credit subscription, topped up as notifications arrive.
     credit_limits: HashMap<u32, i16>,
+    /// Legacy transport: the last notification sequence number of each subscription (see
+    /// [`Connection::check_notification_sequence`]).
+    notification_sequences: HashMap<u32, u32>,
+    /// The subscriptions created on this session and not deleted: what a reconnect would lose.
+    subscriptions: HashSet<u32>,
+    /// Whether [`Connection::legitimate`] succeeded on this session (a reconnect loses it).
+    legitimated: bool,
+    /// The key of the last new-scheme legitimation on this session, which the next one hashes
+    /// again (see [`Connection::legitimate_with`]).
+    legitimation_key: Option<[u8; 32]>,
+    /// This session's [`Connection::generation`].
+    generation: u64,
     /// Legacy transport: a telegram whose chunks are still arriving (kept across a read timeout,
     /// like the TLS path's `rbuf`).
     legacy_partial: crate::legacy::session::PartialResponse,
@@ -211,6 +283,31 @@ pub struct Connection {
     plc_description: Option<String>,
     /// Keep the next request's contents out of the log (it carries credentials).
     redact_next_request: bool,
+}
+
+/// What the caller set on a [`Connection`]; a reconnect keeps it.
+#[derive(Debug, Clone)]
+struct Settings {
+    /// When set, read operations transparently reconnect + retry once on a lost connection.
+    auto_reconnect: bool,
+    /// Most items [`Connection::read_var_values`] puts in one request.
+    read_batch: usize,
+    /// Most variables a browse returns (see [`Connection::set_browse_limit`]).
+    max_browse_vars: usize,
+    /// `(request, notification poll)` socket timeouts (see [`Connection::set_timeouts`]); `None`
+    /// keeps the connect timeout for both.
+    timeouts: Option<(Duration, Duration)>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            auto_reconnect: false,
+            read_batch: READ_BATCH,
+            max_browse_vars: DEFAULT_MAX_BROWSE_VARS,
+            timeouts: None,
+        }
+    }
 }
 
 /// Captures how a [`Connection`] was created so it can be re-established after a network drop.
@@ -233,6 +330,22 @@ enum ReconnectTarget {
         /// means "auto-detect/look up by fingerprint again".
         key: Option<Vec<u8>>,
     },
+    /// A mock legacy PLC ([`crate::mock_plc`]), which skips the login it can't do.
+    #[cfg(test)]
+    Mock {
+        addrs: Vec<SocketAddr>,
+        timeout: Duration,
+    },
+}
+
+/// Wipe the session's keys when the connection goes (a reconnect replaces it, too).
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if let Some(key) = self.legacy_session_key.as_mut() {
+            key.zeroize();
+        }
+        self.legitimation_key.zeroize();
+    }
 }
 
 impl Connection {
@@ -307,14 +420,20 @@ impl Connection {
             db_list: None,
             symbol_cache: HashMap::new(),
             poisoned: false,
+            browse_limit_hit: false,
             reconnect_target: ReconnectTarget::Tls {
                 addrs,
                 timeout,
                 pin,
             },
-            auto_reconnect: false,
+            settings: Settings::default(),
             pending_notifications: VecDeque::new(),
             credit_limits: HashMap::new(),
+            notification_sequences: HashMap::new(),
+            subscriptions: HashSet::new(),
+            legitimated: false,
+            legitimation_key: None,
+            generation: new_generation(),
             legacy_partial: Default::default(),
             max_read_tags: DEFAULT_TAGS_PER_REQUEST,
             max_write_tags: DEFAULT_TAGS_PER_REQUEST,
@@ -491,10 +610,16 @@ impl Connection {
             db_list: None,
             symbol_cache: HashMap::new(),
             poisoned: false,
+            browse_limit_hit: false,
             reconnect_target,
-            auto_reconnect: false,
+            settings: Settings::default(),
             pending_notifications: VecDeque::new(),
             credit_limits: HashMap::new(),
+            notification_sequences: HashMap::new(),
+            subscriptions: HashSet::new(),
+            legitimated: false,
+            legitimation_key: None,
+            generation: new_generation(),
             legacy_partial: Default::default(),
             max_read_tags: DEFAULT_TAGS_PER_REQUEST,
             max_write_tags: DEFAULT_TAGS_PER_REQUEST,
@@ -600,35 +725,88 @@ impl Connection {
     }
 
     /// Re-establish the connection using the parameters it was created with, after a network drop.
-    /// This starts a **fresh session**: a new session id, the sequence/integrity counters reset,
-    /// and the type-info/DB caches are cleared. Any prior legitimation and subscriptions are lost
-    /// and must be redone by the caller. Clears the poisoned state on success.
+    /// This starts a **fresh session**: a new session id and [`Connection::generation`], the
+    /// sequence/integrity counters reset, and the type-info/DB caches are cleared. Any prior
+    /// legitimation and subscriptions are lost and must be redone by the caller: a
+    /// [`Subscription`] of the old session then fails with [`Error::Closed`] when polled. Clears
+    /// the poisoned state on success.
+    ///
+    /// The old socket is shut down first, so the old session doesn't hold one of the PLC's
+    /// connection slots (an S7-1200 has few) while the new one is opened. If the reconnect
+    /// fails, the connection is left poisoned; a timeout is then reported as [`Error::Closed`]
+    /// (not [`Error::is_timeout`]), since the connection is unusable until a reconnect succeeds.
     ///
     /// For the legacy real-PLC transport this reuses the key that authenticated, so it skips the
     /// slow auto-key trial.
     pub fn reconnect(&mut self) -> Result<()> {
-        let auto = self.auto_reconnect;
-        let fresh = match self.reconnect_target.clone() {
+        if let Some(lost) = self.reconnect_would_lose() {
+            log::warn!("reconnecting drops the session's {lost}; they must be set up again");
+        }
+        // The old session is over whatever happens next.
+        self.poisoned = true;
+        self.tcp.shutdown();
+        let fresh = self.connect_again().map_err(|e| {
+            if e.is_timeout() {
+                Error::closed(format!("reconnect failed: {e}"))
+            } else {
+                e
+            }
+        })?;
+        let settings = self.settings.clone();
+        *self = fresh;
+        self.settings = settings;
+        Ok(())
+    }
+
+    /// A new connection to where this one was established.
+    fn connect_again(&self) -> Result<Self> {
+        match self.reconnect_target.clone() {
             ReconnectTarget::Tls {
                 addrs,
                 timeout,
                 pin,
-            } => Self::connect_tls(addrs, timeout, pin)?,
+            } => Self::connect_tls(addrs, timeout, pin),
             ReconnectTarget::LegacyPlcsim { addrs, timeout } => {
-                Self::connect_legacy(addrs.as_slice(), timeout)?
+                Self::connect_legacy(addrs.as_slice(), timeout)
             }
             ReconnectTarget::RealPlc {
                 addrs,
                 timeout,
                 key,
             } => match key {
-                Some(k) => Self::connect_real_plc_with_key(addrs.as_slice(), timeout, &k)?,
-                None => Self::connect_real_plc(addrs.as_slice(), timeout)?,
+                Some(k) => Self::connect_real_plc_with_key(addrs.as_slice(), timeout, &k),
+                None => Self::connect_real_plc(addrs.as_slice(), timeout),
             },
-        };
-        *self = fresh;
-        self.auto_reconnect = auto;
-        Ok(())
+            #[cfg(test)]
+            ReconnectTarget::Mock { addrs, timeout } => {
+                let tcp = IsoTcp::connect(addrs.as_slice(), timeout)?;
+                let target = ReconnectTarget::Mock { addrs, timeout };
+                Self::new_legacy(tcp, crate::mock_plc::mock_session(), target)
+            }
+        }
+    }
+
+    /// What a reconnect would lose that the caller has to restore: the subscriptions and
+    /// legitimation of this session, if any.
+    fn reconnect_would_lose(&self) -> Option<String> {
+        let subs = self.subscriptions.len();
+        match (subs, self.legitimated) {
+            (0, false) => None,
+            (0, true) => Some("legitimation".into()),
+            (n, legitimated) => Some(format!(
+                "{n} subscription(s){}",
+                if legitimated { " and legitimation" } else { "" }
+            )),
+        }
+    }
+
+    /// Identifies the current session: a number unique to it in this process, which changes with
+    /// every [`Connection::reconnect`] (including an automatic one). A [`Subscription`] carries
+    /// the generation it was created in, so a caller can tell whether it is still alive
+    /// (`sub.generation() == conn.generation()`), and that state tied to the session — its
+    /// subscriptions and legitimation — has to be set up again after a change.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// End the session cleanly, as the reference driver's `Disconnect` does: delete the server
@@ -654,8 +832,41 @@ impl Connection {
     /// once. Writes and subscriptions are never auto-retried — a write may already have been applied,
     /// and a subscription is bound to the old session — so handle those with an explicit
     /// [`Connection::reconnect`] plus your own re-subscribe / re-issue.
+    ///
+    /// A reconnect loses the session's subscriptions and legitimation, so while the session has
+    /// either, a read does **not** reconnect by itself: it fails with the error that lost the
+    /// connection (logged as a warning), and the caller reconnects explicitly and restores them.
+    /// Otherwise a reconnect would leave the subscriptions silent and the reads running with
+    /// fewer rights, without a word. Check [`Connection::generation`] to notice an automatic
+    /// reconnect.
     pub fn set_auto_reconnect(&mut self, enabled: bool) {
-        self.auto_reconnect = enabled;
+        self.settings.auto_reconnect = enabled;
+    }
+
+    /// Use separate socket timeouts for requests and for notification polls, instead of the
+    /// timeout given at connect for everything. `request` bounds each wait for (part of) a
+    /// response, and each socket write; a request that runs into it poisons the connection.
+    /// `notification_poll` bounds each wait in [`Connection::next_notification`] /
+    /// [`Connection::next_any_notification`], which then fail with a retryable timeout — so it
+    /// can be short for a responsive poll loop (or long for rare alarms) without loosening the
+    /// request timeout. Both apply per socket read, not to a whole operation, and are kept by
+    /// [`Connection::reconnect`]; connecting itself always uses the connect timeout. Zero is an
+    /// error.
+    pub fn set_timeouts(&mut self, request: Duration, notification_poll: Duration) -> Result<()> {
+        if request.is_zero() || notification_poll.is_zero() {
+            return Err(Error::protocol("timeouts must be longer than zero"));
+        }
+        self.settings.timeouts = Some((request, notification_poll));
+        Ok(())
+    }
+
+    /// Put the socket timeout for `what` in place (see [`Connection::set_timeouts`]).
+    fn use_timeout(&mut self, what: Timeout) -> Result<()> {
+        match (self.settings.timeouts, what) {
+            (None, _) => Ok(()),
+            (Some((request, _)), Timeout::Request) => self.tcp.set_timeout(request),
+            (Some((_, poll)), Timeout::NotificationPoll) => self.tcp.set_timeout(poll),
+        }
     }
 
     /// The exported `EXPERIMENTAL_OMS` keying material (for TLS legitimation). Errors on a legacy
@@ -677,11 +888,129 @@ impl Connection {
         self.sequence_number
     }
 
+    /// Allocate the next sequence number and — when the session uses them — integrity id for a
+    /// request to `function_code`, and build the request with `build(sequence_number,
+    /// with_integrity, integrity_id)`.
+    ///
+    /// The counters only move on if the request builds and fits the transport. A request that
+    /// never leaves (a value that doesn't serialize, a legacy request over 64 KiB) must not use
+    /// up ids: the PLC would see a gap in them, which it may refuse (see the mock PLC's notes on
+    /// integrity-id sensitivity).
+    fn build_request(
+        &mut self,
+        function_code: u16,
+        build: impl FnOnce(u16, bool, u32) -> Result<Vec<u8>>,
+    ) -> Result<BuiltRequest> {
+        let saved = (
+            self.sequence_number,
+            self.integrity_id,
+            self.integrity_id_set,
+        );
+        let seq = self.next_sequence_number();
+        let with_integrity = self.with_integrity;
+        let integrity = if with_integrity {
+            self.next_integrity_id(function_code)
+        } else {
+            0
+        };
+        let built = build(seq, with_integrity, integrity).and_then(|framed| {
+            self.check_sendable(&framed)?;
+            Ok(framed)
+        });
+        match built {
+            Ok(framed) => Ok(BuiltRequest {
+                framed,
+                seq,
+                integrity_id: with_integrity.then_some(integrity),
+            }),
+            Err(e) => {
+                (
+                    self.sequence_number,
+                    self.integrity_id,
+                    self.integrity_id_set,
+                ) = saved;
+                Err(e)
+            }
+        }
+    }
+
+    /// Whether the transport can carry `framed` at all: a legacy request travels as one V3 chunk,
+    /// whose length field caps it at 64 KiB. (TLS splits any request into chunks.)
+    fn check_sendable(&self, framed: &[u8]) -> Result<()> {
+        if self.legacy_session_key.is_some() {
+            crate::legacy::session::v3_chunk_len(framed)?;
+        }
+        Ok(())
+    }
+
+    /// Legacy transport: check that an accepted response carries the integrity id that answers
+    /// `req`, its own integrity id plus its sequence number. The digest proves a response came
+    /// from the PLC, but not that it answers this request rather than replaying an earlier one;
+    /// this does (with the sequence number check of [`check_response_header`]). Every response in
+    /// the captures and field logs follows the rule (PLCSIM live run; S7-1200 FW 4.2 to 4.7,
+    /// first s7tool logs), which is also how Wireshark's dissector computes it; the reference
+    /// driver doesn't check it. A mismatch poisons the connection. TLS sessions, which TLS
+    /// protects against replay, and CreateObject / DeleteObject responses, whose parsers don't
+    /// read the id, aren't checked.
+    fn check_response_integrity(&mut self, req: &BuiltRequest, got: u32) -> Result<()> {
+        let Some(sent) = req
+            .integrity_id
+            .filter(|_| self.legacy_session_key.is_some())
+        else {
+            return Ok(());
+        };
+        let expected = sent.wrapping_add(u32::from(req.seq));
+        if got == expected {
+            return Ok(());
+        }
+        let e = Error::integrity(format!(
+            "response integrity id {got}, expected {expected} (request integrity id {sent} + \
+             sequence number {}): a replayed or misdirected response",
+            req.seq
+        ));
+        log::warn!("{e}; connection poisoned");
+        self.poisoned = true;
+        Err(e)
+    }
+
+    /// Legacy transport: check that a notification for `subscription` moves its sequence number
+    /// forward, so a replayed notification is noticed. The digest proves a notification came
+    /// from the PLC, not that it is new. S7-1200 CPUs number each subscription's notifications
+    /// 0, 1, 2, … (probe run); a gap is fine (a notification the PLC dropped), a repeat or a
+    /// step back is not — except a wrap to a small number from just below a power-of-two
+    /// boundary, since where the PLC wraps (the field is a 32-bit VLQ) isn't known. A violation
+    /// poisons the connection. The reference driver doesn't check this.
+    fn check_notification_sequence(&mut self, subscription: u32, telegram: &[u8]) -> Result<()> {
+        if self.legacy_session_key.is_none() {
+            return Ok(());
+        }
+        let Some(seq) = notification_sequence_number(telegram) else {
+            return Ok(()); // too short to parse; parse_notification reports it
+        };
+        let Some(&last) = self.notification_sequences.get(&subscription) else {
+            self.notification_sequences.insert(subscription, seq);
+            return Ok(());
+        };
+        if !sequence_moves_on(last, seq) {
+            let e = Error::integrity(format!(
+                "notification for subscription 0x{subscription:08x} has sequence number {seq} \
+                 after {last}: a replayed notification"
+            ));
+            log::warn!("{e}; connection poisoned");
+            self.poisoned = true;
+            return Err(e);
+        }
+        self.notification_sequences.insert(subscription, seq);
+        Ok(())
+    }
+
     /// Perform CreateObject for the null server session and record the new ids.
     fn create_session(&mut self) -> Result<CreateObjectResponse> {
-        let seq = self.next_sequence_number();
-        let req = proto::build_create_session_request(seq, self.session_id, false, 0)?;
-        let resp_bytes = self.request_response(&req)?;
+        let session = self.session_id;
+        let req = self.build_request(functioncode::CREATE_OBJECT, |seq, _, _| {
+            proto::build_create_session_request(seq, session, false, 0)
+        })?;
+        let resp_bytes = self.request_response(&req.framed)?;
         let resp = proto::parse_create_object_response(&resp_bytes)?;
         if !resp.header.is_ok() {
             return Err(Error::protocol(format!(
@@ -699,9 +1028,11 @@ impl Connection {
     /// Step 4b: session setup. Echo the `ServerSessionVersion` Struct back to the session
     /// object via SetMultiVariables (no integrity id), completing session establishment.
     fn setup_session(&mut self, server_session_version: &PValue) -> Result<()> {
-        let seq = self.next_sequence_number();
-        let req = proto::build_session_setup_request(seq, self.session_id, server_session_version)?;
-        let resp_bytes = self.request_response(&req)?;
+        let session = self.session_id;
+        let req = self.build_request(functioncode::SET_MULTI_VARIABLES, |seq, _, _| {
+            proto::build_session_setup_request(seq, session, server_session_version)
+        })?;
+        let resp_bytes = self.request_response(&req.framed)?;
         let resp = proto::parse_set_multi_response(&resp_bytes)?;
         if !resp.header.is_ok() {
             return Err(Error::protocol(format!(
@@ -782,10 +1113,26 @@ impl Connection {
         &mut self,
         addresses: &[ItemAddress],
     ) -> Result<GetMultiVariablesResponse> {
-        match self.read_variables_once(addresses) {
-            Err(_) if self.auto_reconnect && self.poisoned => {
+        check_read_header(self.read_variables_unchecked_retrying(addresses)?)
+    }
+
+    /// [`Connection::read_variables_retrying`] without the check of the response header, so the
+    /// caller can tell a whole request the PLC refused by its return value.
+    fn read_variables_unchecked_retrying(
+        &mut self,
+        addresses: &[ItemAddress],
+    ) -> Result<GetMultiVariablesResponse> {
+        match self.read_variables_unchecked(addresses) {
+            Err(e) if self.settings.auto_reconnect && self.poisoned => {
+                if let Some(lost) = self.reconnect_would_lose() {
+                    log::warn!(
+                        "not reconnecting automatically: the session's {lost} would be lost; \
+                         reconnect explicitly and set them up again ({e})"
+                    );
+                    return Err(e);
+                }
                 self.reconnect()?;
-                self.read_variables_once(addresses)
+                self.read_variables_unchecked(addresses)
             }
             other => other,
         }
@@ -795,27 +1142,25 @@ impl Connection {
         &mut self,
         addresses: &[ItemAddress],
     ) -> Result<GetMultiVariablesResponse> {
-        let seq = self.next_sequence_number();
-        let with_integrity = self.with_integrity;
-        let integrity = if with_integrity {
-            self.next_integrity_id(functioncode::GET_MULTI_VARIABLES)
-        } else {
-            0
-        };
-        let req = proto::build_get_multi_request(
-            seq,
-            self.session_id,
-            addresses,
-            with_integrity,
-            integrity,
+        check_read_header(self.read_variables_unchecked(addresses)?)
+    }
+
+    /// One GetMultiVariables, its response returned whatever its return value.
+    fn read_variables_unchecked(
+        &mut self,
+        addresses: &[ItemAddress],
+    ) -> Result<GetMultiVariablesResponse> {
+        let session = self.session_id;
+        let req = self.build_request(
+            functioncode::GET_MULTI_VARIABLES,
+            |seq, with_integrity, integrity| {
+                proto::build_get_multi_request(seq, session, addresses, with_integrity, integrity)
+            },
         )?;
-        let resp_bytes = self.request_response(&req)?;
+        let resp_bytes = self.request_response(&req.framed)?;
         let resp = proto::parse_get_multi_response(&resp_bytes)?;
-        if !resp.header.is_ok() {
-            return Err(Error::protocol(format!(
-                "GetMultiVariables rejected: return_value=0x{:016x}",
-                resp.header.return_value
-            )));
+        if resp.header.is_ok() {
+            self.check_response_integrity(&req, resp.integrity_id)?;
         }
         Ok(resp)
     }
@@ -865,22 +1210,21 @@ impl Connection {
         addresses: &[ItemAddress],
         values: &[PValue],
     ) -> Result<SetMultiVariablesResponse> {
-        let seq = self.next_sequence_number();
-        let with_integrity = self.with_integrity;
-        let integrity = if with_integrity {
-            self.next_integrity_id(functioncode::SET_MULTI_VARIABLES)
-        } else {
-            0
-        };
-        let req = proto::build_set_multi_request(
-            seq,
-            self.session_id,
-            addresses,
-            values,
-            with_integrity,
-            integrity,
+        let session = self.session_id;
+        let req = self.build_request(
+            functioncode::SET_MULTI_VARIABLES,
+            |seq, with_integrity, integrity| {
+                proto::build_set_multi_request(
+                    seq,
+                    session,
+                    addresses,
+                    values,
+                    with_integrity,
+                    integrity,
+                )
+            },
         )?;
-        let resp_bytes = self.request_response(&req)?;
+        let resp_bytes = self.request_response(&req.framed)?;
         let resp = proto::parse_set_multi_response(&resp_bytes)?;
         if !resp.header.is_ok() {
             return Err(Error::protocol(format!(
@@ -888,6 +1232,7 @@ impl Connection {
                 resp.header.return_value
             )));
         }
+        self.check_response_integrity(&req, resp.integrity_id)?;
         Ok(resp)
     }
 
@@ -914,6 +1259,11 @@ impl Connection {
     /// see the reference route-mode/credit table). With a finite credit limit the PLC stops
     /// sending once the credit runs out; [`Connection::next_notification`] tops it up
     /// automatically before that happens.
+    ///
+    /// `credit_limit` is `-1` (unlimited) or `1..=255`: the PLC counts credit in the
+    /// notifications' one-byte credit tick, which can't reach a larger limit, and a limit of 0
+    /// would need a top-up after every notification. Anything else is an error, before anything
+    /// is sent.
     pub fn subscribe_with(
         &mut self,
         items: &[proto::SubscriptionItem],
@@ -921,26 +1271,26 @@ impl Connection {
         route_mode: u8,
         credit_limit: i16,
     ) -> Result<Subscription> {
-        let seq = self.next_sequence_number();
-        let with_integrity = self.with_integrity;
-        let integrity = if with_integrity {
-            self.next_integrity_id(functioncode::CREATE_OBJECT)
-        } else {
-            0
-        };
-        let req = proto::build_subscription_create_request(
-            seq,
-            self.session_id,
-            self.session_id2,
-            with_integrity,
-            integrity,
-            1, // change counter (first subscription on this connection)
-            route_mode,
-            cycle_time_ms,
-            credit_limit,
-            items,
+        check_credit_limit(credit_limit)?;
+        let (session, session2) = (self.session_id, self.session_id2);
+        let req = self.build_request(
+            functioncode::CREATE_OBJECT,
+            |seq, with_integrity, integrity| {
+                proto::build_subscription_create_request(
+                    seq,
+                    session,
+                    session2,
+                    with_integrity,
+                    integrity,
+                    1, // change counter (first subscription on this connection)
+                    route_mode,
+                    cycle_time_ms,
+                    credit_limit,
+                    items,
+                )
+            },
         )?;
-        let resp_bytes = self.request_response(&req)?;
+        let resp_bytes = self.request_response(&req.framed)?;
         let resp = proto::parse_create_object_response(&resp_bytes)?;
         if !resp.header.is_ok() {
             return Err(Error::protocol(format!(
@@ -961,7 +1311,22 @@ impl Connection {
         if credit_limit >= 0 {
             self.credit_limits.insert(object_id, credit_limit);
         }
-        Subscription { object_id }
+        self.subscriptions.insert(object_id);
+        Subscription {
+            object_id,
+            generation: self.generation,
+        }
+    }
+
+    /// The error for a subscription that belongs to another session.
+    fn stale_subscription(&self, sub: &Subscription) -> Option<Error> {
+        (sub.generation != self.generation).then(|| {
+            Error::closed(format!(
+                "subscription lost by reconnect: 0x{:08x} belonged to an earlier session \
+                 (generation {}, now {}); subscribe again",
+                sub.object_id, sub.generation, self.generation
+            ))
+        })
     }
 
     /// Create an **alarm** subscription (program/system alarms). The PLC then pushes alarm
@@ -978,24 +1343,25 @@ impl Connection {
         self.subscribe_alarms_with(-1)
     }
 
-    /// Like [`Connection::subscribe_alarms`] but with an explicit credit limit (`-1` = unlimited).
+    /// Like [`Connection::subscribe_alarms`] but with an explicit credit limit (`-1` = unlimited,
+    /// or `1..=255`, as for [`Connection::subscribe_with`]).
     pub fn subscribe_alarms_with(&mut self, credit_limit: i16) -> Result<Subscription> {
-        let seq = self.next_sequence_number();
-        let with_integrity = self.with_integrity;
-        let integrity = if with_integrity {
-            self.next_integrity_id(functioncode::CREATE_OBJECT)
-        } else {
-            0
-        };
-        let req = proto::build_alarm_subscription_create_request(
-            seq,
-            self.session_id,
-            self.session_id2,
-            with_integrity,
-            integrity,
-            credit_limit,
+        check_credit_limit(credit_limit)?;
+        let (session, session2) = (self.session_id, self.session_id2);
+        let req = self.build_request(
+            functioncode::CREATE_OBJECT,
+            |seq, with_integrity, integrity| {
+                proto::build_alarm_subscription_create_request(
+                    seq,
+                    session,
+                    session2,
+                    with_integrity,
+                    integrity,
+                    credit_limit,
+                )
+            },
         )?;
-        let resp_bytes = self.request_response(&req)?;
+        let resp_bytes = self.request_response(&req.framed)?;
         let resp = proto::parse_create_object_response(&resp_bytes)?;
         if !resp.header.is_ok() {
             return Err(Error::protocol(format!(
@@ -1014,21 +1380,20 @@ impl Connection {
     /// Delete a server object by id (e.g. tear down a subscription, freeing it on the PLC instead
     /// of relying on the connection dropping). Uses the set-class integrity counter.
     pub fn delete_object(&mut self, object_id: u32) -> Result<()> {
-        let seq = self.next_sequence_number();
-        let with_integrity = self.with_integrity;
-        let integrity = if with_integrity {
-            self.next_integrity_id(functioncode::DELETE_OBJECT)
-        } else {
-            0
-        };
-        let req = proto::build_delete_object_request(
-            seq,
-            self.session_id,
-            object_id,
-            with_integrity,
-            integrity,
+        let session = self.session_id;
+        let req = self.build_request(
+            functioncode::DELETE_OBJECT,
+            |seq, with_integrity, integrity| {
+                proto::build_delete_object_request(
+                    seq,
+                    session,
+                    object_id,
+                    with_integrity,
+                    integrity,
+                )
+            },
         )?;
-        let resp = self.request_response(&req)?;
+        let resp = self.request_response(&req.framed)?;
         let header = proto::parse_delete_object_response(&resp)?;
         if !header.is_ok() {
             return Err(Error::protocol(format!(
@@ -1038,14 +1403,25 @@ impl Connection {
         }
         // If it was a subscription, forget its credit and anything still queued for it.
         self.credit_limits.remove(&object_id);
+        self.subscriptions.remove(&object_id);
+        self.notification_sequences.remove(&object_id);
         self.pending_notifications
             .retain(|(id, _)| *id != object_id);
         Ok(())
     }
 
     /// Delete a subscription (from [`Connection::subscribe`] / [`Connection::subscribe_alarms`]),
-    /// freeing it on the PLC.
+    /// freeing it on the PLC. A subscription of an earlier session (see
+    /// [`Subscription::generation`]) ended with that session, so this does nothing for it — in
+    /// particular, it doesn't delete whatever object of the new session has the same id.
     pub fn delete_subscription(&mut self, sub: &Subscription) -> Result<()> {
+        if self.stale_subscription(sub).is_some() {
+            log::debug!(
+                "subscription 0x{:08x} ended with its session; nothing to delete",
+                sub.object_id
+            );
+            return Ok(());
+        }
         self.delete_object(sub.object_id)
     }
 
@@ -1061,7 +1437,13 @@ impl Connection {
     /// For a subscription with a *finite* credit limit this tops the credit up (a no-response
     /// `SetVariable`) before the credit tick reaches the limit, keeping the flow going. With the
     /// default unlimited credit there is nothing to do.
+    ///
+    /// A subscription of an earlier session (one a [`Connection::reconnect`] ended) fails at once
+    /// with [`Error::Closed`]: the PLC will never send it another notification.
     pub fn next_notification(&mut self, sub: &Subscription) -> Result<proto::Notification> {
+        if let Some(e) = self.stale_subscription(sub) {
+            return Err(e);
+        }
         self.next_notification_for(Some(sub.object_id))
     }
 
@@ -1087,6 +1469,7 @@ impl Connection {
         let bytes = match queued.and_then(|i| self.pending_notifications.remove(i)) {
             Some((_, bytes)) => bytes,
             None => loop {
+                self.use_timeout(Timeout::NotificationPoll)?;
                 let bytes = match self.recv_notification_telegram() {
                     Ok(b) => b,
                     Err(e) => {
@@ -1118,29 +1501,26 @@ impl Connection {
         if i16::from(notif.credit_tick) < limit - 1 {
             return Ok(());
         }
+        // The limit is in 1..=255 (see `check_credit_limit`), so this can't overflow; it wraps
+        // as the one-byte credit tick does.
         const STEP: i16 = 5;
         let next = ((limit + STEP) % 255).max(STEP);
         self.credit_limits.insert(object_id, next);
-        let seq = self.next_sequence_number();
-        let with_integrity = self.with_integrity;
-        let integrity = if with_integrity {
-            self.next_integrity_id(functioncode::SET_VARIABLE)
-        } else {
-            0
-        };
-        let req = proto::subscription::build_credit_limit_request(
-            seq,
-            self.session_id,
-            object_id,
-            with_integrity,
-            integrity,
-            next,
+        let session = self.session_id;
+        let req = self.build_request(
+            functioncode::SET_VARIABLE,
+            |seq, with_integrity, integrity| {
+                proto::subscription::build_credit_limit_request(
+                    seq,
+                    session,
+                    object_id,
+                    with_integrity,
+                    integrity,
+                    next,
+                )
+            },
         )?;
-        if let Err(e) = self.send_no_response(&req) {
-            self.poisoned = true;
-            return Err(e);
-        }
-        Ok(())
+        self.send_no_response(&req.framed)
     }
 
     /// Keep a notification for a later `next_notification` call. The queue is bounded: a
@@ -1160,8 +1540,15 @@ impl Connection {
     }
 
     /// Send a framed request without waiting for a reply (for `0x74` "no response" requests like
-    /// the subscription credit top-up). Transport-aware (legacy V3 digest vs TLS).
+    /// the subscription credit top-up). Transport-aware (legacy V3 digest vs TLS). A failure once
+    /// sending has started poisons the connection; a timeout is then reported as
+    /// [`Error::Closed`], as for a request.
     fn send_no_response(&mut self, framed: &[u8]) -> Result<()> {
+        if self.poisoned {
+            return Err(Error::closed(
+                "connection poisoned by an earlier transport failure; reconnect required",
+            ));
+        }
         let (_, function, seq) = pdu::header_fields(framed).unwrap_or_default();
         log::debug!(
             "→ {} seq={seq} ({} bytes, no response expected)",
@@ -1169,70 +1556,110 @@ impl Connection {
             framed.len()
         );
         log::trace!("→ {}", pdu::Hex(framed));
-        if let Some(key) = self.legacy_session_key {
-            let v3 = crate::legacy::session::frame_v3(&key, framed)?;
-            self.tcp.send_iso_packet(&v3)
+        let wire = self.encode_for_transport(framed)?;
+        self.use_timeout(Timeout::Request)?;
+        self.send_encoded(wire).map_err(|e| self.poison(e))
+    }
+
+    /// Mark the connection poisoned after `e` left it out of step with the PLC, and return the
+    /// error to report: a timeout becomes [`Error::Closed`], since unlike a quiet notification
+    /// poll the connection can't simply be used again.
+    fn poison(&mut self, e: Error) -> Error {
+        self.poisoned = true;
+        if e.is_timeout() {
+            Error::closed(format!("timed out ({e}); reconnect required"))
         } else {
-            self.send_tls(framed)
+            e
         }
     }
 
-    /// Send a framed telegram over TLS, split into chunks that each fit one COTP frame (see
-    /// [`pdu::MAX_CHUNK_PAYLOAD`]), every chunk in its own TLS record.
-    fn send_tls(&mut self, framed: &[u8]) -> Result<()> {
-        let tls = self
-            .tls
-            .as_mut()
-            .ok_or_else(|| Error::protocol("no TLS channel on a non-legacy connection"))?;
-        for chunk in pdu::split_framed_pdu(framed, pdu::MAX_CHUNK_PAYLOAD) {
-            tls.send(&mut self.tcp, &chunk)?;
+    /// Prepare a framed telegram for the transport, without sending anything: the legacy V3
+    /// digest frame, or the TLS chunks. A failure here leaves the connection as it was (nothing
+    /// went out), so it must not poison it.
+    fn encode_for_transport(&self, framed: &[u8]) -> Result<Encoded> {
+        match &self.legacy_session_key {
+            Some(key) => Ok(Encoded::Legacy(crate::legacy::session::frame_v3(
+                key, framed,
+            )?)),
+            None => {
+                if self.tls.is_none() {
+                    return Err(Error::protocol("no TLS channel on a non-legacy connection"));
+                }
+                Ok(Encoded::Tls(pdu::split_framed_pdu(
+                    framed,
+                    pdu::MAX_CHUNK_PAYLOAD,
+                )))
+            }
         }
-        Ok(())
+    }
+
+    /// Send an encoded telegram. TLS chunks each fit one COTP frame (see
+    /// [`pdu::MAX_CHUNK_PAYLOAD`]) and go in their own TLS record.
+    fn send_encoded(&mut self, wire: Encoded) -> Result<()> {
+        match wire {
+            Encoded::Legacy(v3) => self.tcp.send_iso_packet(&v3),
+            Encoded::Tls(chunks) => {
+                let tls = self
+                    .tls
+                    .as_mut()
+                    .ok_or_else(|| Error::protocol("no TLS channel on a non-legacy connection"))?;
+                for chunk in chunks {
+                    tls.send(&mut self.tcp, &chunk)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Read a single object attribute via GetVarSubstreamed.
     pub fn get_var_substreamed(&mut self, address: u32) -> Result<GetVarSubstreamedResponse> {
-        let seq = self.next_sequence_number();
-        let with_integrity = self.with_integrity;
-        let integrity = if with_integrity {
-            self.next_integrity_id(functioncode::GET_VAR_SUBSTREAMED)
-        } else {
-            0
-        };
-        let req = proto::build_get_var_substreamed_request(
-            protocol_version::V2,
-            seq,
-            self.session_id,
-            self.session_id, // InObjectId: read attributes of the session object
-            address,
-            with_integrity,
-            integrity,
+        let session = self.session_id;
+        let req = self.build_request(
+            functioncode::GET_VAR_SUBSTREAMED,
+            |seq, with_integrity, integrity| {
+                proto::build_get_var_substreamed_request(
+                    protocol_version::V2,
+                    seq,
+                    session,
+                    session, // InObjectId: read attributes of the session object
+                    address,
+                    with_integrity,
+                    integrity,
+                )
+            },
         )?;
-        let resp_bytes = self.request_response(&req)?;
-        proto::parse_get_var_substreamed_response(&resp_bytes)
+        let resp_bytes = self.request_response(&req.framed)?;
+        let resp = proto::parse_get_var_substreamed_response(&resp_bytes)?;
+        if resp.header.is_ok() {
+            self.check_response_integrity(&req, resp.integrity_id)?;
+        }
+        Ok(resp)
     }
 
     /// Write a single object attribute via SetVariable.
     pub fn set_variable(&mut self, address: u32, value: &PValue) -> Result<SetVariableResponse> {
-        let seq = self.next_sequence_number();
-        let with_integrity = self.with_integrity;
-        let integrity = if with_integrity {
-            self.next_integrity_id(functioncode::SET_VARIABLE)
-        } else {
-            0
-        };
-        let req = proto::build_set_variable_request(
-            protocol_version::V2,
-            seq,
-            self.session_id,
-            self.session_id, // InObjectId: write attributes of the session object
-            address,
-            value,
-            with_integrity,
-            integrity,
+        let session = self.session_id;
+        let req = self.build_request(
+            functioncode::SET_VARIABLE,
+            |seq, with_integrity, integrity| {
+                proto::build_set_variable_request(
+                    protocol_version::V2,
+                    seq,
+                    session,
+                    session, // InObjectId: write attributes of the session object
+                    address,
+                    value,
+                    with_integrity,
+                    integrity,
+                )
+            },
         )?;
-        let resp_bytes = self.request_response(&req)?;
-        proto::parse_set_variable_response(&resp_bytes)
+        let resp_bytes = self.request_response(&req.framed)?;
+        let resp = proto::parse_set_variable_response(&resp_bytes)?;
+        if resp.header.is_ok() {
+            self.check_response_integrity(&req, resp.integrity_id)?;
+        }
+        Ok(resp)
     }
 
     /// Explore the object tree under `explore_id` and return the raw response telegram
@@ -1240,6 +1667,9 @@ impl Connection {
     /// `ExploreChildsRecursive`, `parents` = `ExploreParents`. `attrs` restricts which
     /// attributes are returned per object (empty = all); some objects (e.g. data blocks)
     /// only appear when the relevant attributes are requested.
+    ///
+    /// Unlike [`Connection::explore`], this can't check a legacy response's integrity id (it is
+    /// past the objects the caller decodes).
     pub fn explore_raw(
         &mut self,
         explore_id: u32,
@@ -1247,7 +1677,27 @@ impl Connection {
         parents: u8,
         attrs: &[u32],
     ) -> Result<Vec<u8>> {
-        self.explore_request(explore_id, ids::NONE, recursive, parents, attrs)
+        Ok(self
+            .explore_request(explore_id, ids::NONE, recursive, parents, attrs)?
+            .0)
+    }
+
+    /// An Explore, decoded; a legacy response's integrity id is checked if the PLC accepted it.
+    /// The caller checks the return value.
+    fn explore_parsed(
+        &mut self,
+        explore_id: u32,
+        request_id: u32,
+        recursive: u8,
+        parents: u8,
+        attrs: &[u32],
+    ) -> Result<proto::ExploreResponse> {
+        let (raw, req) = self.explore_request(explore_id, request_id, recursive, parents, attrs)?;
+        let resp = proto::parse_explore_response(&raw, self.with_integrity)?;
+        if resp.header.is_ok() {
+            self.check_response_integrity(&req, resp.integrity_id)?;
+        }
+        Ok(resp)
     }
 
     /// [`Connection::explore_raw`] with an `ExploreRequestId`, which some objects use to select
@@ -1259,27 +1709,24 @@ impl Connection {
         recursive: u8,
         parents: u8,
         attrs: &[u32],
-    ) -> Result<Vec<u8>> {
-        let seq = self.next_sequence_number();
-        let with_integrity = self.with_integrity;
-        let integrity = if with_integrity {
-            self.next_integrity_id(functioncode::EXPLORE)
-        } else {
-            0
-        };
-        let req = proto::build_explore_request(
-            protocol_version::V2,
-            seq,
-            self.session_id,
-            explore_id,
-            request_id,
-            recursive,
-            parents,
-            attrs,
-            with_integrity,
-            integrity,
-        )?;
-        self.request_response(&req)
+    ) -> Result<(Vec<u8>, BuiltRequest)> {
+        let session = self.session_id;
+        let req = self.build_request(functioncode::EXPLORE, |seq, with_integrity, integrity| {
+            proto::build_explore_request(
+                protocol_version::V2,
+                seq,
+                session,
+                explore_id,
+                request_id,
+                recursive,
+                parents,
+                attrs,
+                with_integrity,
+                integrity,
+            )
+        })?;
+        let raw = self.request_response(&req.framed)?;
+        Ok((raw, req))
     }
 
     /// Whether requests currently carry an integrity id.
@@ -1296,9 +1743,7 @@ impl Connection {
         parents: u8,
         attrs: &[u32],
     ) -> Result<proto::ExploreResponse> {
-        let with_integrity = self.with_integrity;
-        let raw = self.explore_raw(explore_id, recursive, parents, attrs)?;
-        let resp = proto::parse_explore_response(&raw, with_integrity)?;
+        let resp = self.explore_parsed(explore_id, ids::NONE, recursive, parents, attrs)?;
         if !resp.header.is_ok() {
             return Err(Error::protocol(format!(
                 "Explore rejected: return_value=0x{:016x}",
@@ -1364,10 +1809,10 @@ impl Connection {
             );
             for (id, v) in &obj.attributes {
                 let vs = format!("{v:?}");
-                let vs = if vs.len() > 80 {
-                    format!("{}…", &vs[..80])
-                } else {
-                    vs
+                // Cut at the 80th character, not byte: a WString may hold non-ASCII text.
+                let vs = match vs.char_indices().nth(80) {
+                    Some((cut, _)) => format!("{}…", &vs[..cut]),
+                    None => vs,
                 };
                 let _ = writeln!(out, "{pad}  attr 0x{id:x} ({id}) = {vs}");
             }
@@ -1438,13 +1883,71 @@ impl Connection {
     }
 
     /// Forget the cached data-block list, type info and resolved symbols, so the next lookup
-    /// asks the PLC again — e.g. after a program download changed the blocks. (A reconnect
-    /// starts with empty caches anyway.)
+    /// asks the PLC again. (A reconnect starts with empty caches anyway.)
+    ///
+    /// **Call this after a program download** (or use
+    /// [`Connection::refresh_caches_if_program_changed`]). Symbols are addressed by the data
+    /// block's relation id and the members' LIDs, with a symbol CRC of 0 — the reference driver
+    /// does the same — so the PLC does not check that an address still means the symbol it was
+    /// resolved from. After a download that renumbers a data block or changes its members' LIDs,
+    /// a cached address can silently read or write **another variable**. The same holds for
+    /// [`ItemAddress`]es and [`VarInfo`]s a caller keeps.
     pub fn clear_caches(&mut self) {
         self.type_info_cache.clear();
         self.type_container_prefetched = false;
         self.db_list = None;
         self.symbol_cache.clear();
+    }
+
+    /// Check whether the PLC program changed in a way that invalidates the cached addresses
+    /// (see [`Connection::clear_caches`]), and if so clear the caches. Returns whether it did.
+    /// Nothing is checked, and `false` returned, while nothing is cached.
+    ///
+    /// It reads the data-block list again (one Explore and one batched read, the requests the
+    /// first lookup made) and compares the blocks' names, numbers, relation ids and type-info
+    /// ids; if those match, it compares the modification time of each data block's type info
+    /// that is cached (attribute 529, `VariableTypeStructModificationTime`, which the PLC sends
+    /// with every type-info object) — one small Explore per such block. A layout change inside
+    /// a block shows up there; a change confined to a nested UDT or to the PLC tags (M/Q/I) may
+    /// not, so after a known download, [`Connection::clear_caches`] is the sure way.
+    ///
+    /// Opt-in and untested against PLCs so far: the attribute-filtered Explore of a type-info
+    /// object is the form `cpu_state` uses on the CPU object, but has not been tried on a type
+    /// (an S7-1215C on FW V4.2 closes the connection over some Explores it refuses).
+    pub fn refresh_caches_if_program_changed(&mut self) -> Result<bool> {
+        let Some(before) = self.db_list.clone() else {
+            return Ok(false);
+        };
+        let times: Vec<(u32, PValue)> = before
+            .iter()
+            .filter_map(|db| {
+                let ti = self.type_info_cache.get(&db.ti_relid)?;
+                Some((db.ti_relid, ti.attribute(STRUCT_MODIFICATION_TIME)?.clone()))
+            })
+            .collect();
+        self.db_list = None;
+        let now = self.data_blocks()?;
+        let same_blocks = before.len() == now.len()
+            && before.iter().zip(now.iter()).all(|(a, b)| {
+                (a.name.as_str(), a.relid, a.number, a.ti_relid)
+                    == (b.name.as_str(), b.relid, b.number, b.ti_relid)
+            });
+        let mut changed = !same_blocks;
+        for (ti_relid, time) in times {
+            if changed {
+                break;
+            }
+            let resp = self.explore(ti_relid, 0, 0, &[STRUCT_MODIFICATION_TIME])?;
+            let current = find_object(&resp.objects, ti_relid)
+                .and_then(|o| o.attribute(STRUCT_MODIFICATION_TIME));
+            // A PLC that doesn't answer with the attribute tells nothing either way.
+            changed = current.is_some_and(|c| *c != time);
+        }
+        if changed {
+            log::info!("the PLC program changed; cached addresses dropped");
+            self.clear_caches();
+        }
+        Ok(changed)
     }
 
     /// Discover (and cache) the data blocks: name, relid, number, and type-info relid.
@@ -1542,6 +2045,7 @@ impl Connection {
     /// first. Blocks whose interface the PLC withholds (know-how protected) contribute nothing. A lost
     /// connection is an error rather than a partial list.
     pub fn browse_vars(&mut self) -> Result<Vec<VarInfo>> {
+        self.browse_limit_hit = false;
         let dbs = self.data_blocks()?;
         if let Err(e) = self.prefetch_type_container() {
             self.skip_unless_lost(e, "the type-info prefetch")?; // best effort
@@ -1576,11 +2080,44 @@ impl Connection {
     /// and goes on — unless the connection is gone, when continuing would only produce a partial
     /// list that looks complete.
     fn skip_unless_lost(&self, e: Error, what: &str) -> Result<()> {
-        if self.poisoned {
+        if self.poisoned || self.browse_limit_hit {
             return Err(e);
         }
         log::debug!("browse: skipping {}: {e}", crate::logging::name(what));
         Ok(())
+    }
+
+    /// Check that `more` variables still fit in a browse that has found `found` so far (see
+    /// [`Connection::set_browse_limit`]). Array element counts come from the PLC's type info, and
+    /// arrays of structs with arrays multiply, so a malformed or hostile type info could ask for
+    /// billions; past the limit the browse fails rather than run out of memory (or return a list
+    /// that looks complete but isn't).
+    fn check_browse_room(&mut self, found: usize, more: u32, what: &str) -> Result<()> {
+        let max = self.settings.max_browse_vars;
+        let needed = usize::try_from(more)
+            .ok()
+            .and_then(|m| found.checked_add(m));
+        if needed.is_some_and(|n| n <= max) {
+            return Ok(());
+        }
+        self.browse_limit_hit = true;
+        log::warn!(
+            "browse stopped at {}: more than {max} variables ({found} so far, {more} more)",
+            crate::logging::name(what)
+        );
+        Err(Error::protocol(format!(
+            "browse stopped: the program has more than {max} variables (at '{}', {found} so far \
+             and {more} more); raise the limit with Connection::set_browse_limit",
+            crate::logging::name(what)
+        )))
+    }
+
+    /// Most variables a browse ([`Connection::browse_vars`], [`Connection::browse_datablock`],
+    /// [`Connection::browse_controller_area`]) returns: past it the browse fails with an error
+    /// instead of running out of memory on a type info that declares huge arrays. The default,
+    /// 1,000,000, is far above any program measured so far.
+    pub fn set_browse_limit(&mut self, max_vars: usize) {
+        self.settings.max_browse_vars = max_vars;
     }
 
     /// Enumerate the readable leaf variables of one data block (name prefixed by the DB name).
@@ -1590,6 +2127,7 @@ impl Connection {
         ti_relid: u32,
         name: &str,
     ) -> Result<Vec<VarInfo>> {
+        self.browse_limit_hit = false;
         let mut out = Vec::new();
         let prefix = quote_level(name);
         self.walk_type(
@@ -1606,6 +2144,7 @@ impl Connection {
 
     /// Enumerate the readable leaf variables of one controller area (M/Q/I; bare tag names).
     pub fn browse_controller_area(&mut self, area_rid: u32, ti_relid: u32) -> Result<Vec<VarInfo>> {
+        self.browse_limit_hit = false;
         let mut out = Vec::new();
         self.walk_type(
             area_rid,
@@ -1655,14 +2194,16 @@ impl Connection {
             let has_rel = oi.has_relation();
 
             if oi.is_1dim || oi.is_mdim {
+                // The element count comes from the PLC: bound it before expanding it.
+                self.check_browse_room(out.len(), oi.array_element_count, &name)?;
                 // Enumerate array elements: `(display suffix, zero-based element id)`.
                 let elems: Vec<(String, u32)> = if oi.is_1dim {
-                    let lower = oi.array_lower_bounds;
+                    let lower = i64::from(oi.array_lower_bounds);
                     (0..oi.array_element_count)
-                        .map(|k| (format!("[{}]", lower + k as i32), k))
+                        .map(|k| (format!("[{}]", lower + i64::from(k)), k))
                         .collect()
                 } else {
-                    mdim_elements(oi, sdt)
+                    mdim_elements(oi, sdt)?
                 };
                 for (suffix, id) in elems {
                     let ename = format!("{name}{suffix}");
@@ -1678,6 +2219,7 @@ impl Connection {
                             }
                         }
                     } else {
+                        self.check_browse_room(out.len(), 1, &ename)?;
                         out.push(VarInfo {
                             name: ename,
                             access_area: area,
@@ -1697,6 +2239,7 @@ impl Connection {
                     }
                 }
             } else {
+                self.check_browse_room(out.len(), 1, &name)?;
                 out.push(VarInfo {
                     name,
                     access_area: area,
@@ -1710,78 +2253,70 @@ impl Connection {
         Ok(())
     }
 
-    /// Read the current values of browsed variables in batched `GetMultiVariables` requests.
-    /// Returns one entry per input var (in order): `Some(value)` if read, `None` if that item
-    /// genuinely errored on the PLC. A whole batch failing propagates as `Err`.
+    /// Read the current values of browsed variables in batched `GetMultiVariables` requests of
+    /// at most [`Connection::set_read_batch_size`] items (48 by default) and the PLC's own limit.
+    /// Returns one entry per input var (in order): `Some(value)` if read, `None` if the PLC
+    /// reported an error for that item.
     ///
-    /// A batch whose items *all* come back errored is treated as "the PLC refused a batch this
-    /// large" and is retried in halves down to single items — so a per-request item cap degrades
-    /// to correct (if slower) reads rather than spurious "not readable" results.
+    /// A request the PLC refuses as a whole fails the call with that error — except the refusal
+    /// of a request with more items than the PLC accepts, which is retried in halves (a PLC whose
+    /// real limit is below the one it advertises still reads everything, just slower).
     pub fn read_var_values(&mut self, vars: &[VarInfo]) -> Result<Vec<Option<PValue>>> {
-        let batch = std::env::var("S7_READ_BATCH")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(READ_BATCH)
-            .min(self.max_read_tags.max(1));
+        let batch = self.settings.read_batch.min(self.max_read_tags).max(1);
         let mut out = Vec::with_capacity(vars.len());
         for chunk in vars.chunks(batch) {
-            self.read_chunk_adaptive(chunk, &mut out)?;
+            self.read_chunk(chunk, &mut out)?;
         }
         Ok(out)
     }
 
-    /// Read one chunk, tolerating a PLC per-request cap: an over-large batch is refused either as
-    /// a header-level rejection (`Err`) or as every item erroring — in both cases (when the chunk
-    /// has more than one item) we split in half and retry. A genuinely unreadable *single* item
-    /// becomes `None` rather than aborting the whole read; only a lost connection propagates.
-    fn read_chunk_adaptive(
-        &mut self,
-        chunk: &[VarInfo],
-        out: &mut Vec<Option<PValue>>,
-    ) -> Result<()> {
+    /// Most items [`Connection::read_var_values`] puts in one request (default 48, the measured
+    /// sweet spot on an S7-1200: ~12% faster than 32), capped by
+    /// [`Connection::max_tags_per_read`] whatever is set here. 0 is taken as 1.
+    pub fn set_read_batch_size(&mut self, items: usize) {
+        self.settings.read_batch = items.max(1);
+    }
+
+    /// Read one chunk of [`Connection::read_var_values`], halving it while the PLC says it has too
+    /// many items.
+    fn read_chunk(&mut self, chunk: &[VarInfo], out: &mut Vec<Option<PValue>>) -> Result<()> {
         if chunk.is_empty() {
             return Ok(());
         }
         let addrs: Vec<ItemAddress> = chunk.iter().map(VarInfo::address).collect();
-        match self.read_variables(&addrs) {
-            Ok(resp) => {
-                let vals: Vec<Option<PValue>> = resp
-                    .into_items(chunk.len())
-                    .into_iter()
-                    .map(std::result::Result::ok)
-                    .collect();
-                if chunk.len() > 1 && vals.iter().all(Option::is_none) {
-                    self.split_and_read(chunk, out)
-                } else {
-                    out.extend(vals);
-                    Ok(())
-                }
-            }
-            // A real transport loss must propagate; a protocol rejection of an over-cap batch is
-            // recoverable by splitting. A single item that still fails is recorded as `None`.
-            Err(e) if self.poisoned => Err(e),
-            Err(_) if chunk.len() > 1 => self.split_and_read(chunk, out),
-            Err(_) => {
-                out.push(None);
-                Ok(())
-            }
+        let resp = self.read_variables_unchecked_retrying(&addrs)?;
+        let rv = resp.header.return_value;
+        if !resp.header.is_ok() && is_too_many_items(rv) && chunk.len() > 1 {
+            log::debug!(
+                "the PLC refused {} items in one read (return_value=0x{rv:016x}); halving",
+                chunk.len()
+            );
+            let mid = chunk.len() / 2;
+            self.read_chunk(&chunk[..mid], out)?;
+            return self.read_chunk(&chunk[mid..], out);
         }
-    }
-
-    /// Split a chunk in half and read each half (used by the adaptive read to back off an
-    /// over-large batch).
-    fn split_and_read(&mut self, chunk: &[VarInfo], out: &mut Vec<Option<PValue>>) -> Result<()> {
-        let mid = chunk.len() / 2;
-        self.read_chunk_adaptive(&chunk[..mid], out)?;
-        self.read_chunk_adaptive(&chunk[mid..], out)
+        let resp = check_read_header(resp)?;
+        out.extend(
+            resp.into_items(chunk.len())
+                .into_iter()
+                .map(std::result::Result::ok),
+        );
+        Ok(())
     }
 
     /// Resolve a symbol like `"Data_block_1.toto"` to its [`ItemAddress`] by walking the
     /// block's type info. Handles nested structs/FBs and 1-D/M-D array indexing
     /// (`"DB.arr[2]"`, `"DB.m[1,2]"`). Paths can be written as TIA Portal shows them: names may
     /// be double-quoted, which is required when they contain `.`, `[` or `]`
-    /// (`"\"Data block.1\".\"value.1\""`), and array-DB elements are `"\"Array DB\"[2]"`.
+    /// (`"\"Data block.1\".\"value.1\""`), and array-DB elements are `"\"Array DB\"[2]"`. A `"`
+    /// inside a quoted name is written doubled. Whitespace around a level is ignored; an empty
+    /// level (`DB..x`) or anything but `.` or `[` right after a quoted name is an error.
+    ///
+    /// The result is cached (and so is the type info behind it), and the address carries no
+    /// symbol CRC for the PLC to check: after a program download that renumbers a data block or
+    /// changes its members, it may address **another variable** without any error. Call
+    /// [`Connection::clear_caches`] after a download, and don't keep the returned address past
+    /// one either (see [`Connection::refresh_caches_if_program_changed`]).
     pub fn resolve_symbol(&mut self, symbol: &str) -> Result<ItemAddress> {
         Ok(self.resolve_full(symbol)?.0)
     }
@@ -1859,8 +2394,10 @@ impl Connection {
                     }
                 }
                 found.ok_or_else(|| {
+                    // The hint names a data block, which a redacted log must not carry.
                     let hint = dbs
                         .iter()
+                        .filter(|_| !crate::logging::redacting())
                         .find(|d| d.name.contains('.') && symbol.starts_with(d.name.as_str()))
                         .map(|d| {
                             format!(
@@ -1870,7 +2407,8 @@ impl Connection {
                         })
                         .unwrap_or_default();
                     Error::protocol(format!(
-                        "symbol '{symbol}' not found in any data block or M/Q/I area{hint}"
+                        "symbol '{}' not found in any data block or M/Q/I area{hint}",
+                        crate::logging::name(symbol)
                     ))
                 })?
             };
@@ -1895,11 +2433,9 @@ impl Connection {
                 .vartype_list
                 .as_ref()
                 .ok_or_else(|| Error::protocol("type info missing VartypeList"))?;
-            let idx = names
-                .names
-                .iter()
-                .position(|n| n == name)
-                .ok_or_else(|| Error::protocol(format!("member '{name}' not found")))?;
+            let idx = names.names.iter().position(|n| n == name).ok_or_else(|| {
+                Error::protocol(format!("member '{}' not found", crate::logging::name(name)))
+            })?;
             let elem = vt
                 .elements
                 .get(idx)
@@ -1911,8 +2447,13 @@ impl Connection {
             // Array indexing: append the (zero-based, row-major) element id, plus an extra
             // `.1` when the elements are structs (array-of-struct).
             if !indices.is_empty() {
-                let array_lid = array_element_id(oi, indices)
-                    .ok_or_else(|| Error::protocol(format!("bad array index for '{name}'")))?;
+                let array_lid =
+                    array_element_id(oi, elem.softdatatype, indices).ok_or_else(|| {
+                        Error::protocol(format!(
+                            "bad array index for '{}'",
+                            crate::logging::name(name)
+                        ))
+                    })?;
                 addr.lid.push(array_lid);
                 if oi.has_relation() {
                     addr.lid.push(1);
@@ -1921,7 +2462,8 @@ impl Connection {
                 // A whole array-of-struct can be read as the leaf, but its members can only be
                 // reached through an element.
                 return Err(Error::protocol(format!(
-                    "'{name}' is an array; index it to reach its members"
+                    "'{}' is an array; index it to reach its members",
+                    crate::logging::name(name)
                 )));
             }
 
@@ -1936,8 +2478,9 @@ impl Connection {
         }
         if i < levels.len() {
             return Err(Error::protocol(format!(
-                "could not fully resolve '{symbol}' (stopped before '{}')",
-                levels[i].0
+                "could not fully resolve '{}' (stopped before '{}')",
+                crate::logging::name(symbol),
+                crate::logging::name(&levels[i].0)
             )));
         }
         Ok((addr, leaf))
@@ -1962,6 +2505,10 @@ impl Connection {
 
     /// Write a single tag by symbol name (e.g. `"Data_block_1.titi"`). The `value` type must
     /// match the PLC variable's type.
+    ///
+    /// The name resolves through the cache: after a program download, call
+    /// [`Connection::clear_caches`] first, or the write may land in another variable (see
+    /// [`Connection::resolve_symbol`]).
     pub fn write_tag(&mut self, symbol: &str, value: PValue) -> Result<()> {
         let addr = self.resolve_symbol(symbol)?;
         self.write_resolved(symbol, addr, value)
@@ -2170,14 +2717,13 @@ impl Connection {
     /// delivers it.
     pub fn active_alarms(&mut self) -> Result<Vec<proto::Alarm>> {
         use proto::alarm::{ALARM_SUBSYSTEM_RID, DAI_ATTRIBUTES, UPDATE_RELEVANT_DAI};
-        let raw = self.explore_request(
+        let resp = self.explore_parsed(
             ALARM_SUBSYSTEM_RID,
             UPDATE_RELEVANT_DAI,
             1,
             0,
             &DAI_ATTRIBUTES,
         )?;
-        let resp = proto::parse_explore_response(&raw, self.with_integrity)?;
         if !resp.header.is_ok() {
             return Err(Error::protocol(format!(
                 "reading the pending alarms rejected: return_value=0x{:016x}",
@@ -2206,46 +2752,87 @@ impl Connection {
         }
     }
 
-    /// Authenticate (the "new", firmware ≥ V3.1 path): fetch the server-session challenge,
-    /// AES-encrypt the credentials payload with the exported keying material, and submit it.
+    /// Authenticate with the PLC's password (empty `username`) or as a user, in the scheme the
+    /// PLC's firmware takes, chosen from [`Connection::plc_description`] as the reference driver
+    /// chooses it (see [`crate::legitimation::scheme_for`]):
+    ///
+    /// * the **new** scheme (S7-1500 FW ≥ V3.1, S7-1200 FW ≥ V4.7 and G2): the credentials,
+    ///   AES-encrypted with a key derived from the TLS session;
+    /// * the **legacy** scheme (S7-1500 FW V2.9–V3.0, S7-1200 FW V4.3–V4.6, software
+    ///   controllers): `sha1(password) XOR challenge`. It knows no users: a `username` is
+    ///   ignored, as the reference ignores it.
+    ///
+    /// Older firmware, and a description that doesn't say which applies, are an error; use
+    /// [`Connection::legitimate_with`] to choose the scheme yourself.
+    ///
+    /// Legitimation requires a TLS connection ([`Connection::connect`]) and fails at once, before
+    /// anything is sent, on a legacy one: there the challenge and the answer would cross the
+    /// network unencrypted, which gives away `sha1(password)` — all the PLC checks. A reconnect
+    /// loses the legitimation (see [`Connection::reconnect`]).
     pub fn legitimate(&mut self, username: &str, password: &str) -> Result<()> {
+        self.require_tls_for_legitimation()?;
+        let description = self.plc_description.as_deref().ok_or_else(|| {
+            Error::protocol(
+                "legitimation: the PLC sent no description, so the scheme is unknown; \
+                 use legitimate_with",
+            )
+        })?;
+        let scheme = crate::legitimation::scheme_for(description)?;
+        log::debug!("legitimation scheme for {description:?}: {scheme:?}");
+        self.legitimate_with(scheme, username, password)
+    }
+
+    /// Like [`Connection::legitimate`], but in the given `scheme` whatever the firmware.
+    pub fn legitimate_with(
+        &mut self,
+        scheme: crate::legitimation::LegitimationScheme,
+        username: &str,
+        password: &str,
+    ) -> Result<()> {
+        use crate::legitimation::LegitimationScheme;
+        self.require_tls_for_legitimation()?;
         // 1. Fetch the challenge.
-        let challenge_resp = self.get_var_substreamed(ids::SERVER_SESSION_REQUEST)?;
-        if !challenge_resp.header.is_ok() {
-            return Err(Error::protocol(format!(
-                "challenge request rejected: return_value=0x{:016x}",
-                challenge_resp.header.return_value
-            )));
-        }
-        let challenge = match challenge_resp.value {
-            PValue::USIntArray(bytes) => bytes,
-            other => {
-                return Err(Error::protocol(format!(
-                    "unexpected challenge value type: {other:?}"
-                )))
+        let challenge = self.legitimation_challenge()?;
+        // 2. Answer it, keeping the answer out of the log.
+        let (address, answer) = match scheme {
+            LegitimationScheme::Legacy => {
+                if !username.is_empty() {
+                    log::warn!("legacy legitimation is by password only; the username is ignored");
+                }
+                let answer = crate::legitimation::legacy_challenge_response(password, &challenge)?;
+                (ids::SERVER_SESSION_RESPONSE, PValue::USIntArray(answer))
+            }
+            LegitimationScheme::New => {
+                if challenge.len() < crypto::AES_BLOCK_LEN {
+                    return Err(Error::protocol("challenge shorter than one AES block"));
+                }
+                // The reference "rolls" the key: each legitimation on a session hashes the
+                // previous key again, starting from the exported secret.
+                let base = Zeroizing::new(match self.legitimation_key {
+                    Some(key) => key,
+                    None => self.export_oms_secret()?,
+                });
+                let key = Zeroizing::new(crypto::sha256(&*base));
+                self.legitimation_key = Some(*key);
+                let iv = &challenge[..crypto::AES_BLOCK_LEN];
+                // The credentials in the clear, wiped once encrypted.
+                let mut credentials = build_legitimation_payload(username, password);
+                // Room for it all up front: a reallocation would leave a copy behind.
+                let room = 64 + username.len() + password.len();
+                let mut payload = Zeroizing::new(Vec::with_capacity(room));
+                let serialized = credentials.serialize(&mut *payload);
+                wipe_blobs(&mut credentials);
+                serialized?;
+                let ciphertext = crypto::encrypt_aes256_cbc_pkcs7(&*key, iv, &payload)?;
+                let blob = PValue::Blob {
+                    root_id: 0,
+                    data: ciphertext,
+                };
+                (ids::LEGITIMATE, blob)
             }
         };
-        if challenge.len() < crypto::AES_BLOCK_LEN {
-            return Err(Error::protocol("challenge shorter than one AES block"));
-        }
-
-        // 2. Derive key/IV and encrypt the credentials payload.
-        let secret = self.export_oms_secret()?;
-        let key = crypto::sha256(&secret);
-        let iv = &challenge[..crypto::AES_BLOCK_LEN];
-        let mut payload = Vec::new();
-        build_legitimation_payload(username, password).serialize(&mut payload)?;
-        let ciphertext = crypto::encrypt_aes256_cbc_pkcs7(&key, iv, &payload)?;
-
-        // 3. Submit the encrypted response, keeping it out of the log.
         self.redact_next_request = true;
-        let resp = self.set_variable(
-            ids::LEGITIMATE,
-            &PValue::Blob {
-                root_id: 0,
-                data: ciphertext,
-            },
-        )?;
+        let resp = self.set_variable(address, &answer)?;
         // Denied if the error bit is set OR the low 16 bits (as a signed int) are negative — the
         // reference treats `(Int16)ReturnValue < 0` as access-denied, and `is_ok` checks both.
         if !resp.header.is_ok() {
@@ -2254,7 +2841,36 @@ impl Connection {
                 resp.header.return_value
             )));
         }
+        self.legitimated = true;
         Ok(())
+    }
+
+    /// Legitimation needs TLS: see [`Connection::legitimate`].
+    fn require_tls_for_legitimation(&self) -> Result<()> {
+        if self.tls.is_none() {
+            return Err(Error::protocol(
+                "legitimation requires a TLS connection: on a legacy (non-TLS) connection the \
+                 challenge and its answer would cross the network unencrypted",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The PLC's legitimation challenge (`ServerSessionRequest`).
+    fn legitimation_challenge(&mut self) -> Result<Vec<u8>> {
+        let challenge_resp = self.get_var_substreamed(ids::SERVER_SESSION_REQUEST)?;
+        if !challenge_resp.header.is_ok() {
+            return Err(Error::protocol(format!(
+                "challenge request rejected: return_value=0x{:016x}",
+                challenge_resp.header.return_value
+            )));
+        }
+        match challenge_resp.value {
+            PValue::USIntArray(bytes) => Ok(bytes),
+            other => Err(Error::protocol(format!(
+                "unexpected challenge value type: {other:?}"
+            ))),
+        }
     }
 
     /// Send a framed request telegram and read the next response telegram. Uses TLS, or — for a
@@ -2277,8 +2893,11 @@ impl Connection {
         } else {
             log::trace!("→ {}", pdu::Hex(framed_request));
         }
+        // Nothing has gone out if the request can't be encoded, so the connection stays usable.
+        let wire = self.encode_for_transport(framed_request)?;
+        self.use_timeout(Timeout::Request)?;
         let started = std::time::Instant::now();
-        let result = self.request_response_inner(framed_request);
+        let result = self.request_response_inner(framed_request, wire);
         let ms = started.elapsed().as_secs_f64() * 1000.0;
         match result {
             Ok(response) => {
@@ -2320,13 +2939,8 @@ impl Connection {
         self.poisoned
     }
 
-    fn request_response_inner(&mut self, framed_request: &[u8]) -> Result<Vec<u8>> {
-        if let Some(key) = self.legacy_session_key {
-            let v3 = crate::legacy::session::frame_v3(&key, framed_request)?;
-            self.tcp.send_iso_packet(&v3)?;
-        } else {
-            self.send_tls(framed_request)?;
-        }
+    fn request_response_inner(&mut self, framed_request: &[u8], wire: Encoded) -> Result<Vec<u8>> {
+        self.send_encoded(wire)?;
         let response = self.recv_response()?;
         check_response_header(framed_request, &response)?;
         Ok(response)
@@ -2371,6 +2985,7 @@ impl Connection {
             }
             if let Some(id) = notification_subscription_id(&bytes) {
                 log_notification(id, &bytes, "queued while awaiting a response");
+                self.check_notification_sequence(id, &bytes)?;
                 self.queue_notification(id, bytes);
                 continue;
             }
@@ -2386,7 +3001,10 @@ impl Connection {
                 continue;
             }
             match notification_subscription_id(&bytes) {
-                Some(id) => log_notification(id, &bytes, ""),
+                Some(id) => {
+                    log_notification(id, &bytes, "");
+                    self.check_notification_sequence(id, &bytes)?;
+                }
                 None => {
                     log::debug!(
                         "← unexpected telegram while awaiting a notification ({} bytes)",
@@ -2406,9 +3024,29 @@ impl Connection {
     ///
     /// Nothing is consumed from `rbuf` until the whole telegram is there, so a read timeout
     /// part-way through keeps every byte for the next call.
+    ///
+    /// A SystemEvent chunk (`72 fe len`, no trailer) is a telegram of its own, even between the
+    /// chunks of another telegram (FW 4.2 sent keep-alives there on the legacy transport, trace
+    /// run): it is cut out and returned as it is, and the other telegram's chunks stay put.
     fn recv_telegram(&mut self) -> Result<Vec<u8>> {
         loop {
-            if let Some((version, end, body_len)) = scan_telegram(&self.rbuf[self.rpos..])? {
+            let scanned = scan_telegram(&self.rbuf[self.rpos..])?;
+            if let Some(Scanned::SystemEvent { start, end }) = scanned {
+                let (start, end) = (self.rpos + start, self.rpos + end);
+                let event = self.rbuf[start..end].to_vec();
+                self.rbuf.drain(start..end);
+                if self.rpos == self.rbuf.len() {
+                    self.rbuf.clear();
+                    self.rpos = 0;
+                }
+                return Ok(event);
+            }
+            if let Some(Scanned::Telegram {
+                version,
+                end,
+                body_len,
+            }) = scanned
+            {
                 // Re-frame as a single chunk directly (what `pdu::frame_single_pdu` produces),
                 // copying each chunk's payload once.
                 let raw = &self.rbuf[self.rpos..self.rpos + end];
@@ -2446,12 +3084,30 @@ impl Connection {
     }
 }
 
-/// Find a complete telegram at the start of `buf`: `(trailer version, length including the
-/// trailer, total body length)`, or `None` if more bytes are needed. Only reads `buf`, so the
-/// caller can retry after the next read.
-fn scan_telegram(buf: &[u8]) -> Result<Option<(u8, usize, usize)>> {
+/// What [`scan_telegram`] found at the start of the receive buffer.
+#[derive(Debug, PartialEq, Eq)]
+enum Scanned {
+    /// A complete telegram: its version, its length including the trailer, and the total length
+    /// of its chunks' payloads.
+    Telegram {
+        version: u8,
+        end: usize,
+        body_len: usize,
+    },
+    /// A complete SystemEvent chunk at `start..end`, possibly between another telegram's chunks.
+    SystemEvent { start: usize, end: usize },
+}
+
+/// Find a complete telegram at the start of `buf`, or a SystemEvent among its chunks, or `None`
+/// if more bytes are needed. Only reads `buf`, so the caller can retry after the next read.
+///
+/// The chunks and trailer of one telegram must share a protocol version: a mismatch means the
+/// stream is out of step. A SystemEvent (`0xfe`) carries no trailer and stands alone wherever it
+/// appears, so it is reported on its own instead of being joined to the telegram around it.
+fn scan_telegram(buf: &[u8]) -> Result<Option<Scanned>> {
     let mut i = 0;
     let mut body_len = 0;
+    let mut telegram_version = None;
     while let Some(&[id, version, hi, lo]) = buf.get(i..i + 4) {
         if id != pdu::PROTOCOL_ID {
             return Err(Error::framing(format!(
@@ -2459,8 +3115,27 @@ fn scan_telegram(buf: &[u8]) -> Result<Option<(u8, usize, usize)>> {
             )));
         }
         let len = usize::from(u16::from_be_bytes([hi, lo]));
+        if version == protocol_version::SYSTEM_EVENT {
+            let end = i + 4 + len;
+            return Ok((end <= buf.len()).then_some(Scanned::SystemEvent { start: i, end }));
+        }
+        match telegram_version {
+            None => telegram_version = Some(version),
+            Some(first) if first != version => {
+                return Err(Error::framing(format!(
+                    "chunks of one telegram with protocol versions 0x{first:02x} and \
+                     0x{version:02x}"
+                )))
+            }
+            Some(_) => {}
+        }
         if len == 0 {
-            return Ok(Some((version, i + 4, body_len))); // trailer => end of telegram
+            // The trailer: the end of the telegram.
+            return Ok(Some(Scanned::Telegram {
+                version,
+                end: i + 4,
+                body_len,
+            }));
         }
         body_len += len;
         if body_len > pdu::MAX_TELEGRAM_LEN {
@@ -2469,6 +3144,62 @@ fn scan_telegram(buf: &[u8]) -> Result<Option<(u8, usize, usize)>> {
         i += 4 + len;
     }
     Ok(None)
+}
+
+/// Overwrite the bytes of every `Blob` in `value` (the credentials of a legitimation payload).
+fn wipe_blobs(value: &mut PValue) {
+    match value {
+        PValue::Blob { data, .. } => data.zeroize(),
+        PValue::Struct { elements, .. } => {
+            for (_, v) in elements {
+                wipe_blobs(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A GetMultiVariables response, or the error for a request the PLC refused as a whole.
+fn check_read_header(resp: GetMultiVariablesResponse) -> Result<GetMultiVariablesResponse> {
+    if resp.header.is_ok() {
+        Ok(resp)
+    } else {
+        Err(Error::protocol(format!(
+            "GetMultiVariables rejected: return_value=0x{:016x}",
+            resp.header.return_value
+        )))
+    }
+}
+
+/// Whether `return_value` is a PLC's answer to a read of more items than it accepts in one
+/// request. Measured on PLCSIM Advanced (PLCSIM live run) and on S7-1200 FW 4.2 to 4.7 (probe
+/// run): `0xa027_a600_00XX_fffc`, the middle 16 bits varying by firmware (`0x7b`, `0x54`,
+/// `0x70`, `0x71`, `0x78`).
+fn is_too_many_items(return_value: u64) -> bool {
+    return_value >> 32 == 0xa027_a600 && return_value & 0xffff == 0xfffc
+}
+
+/// Check a subscription's credit limit: `-1` (unlimited) or `1..=255`. The PLC reports the credit
+/// used in a one-byte tick, so a larger limit is never topped up, and 0 would need a top-up after
+/// every notification (the reference documents 255 as the maximum).
+fn check_credit_limit(credit_limit: i16) -> Result<()> {
+    match credit_limit {
+        -1 | 1..=255 => Ok(()),
+        other => Err(Error::protocol(format!(
+            "credit limit {other} out of range: use -1 (unlimited) or 1..=255"
+        ))),
+    }
+}
+
+/// The object with relation id `relid` in `objects` or among their nested objects.
+fn find_object(objects: &[PObject], relid: u32) -> Option<&PObject> {
+    objects.iter().find_map(|o| {
+        if o.relation_id == relid {
+            Some(o)
+        } else {
+            find_object(&o.objects, relid)
+        }
+    })
 }
 
 /// Every object in `objects` (recursively) that carries a member list, each detached from its
@@ -2541,6 +3272,27 @@ fn check_response_header(request: &[u8], response: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// The sequence number of a framed `Notification` telegram: the VLQ after the opcode, the
+/// subscription id, six reserved bytes and the credit tick.
+fn notification_sequence_number(buf: &[u8]) -> Option<u32> {
+    let h = pdu::parse_header(buf).ok()?;
+    let mut cur = std::io::Cursor::new(buf.get(h.body_offset + 12..)?);
+    crate::wire::vlq::decode_u32(&mut cur).ok()
+}
+
+/// Whether a subscription's notification sequence number may follow `last` with `next`: forward
+/// (gaps allowed), or a wrap to a number below 16 from within 16 of a power-of-two boundary that
+/// a counter might wrap at.
+fn sequence_moves_on(last: u32, next: u32) -> bool {
+    const SLACK: u32 = 16;
+    const WRAP_POINTS: [u32; 5] = [0xff, 0x7fff, 0xffff, 0x7fff_ffff, u32::MAX];
+    next > last
+        || (next < SLACK
+            && WRAP_POINTS
+                .iter()
+                .any(|&point| last <= point && point - last < SLACK))
+}
+
 /// The subscription a framed telegram notifies about, if it is a `Notification` (`0x33`). A
 /// notification too short to carry the id reads as subscription 0 (and fails to parse later),
 /// so it is never mistaken for a response.
@@ -2560,75 +3312,97 @@ fn notification_subscription_id(buf: &[u8]) -> Option<u32> {
 /// `DB.arr[2].x` → `[("DB", []), ("arr", [2]), ("x", [])]`, `DB.m[1,2]` → `[.., ("m", [1, 2])]`.
 ///
 /// A name may be wrapped in double quotes, as TIA Portal writes it, so it can contain `.`, `[`
-/// or `]`: `"Data block.1"."value.1"` → `[("Data block.1", []), ("value.1", [])]`. Indices
-/// follow the closing quote (`"my arr"[2]`). An unterminated quote is an error.
+/// or `]`: `"Data block.1"."value.1"` → `[("Data block.1", []), ("value.1", [])]`. Inside the
+/// quotes a `"` is written doubled (`"a""b"` is the name `a"b`): the convention [`quote_level`]
+/// writes, for a name that contains one (whether TIA Portal allows that is not known). Indices
+/// follow the name (`"my arr"[2]`).
+///
+/// Whitespace around a level is ignored (`DB . x` is `DB.x`), but kept inside a name and inside
+/// quotes. Each level must be a whole name: an empty level (`DB..x`, a leading or trailing `.`;
+/// a member whose name really is empty is written `""`),
+/// a quoted name with anything but `.`, `[` or the end after it (`"DB"x`), a quote in the middle
+/// of a name, or an unterminated quote or `[` are errors — the old parser silently joined or
+/// dropped such parts, which could address another variable.
 fn parse_symbol_path(symbol: &str) -> Result<Vec<(String, Vec<i32>)>> {
+    let bad = |what: String| {
+        Error::protocol(format!(
+            "{what} in symbol '{}'",
+            crate::logging::name(symbol)
+        ))
+    };
     let mut levels = Vec::new();
-    let mut name = String::new();
-    let mut indices = Vec::new();
-    let mut chars = symbol.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => {
-                if !indices.is_empty() {
-                    return Err(Error::protocol(format!(
-                        "unexpected '\"' after an array index in symbol '{symbol}'"
-                    )));
-                }
-                loop {
-                    match chars.next() {
-                        Some('"') => break,
-                        Some(q) => name.push(q),
-                        None => {
-                            return Err(Error::protocol(format!(
-                                "unterminated quote in symbol '{symbol}'"
-                            )))
-                        }
-                    }
+    let mut chars = symbol.chars().peekable();
+    let skip_whitespace = |chars: &mut std::iter::Peekable<std::str::Chars>| {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+    };
+    loop {
+        skip_whitespace(&mut chars);
+        let mut name = String::new();
+        if chars.next_if_eq(&'"').is_some() {
+            loop {
+                match chars.next() {
+                    Some('"') if chars.next_if_eq(&'"').is_some() => name.push('"'),
+                    Some('"') => break,
+                    Some(c) => name.push(c),
+                    None => return Err(bad("unterminated quote".into())),
                 }
             }
-            '.' => levels.push((std::mem::take(&mut name), std::mem::take(&mut indices))),
-            '[' => {
-                let mut inner = String::new();
-                loop {
-                    match chars.next() {
-                        Some(']') => break,
-                        Some(c) => inner.push(c),
-                        None => {
-                            return Err(Error::protocol(format!(
-                                "unterminated '[' in symbol '{symbol}'"
-                            )))
-                        }
-                    }
-                }
-                // A bad index must not silently select the whole array.
-                for part in inner.split(',') {
-                    let index = part.trim().parse::<i32>().map_err(|_| {
-                        Error::protocol(format!(
-                            "bad array index '{}' in symbol '{symbol}'",
-                            part.trim()
-                        ))
-                    })?;
-                    indices.push(index);
+            // `""` is a deliberately empty name: the PLC has such members (an unnamed level
+            // inside a Program_Alarm instance, browsed as `alarm."".Alarm_ID`).
+        } else {
+            while let Some(c) = chars.next_if(|c| !matches!(c, '.' | '[' | ']' | '"')) {
+                name.push(c);
+            }
+            let trimmed = name.trim_end();
+            if trimmed.is_empty() {
+                return Err(bad(format!("empty name at level {}", levels.len() + 1)));
+            }
+            name.truncate(trimmed.len());
+        }
+        skip_whitespace(&mut chars);
+        let mut indices = Vec::new();
+        while chars.next_if_eq(&'[').is_some() {
+            let mut inner = String::new();
+            loop {
+                match chars.next() {
+                    Some(']') => break,
+                    Some(c) => inner.push(c),
+                    None => return Err(bad("unterminated '['".into())),
                 }
             }
-            _ if !indices.is_empty() => {
-                return Err(Error::protocol(format!(
-                    "unexpected '{c}' after an array index in symbol '{symbol}'"
-                )))
+            // A bad index must not silently select the whole array.
+            for part in inner.split(',') {
+                let index = part
+                    .trim()
+                    .parse::<i32>()
+                    .map_err(|_| bad(format!("bad array index '{}'", part.trim())))?;
+                indices.push(index);
             }
-            _ => name.push(c),
+            skip_whitespace(&mut chars);
+        }
+        levels.push((name, indices));
+        match chars.next() {
+            None => return Ok(levels),
+            Some('.') => {}
+            Some(c) => {
+                let after = if levels.last().is_some_and(|l| !l.1.is_empty()) {
+                    "an array index"
+                } else {
+                    "a name"
+                };
+                return Err(bad(format!("unexpected '{c}' after {after}")));
+            }
         }
     }
-    levels.push((name, indices));
-    Ok(levels)
 }
 
-/// Format one browsed member name as a symbol path level, double-quoting it (TIA style) when it
-/// contains characters that [`parse_symbol_path`] would otherwise treat as syntax.
+/// Format one browsed member name as a symbol path level that [`parse_symbol_path`] reads back
+/// as that name: double-quoted (TIA style) when it contains `.`, `[`, `]` or `"` or starts or
+/// ends with whitespace, with a `"` inside it doubled.
 fn quote_level(name: &str) -> String {
-    if name.contains(['.', '[', ']']) {
-        format!("\"{name}\"")
+    let edge_space = name.starts_with(char::is_whitespace) || name.ends_with(char::is_whitespace);
+    if name.is_empty() || edge_space || name.contains(['.', '[', ']', '"']) {
+        format!("\"{}\"", name.replace('"', "\"\""))
     } else {
         name.to_string()
     }
@@ -2636,46 +3410,49 @@ fn quote_level(name: &str) -> String {
 
 /// Compute the zero-based, row-major element id for an array access (the LID appended for
 /// `[..]`), porting the reference's 1-dim and M-dim access-sequence math. Returns `None` on
-/// a dimension/bounds mismatch.
-#[allow(clippy::needless_range_loop)]
-fn array_element_id(oi: &crate::proto::OffsetInfo, indices: &[i32]) -> Option<u32> {
+/// a dimension/bounds mismatch, or an id past `u32` (the counts come from the PLC).
+///
+/// A multi-dimensional array of `BBOOL` (`softdatatype`) starts each row of its fastest
+/// dimension on a byte boundary: the row stride is rounded up to a multiple of 8, as the browse
+/// enumeration ([`mdim_elements`]) has it. `Array[0..1, 0..2] of Bool` has ids 0, 1, 2, 8, 9, 10.
+fn array_element_id(
+    oi: &crate::proto::OffsetInfo,
+    softdatatype: u8,
+    indices: &[i32],
+) -> Option<u32> {
     if oi.is_1dim {
-        if indices.len() != 1 {
+        let [index] = indices else {
             return None;
-        }
-        let zero = indices[0].checked_sub(oi.array_lower_bounds)?;
-        if zero < 0 || (zero as u32) >= oi.array_element_count {
-            return None;
-        }
-        Some(zero as u32)
+        };
+        let zero = u32::try_from(i64::from(*index) - i64::from(oi.array_lower_bounds)).ok()?;
+        (zero < oi.array_element_count).then_some(zero)
     } else if oi.is_mdim {
         let dim_count = oi.mdim_element_count.iter().filter(|&&c| c > 0).count();
         if dim_count == 0 || dim_count != indices.len() {
             return None;
         }
-        // Normalize indices against the (reversed) per-dimension lower bounds.
-        let mut idx = vec![0i64; dim_count];
-        for i in 0..dim_count {
-            let lb = oi.mdim_lower_bounds[dim_count - i - 1];
-            let v = indices[i].checked_sub(lb)?;
-            if v < 0 || (v as u32) >= oi.mdim_element_count[dim_count - i - 1] {
+        // Dimension 0 varies fastest; `indices` name the dimensions high-to-low.
+        let mut id = 0u64;
+        let mut stride = 1u64;
+        for (d, &index) in indices.iter().rev().enumerate() {
+            let count = oi.mdim_element_count[d];
+            let zero = u32::try_from(i64::from(index) - i64::from(oi.mdim_lower_bounds[d])).ok()?;
+            if zero >= count {
                 return None;
             }
-            idx[i] = v as i64;
+            id = id.checked_add(u64::from(zero).checked_mul(stride)?)?;
+            if d + 1 < indices.len() {
+                let bool_row =
+                    d == 0 && softdatatype == crate::value::datatype::softdatatype::BBOOL;
+                let extent = if bool_row {
+                    u64::from(count).next_multiple_of(8)
+                } else {
+                    u64::from(count)
+                };
+                stride = stride.checked_mul(extent)?;
+            }
         }
-        // Row-major strides.
-        let mut dim_size = vec![1u64; dim_count];
-        let mut g = 1u64;
-        for i in 0..dim_count - 1 {
-            dim_size[i] = g;
-            g *= oi.mdim_element_count[i] as u64;
-        }
-        dim_size[dim_count - 1] = g;
-        let mut array_index = 0i64;
-        for i in 0..dim_count {
-            array_index += idx[i] * dim_size[dim_count - i - 1] as i64;
-        }
-        u32::try_from(array_index).ok()
+        u32::try_from(id).ok()
     } else {
         None
     }
@@ -2683,25 +3460,28 @@ fn array_element_id(oi: &crate::proto::OffsetInfo, indices: &[i32]) -> Option<u3
 
 /// Enumerate the elements of an M-dimensional array as `(display suffix, zero-based access id)`,
 /// porting the reference `Browser.AddSubNodes` M-dim loop (dimension 0 varies fastest; names list
-/// the dimensions high-to-low; `BBOOL` arrays skip ids to the next byte boundary per row).
-fn mdim_elements(oi: &crate::proto::OffsetInfo, softdatatype: u8) -> Vec<(String, u32)> {
+/// the dimensions high-to-low; `BBOOL` arrays skip ids to the next byte boundary per row). The
+/// caller bounds the element count; an id past `u32` is an error.
+fn mdim_elements(oi: &crate::proto::OffsetInfo, softdatatype: u8) -> Result<Vec<(String, u32)>> {
     let actdim = oi.mdim_element_count.iter().filter(|&&c| c > 0).count();
     if actdim == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let total = oi.array_element_count;
     let mut out = Vec::new();
     let mut xx = [0u32; 6];
-    let mut id = 0u32;
-    let mut n = 1u32;
+    let mut id = 0u64;
+    let mut n = 1u64;
     loop {
         let mut name = String::from("[");
         for j in (0..actdim).rev() {
-            let v = xx[j] as i64 + oi.mdim_lower_bounds[j] as i64;
+            let v = i64::from(xx[j]) + i64::from(oi.mdim_lower_bounds[j]);
             name.push_str(&v.to_string());
             name.push(if j > 0 { ',' } else { ']' });
         }
-        out.push((name, id));
+        let element = u32::try_from(id)
+            .map_err(|_| Error::protocol("array element id past 32 bits in the type info"))?;
+        out.push((name, element));
 
         xx[0] += 1;
         // BBOOL arrays: the id of the fastest dimension only advances in units up to 8 per byte.
@@ -2709,21 +3489,21 @@ fn mdim_elements(oi: &crate::proto::OffsetInfo, softdatatype: u8) -> Vec<(String
             && xx[0] >= oi.mdim_element_count[0]
             && oi.mdim_element_count[0] % 8 != 0
         {
-            id += 8 - (xx[0] % 8);
+            id += u64::from(8 - (xx[0] % 8));
         }
         for dim in 0..5 {
             if xx[dim] >= oi.mdim_element_count[dim] {
                 xx[dim] = 0;
-                xx[dim + 1] += 1;
+                xx[dim + 1] = xx[dim + 1].saturating_add(1);
             }
         }
         id += 1;
         n += 1;
-        if n > total {
+        if n > u64::from(total) {
             break;
         }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -2731,6 +3511,9 @@ mod tests {
     use super::*;
     use crate::mock_plc::{mock_connection, MockPlc};
     use crate::proto::OffsetInfo;
+
+    /// The timeout of the mock TLS connections.
+    const TIMEOUT: Duration = Duration::from_secs(5);
 
     fn levels(symbol: &str) -> Vec<(String, Vec<i32>)> {
         parse_symbol_path(symbol).unwrap()
@@ -2787,6 +3570,67 @@ mod tests {
         assert_eq!(levels("DB.m[1][2]"), [lv("DB", &[]), lv("m", &[1, 2])]);
     }
 
+    /// Each level is one whole name: the old parser joined `"DB"x` into `DBx`, read `DB..x` as
+    /// an empty member and kept the spaces of `DB . x` as part of the names.
+    #[test]
+    fn parse_symbol_path_requires_whole_levels() {
+        for bad in [
+            "\"DB\"x", "\"DB\" x", "ab\"cd\"", "DB..x", ".x", "x.", "DB. .x", "", "  ", "DB.x]",
+            "DB.\"x",
+        ] {
+            assert!(parse_symbol_path(bad).is_err(), "{bad:?}");
+        }
+        // An explicitly quoted empty name is a member whose name is empty (a Program_Alarm
+        // instance has one), not a typo.
+        assert_eq!(
+            levels("AlarmFB_DB.alarm.\"\".Alarm_ID"),
+            [
+                lv("AlarmFB_DB", &[]),
+                lv("alarm", &[]),
+                lv("", &[]),
+                lv("Alarm_ID", &[])
+            ]
+        );
+        assert_eq!(levels(" DB . x "), [lv("DB", &[]), lv("x", &[])]);
+        assert_eq!(
+            levels("DB.arr [2] .y"),
+            [lv("DB", &[]), lv("arr", &[2]), lv("y", &[])]
+        );
+        assert_eq!(
+            levels("\"Data block 1\" . \"a b\""),
+            [lv("Data block 1", &[]), lv("a b", &[])]
+        );
+        // Spaces inside a plain name and inside quotes are kept.
+        assert_eq!(levels("My DB.x"), [lv("My DB", &[]), lv("x", &[])]);
+        assert_eq!(levels("\" x \""), [lv(" x ", &[])]);
+        // A doubled quote inside quotes is one quote.
+        assert_eq!(
+            levels("\"a\"\"b\".\"\"\"\""),
+            [lv("a\"b", &[]), lv("\"", &[])]
+        );
+    }
+
+    #[test]
+    fn quote_level_round_trips_any_name() {
+        for name in [
+            "plain",
+            "with space",
+            "dot.ted",
+            "br[ack]et",
+            "quo\"te",
+            "\"",
+            "",
+            " lead",
+            "trail ",
+            "a\"\"b",
+        ] {
+            let path = format!("{}.{}[1]", quote_level(name), quote_level(name));
+            assert_eq!(levels(&path), [lv(name, &[]), lv(name, &[1])], "{name:?}");
+        }
+        assert_eq!(quote_level("with space"), "with space");
+        assert_eq!(quote_level("quo\"te"), "\"quo\"\"te\"");
+    }
+
     #[test]
     fn quote_level_round_trips_through_parser() {
         assert_eq!(quote_level("plain_name"), "plain_name");
@@ -2808,12 +3652,12 @@ mod tests {
             array_element_count: 10,
             ..Default::default()
         };
-        assert_eq!(array_element_id(&oi, &[3]), Some(2));
-        assert_eq!(array_element_id(&oi, &[1]), Some(0));
-        assert_eq!(array_element_id(&oi, &[0]), None); // below lower bound
-        assert_eq!(array_element_id(&oi, &[10]), Some(9)); // last element
-        assert_eq!(array_element_id(&oi, &[11]), None); // one past the upper bound
-        assert_eq!(array_element_id(&oi, &[1, 2]), None); // wrong dim count
+        assert_eq!(array_element_id(&oi, 7, &[3]), Some(2));
+        assert_eq!(array_element_id(&oi, 7, &[1]), Some(0));
+        assert_eq!(array_element_id(&oi, 7, &[0]), None); // below lower bound
+        assert_eq!(array_element_id(&oi, 7, &[10]), Some(9)); // last element
+        assert_eq!(array_element_id(&oi, 7, &[11]), None); // one past the upper bound
+        assert_eq!(array_element_id(&oi, 7, &[1, 2]), None); // wrong dim count
     }
 
     #[test]
@@ -2826,12 +3670,12 @@ mod tests {
         };
         oi.mdim_element_count[0] = 3;
         oi.mdim_element_count[1] = 4;
-        assert_eq!(array_element_id(&oi, &[1, 2]), Some(5));
-        assert_eq!(array_element_id(&oi, &[0, 0]), Some(0));
-        assert_eq!(array_element_id(&oi, &[3, 2]), Some(11)); // last element
-                                                              // One past the end in either dimension must not wrap into a neighbouring row.
-        assert_eq!(array_element_id(&oi, &[4, 0]), None);
-        assert_eq!(array_element_id(&oi, &[0, 3]), None);
+        assert_eq!(array_element_id(&oi, 7, &[1, 2]), Some(5));
+        assert_eq!(array_element_id(&oi, 7, &[0, 0]), Some(0));
+        assert_eq!(array_element_id(&oi, 7, &[3, 2]), Some(11)); // last element
+                                                                 // One past the end in either dimension must not wrap into a neighbouring row.
+        assert_eq!(array_element_id(&oi, 7, &[4, 0]), None);
+        assert_eq!(array_element_id(&oi, 7, &[0, 3]), None);
     }
 
     #[test]
@@ -2846,7 +3690,7 @@ mod tests {
             mdim_lower_bounds: [0, 0, 0, 0, 0, 0],
             ..Default::default()
         };
-        let got = mdim_elements(&oi, 7 /* DInt softdatatype, not BBOOL */);
+        let got = mdim_elements(&oi, 7 /* DInt softdatatype, not BBOOL */).unwrap();
         assert_eq!(
             got,
             vec![
@@ -2870,7 +3714,7 @@ mod tests {
             mdim_lower_bounds: [1, 10, 0, 0, 0, 0],
             ..Default::default()
         };
-        let got = mdim_elements(&oi, 7 /* DInt softdatatype, not BBOOL */);
+        let got = mdim_elements(&oi, 7 /* DInt softdatatype, not BBOOL */).unwrap();
         assert_eq!(
             got,
             vec![
@@ -2882,15 +3726,279 @@ mod tests {
         );
     }
 
-    /// A notification telegram body for `subscription` with `credit_tick` and one DInt value.
+    /// A multi-dimensional `OffsetInfo` with per-dimension `counts` (fastest first) and lower
+    /// bounds `lower`.
+    fn mdim(counts: &[u32], lower: &[i32]) -> OffsetInfo {
+        let mut oi = OffsetInfo {
+            is_mdim: true,
+            array_element_count: counts.iter().fold(1, |n: u32, &c| n.wrapping_mul(c)),
+            ..Default::default()
+        };
+        oi.mdim_element_count[..counts.len()].copy_from_slice(counts);
+        oi.mdim_lower_bounds[..lower.len()].copy_from_slice(lower);
+        oi
+    }
+
+    /// The indices in a browse suffix like `[1,-2,3]`.
+    fn suffix_indices(suffix: &str) -> Vec<i32> {
+        suffix
+            .trim_matches(['[', ']'])
+            .split(',')
+            .map(|i| i.parse().unwrap())
+            .collect()
+    }
+
+    /// A multi-dimensional Bool array starts each row on a byte, so resolving an element must
+    /// skip the padding the browse enumeration skips (the reported case: `Array[0..1, 0..2] of
+    /// Bool` browses as ids 0, 1, 2, 8, 9, 10, and `[1,0]` resolved to 3).
+    #[test]
+    fn array_element_id_pads_bool_rows_like_the_browse() {
+        use crate::value::datatype::softdatatype::BBOOL;
+        let oi = mdim(&[3, 2], &[0, 0]);
+        assert_eq!(array_element_id(&oi, BBOOL, &[1, 0]), Some(8));
+        assert_eq!(array_element_id(&oi, BBOOL, &[1, 2]), Some(10));
+        assert_eq!(
+            array_element_id(&oi, 7, &[1, 0]),
+            Some(3),
+            "DInt: no padding"
+        );
+
+        // Every element of these shapes resolves to the id the browse gives it.
+        for (counts, lower) in [
+            (&[3, 2][..], &[0, 0][..]),
+            (&[8, 3], &[1, 0]),
+            (&[10, 2], &[0, -5]),
+            (&[3, 2, 2], &[0, 0, 0]),
+            (&[1, 4], &[2, 2]),
+            (&[5, 3, 2, 2], &[-1, 0, 1, 0]),
+        ] {
+            let oi = mdim(counts, lower);
+            for sdt in [BBOOL, 7] {
+                let elements = mdim_elements(&oi, sdt).unwrap();
+                assert_eq!(elements.len(), oi.array_element_count as usize);
+                for (suffix, id) in elements {
+                    let indices = suffix_indices(&suffix);
+                    assert_eq!(
+                        array_element_id(&oi, sdt, &indices),
+                        Some(id),
+                        "{counts:?} sdt {sdt} {suffix}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Counts and bounds come from the PLC: extreme ones give `None`, not an overflow panic.
+    #[test]
+    fn array_element_id_survives_extreme_type_info() {
+        let mut oi = mdim(&[u32::MAX; 6], &[i32::MIN; 6]);
+        oi.array_element_count = u32::MAX;
+        assert_eq!(array_element_id(&oi, 7, &[i32::MAX; 6]), None);
+        // Strides past 64 bits: no element of such an array can be addressed.
+        assert_eq!(array_element_id(&oi, 7, &[i32::MIN; 6]), None);
+        let two = mdim(&[u32::MAX; 2], &[i32::MIN; 2]);
+        assert_eq!(array_element_id(&two, 7, &[i32::MIN; 2]), Some(0));
+        assert_eq!(
+            array_element_id(&two, 7, &[i32::MIN, i32::MIN + 1]),
+            Some(1)
+        );
+        let past_u32 = [i32::MIN + 1, i32::MIN + 1]; // id u32::MAX + 1
+        assert_eq!(array_element_id(&two, 7, &past_u32), None);
+        let one = OffsetInfo {
+            is_1dim: true,
+            array_lower_bounds: i32::MIN,
+            array_element_count: u32::MAX,
+            ..Default::default()
+        };
+        assert_eq!(
+            array_element_id(&one, 7, &[i32::MAX - 1]),
+            Some(u32::MAX - 1)
+        );
+        assert_eq!(array_element_id(&one, 7, &[i32::MAX]), None); // one past the end
+        let one = OffsetInfo {
+            array_lower_bounds: i32::MAX,
+            ..one
+        };
+        assert_eq!(array_element_id(&one, 7, &[i32::MIN]), None);
+    }
+
+    /// A type object at `relid` with one member `name` of softdatatype `sdt` and offset info
+    /// `oi`.
+    fn type_object(relid: u32, name: &str, sdt: u8, oi: OffsetInfo) -> Arc<PObject> {
+        let mut obj = PObject::new(relid, 0, 0);
+        obj.vartype_list = Some(crate::proto::VartypeList {
+            first_id: 0,
+            elements: vec![crate::proto::VartypeElement {
+                lid: 1,
+                symbol_crc: 0,
+                softdatatype: sdt,
+                attribute_flags: 0,
+                bitoffsetinfo_flags: 0,
+                offset_info: oi,
+            }],
+        });
+        obj.varname_list = Some(crate::proto::VarnameList {
+            names: vec![name.into()],
+        });
+        Arc::new(obj)
+    }
+
+    /// Array counts in the type info are the PLC's: a browse stops at its limit with an error
+    /// instead of expanding billions of elements, nested ones included.
+    #[test]
+    fn browse_stops_at_its_limit() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |_| {});
+        let huge = OffsetInfo {
+            is_1dim: true,
+            array_element_count: u32::MAX,
+            ..Default::default()
+        };
+        conn.type_info_cache
+            .insert(0x10, type_object(0x10, "huge", 7, huge));
+        let e = conn.browse_datablock(0x8a0e_0001, 0x10, "DB").unwrap_err();
+        assert!(e.to_string().contains("set_browse_limit"), "{e}");
+
+        // 300 structs of 300 DInts: 90,000 variables, each array within the limit on its own.
+        let arr = |n, rel| OffsetInfo {
+            is_1dim: true,
+            array_element_count: n,
+            relation_id: rel,
+            ..Default::default()
+        };
+        conn.type_info_cache
+            .insert(0x20, type_object(0x20, "outer", 0x11, arr(300, Some(0x21))));
+        conn.type_info_cache
+            .insert(0x21, type_object(0x21, "inner", 7, arr(300, None)));
+        conn.set_browse_limit(50_000);
+        let e = conn.browse_datablock(0x8a0e_0001, 0x20, "DB").unwrap_err();
+        assert!(e.to_string().contains("more than 50000"), "{e}");
+        conn.set_browse_limit(90_000);
+        let vars = conn.browse_datablock(0x8a0e_0001, 0x20, "DB").unwrap();
+        assert_eq!(vars.len(), 90_000);
+        assert_eq!(vars[90_000 - 1].name, "DB.outer[299].inner[299]");
+        plc.join().unwrap();
+    }
+
+    /// A notification telegram body for `subscription` with `credit_tick` and one DInt value,
+    /// numbered after every earlier one (one counter for all tests, so each subscription's
+    /// numbers go up).
     fn notification(subscription: u32, credit_tick: u8) -> Vec<u8> {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let seq = NEXT.fetch_add(1, Ordering::Relaxed) as u32;
+        notification_numbered(subscription, credit_tick, seq)
+    }
+
+    /// A notification telegram body for `subscription` with sequence number `seq`.
+    fn notification_numbered(subscription: u32, credit_tick: u8, seq: u32) -> Vec<u8> {
         let mut b = vec![pdu::opcode::NOTIFICATION];
         b.extend_from_slice(&subscription.to_be_bytes());
-        b.extend_from_slice(&[0, 0, 0, 0, 0, 0, credit_tick, 1, 1]);
+        b.extend_from_slice(&[0, 0, 0, 0, 0, 0, credit_tick]);
+        crate::wire::vlq::encode_u32(&mut b, seq).unwrap();
+        b.push(1); // change counter
         b.extend_from_slice(&[0x9b, 0x01]);
         PValue::DInt(subscription as i32).serialize(&mut b).unwrap();
         b.push(0);
         b
+    }
+
+    /// On the legacy transport a response must carry the integrity id that answers its request
+    /// (the request's plus its sequence number), so a replayed earlier response is caught.
+    #[test]
+    fn a_response_with_another_integrity_id_poisons_the_connection() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            let req = plc.recv_request();
+            // The limits read was integrity id 1 at sequence 3 (answered with 4); this read is
+            // id 2 at sequence 4, so its answer carries 6.
+            assert_eq!(ids_of(&req), (4, 2));
+            assert_eq!(plc.response_integrity(), 6);
+            let mut rest = blob_item(vec![1]);
+            rest.pop();
+            rest.push(4); // the limits read's answer, replayed
+            plc.send(&plc.response(functioncode::GET_MULTI_VARIABLES, &rest));
+        });
+        let e = conn.read_area(Area::Memory, 0, 1).unwrap_err();
+        assert!(matches!(e, Error::Integrity(_)), "{e}");
+        assert!(e.to_string().contains("expected 6"), "{e}");
+        assert!(conn.is_poisoned());
+        plc.join().unwrap();
+    }
+
+    /// The emulated PLC's Explore answers are captures with the integrity id the rule gives them,
+    /// and every one decodes: the rule holds for the captures (PLCSIM), as it does for the
+    /// S7-1200 logs (the mock PLC's sessions run every firmware profile through it).
+    #[test]
+    fn the_captured_explore_responses_follow_the_integrity_rule() {
+        // Captured with integrity ids 6, 14, 10 and 6 at sequence numbers 4, 8, 6 and 4: the
+        // requests had ids 2, 6, 4 and 2, as this crate numbers get-class requests after login.
+        for (capture, seq, id) in [
+            (
+                &include_bytes!("../tests/vectors/proto/explore_cpu_state_run.bin")[..],
+                4,
+                6,
+            ),
+            (
+                include_bytes!("../tests/vectors/proto/explore_program.bin"),
+                8,
+                14,
+            ),
+            (
+                include_bytes!("../tests/vectors/proto/explore_ti_92000001.bin"),
+                6,
+                10,
+            ),
+            (
+                include_bytes!("../tests/vectors/proto/explore_device_tree.bin"),
+                4,
+                6,
+            ),
+        ] {
+            let resp = proto::parse_explore_response(capture, true).unwrap();
+            assert_eq!(resp.header.sequence_number, seq);
+            assert_eq!(resp.integrity_id, id);
+        }
+    }
+
+    /// On the legacy transport each subscription's notification numbers must go up: a repeat or
+    /// a step back is a replay and poisons the connection. Gaps are fine, and so is a wrap from
+    /// just below a power-of-two boundary.
+    #[test]
+    fn a_replayed_notification_poisons_the_connection() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            for (sub, seq) in [(0xa, 0), (0xb, 0), (0xa, 1), (0xa, 5), (0xb, 0)] {
+                plc.send(&notification_numbered(sub, 0, seq));
+            }
+        });
+        let a = conn.register_subscription(0xa, -1);
+        for _ in 0..3 {
+            conn.next_notification(&a).unwrap();
+        }
+        // B's 0 (queued) then 0 again: the second is a replay, caught when it arrives.
+        assert_eq!(
+            conn.next_any_notification().unwrap().subscription_object_id,
+            0xb
+        );
+        let e = conn.next_any_notification().unwrap_err();
+        assert!(matches!(e, Error::Integrity(_)), "{e}");
+        assert!(conn.is_poisoned());
+        plc.join().unwrap();
+
+        for (last, next, ok) in [
+            (0, 1, true),
+            (5, 9, true),
+            (5, 5, false),
+            (5, 4, false),
+            (200, 0, false),
+            (0xff, 0, true),
+            (0xfe, 1, true),
+            (0xffff, 0, true),
+            (u32::MAX, 0, true),
+            (u32::MAX - 3, 2, true),
+            (0x7fff_fff0, 0, true),
+            (0x1_0000, 0, false),
+            (0xffff, 16, false),
+        ] {
+            assert_eq!(sequence_moves_on(last, next), ok, "{last} -> {next}");
+        }
     }
 
     #[test]
@@ -2908,8 +4016,8 @@ mod tests {
             plc.send(&notification(0xb, 0));
             plc.send(&notification(0xa, 0));
         });
-        let a = Subscription { object_id: 0xa };
-        let b = Subscription { object_id: 0xb };
+        let a = conn.register_subscription(0xa, -1);
+        let b = conn.register_subscription(0xb, -1);
         // B's notification is behind one of A's; A's is kept for its own call.
         let first = conn.next_notification(&b).unwrap();
         assert_eq!(first.subscription_object_id, 0xb);
@@ -2935,6 +4043,131 @@ mod tests {
         conn.next_notification(&b).unwrap();
         conn.next_notification(&a).unwrap();
         assert_eq!(conn.credit_limits.get(&0xa), Some(&15));
+        plc.join().unwrap();
+    }
+
+    /// A browsed variable of DB 1 at LID `lid`.
+    fn var(lid: u32) -> VarInfo {
+        VarInfo {
+            name: format!("DB.v{lid}"),
+            access_area: 0x8a0e_0001,
+            access_sub_area: DB_VALUE_ACTUAL,
+            lids: vec![lid],
+            softdatatype: 7,
+            string_max_len: 0,
+        }
+    }
+
+    /// The number of items in a GetMultiVariables request body (after the link id).
+    fn item_count(req: &[u8]) -> u8 {
+        assert_eq!(&req[3..5], &functioncode::GET_MULTI_VARIABLES.to_be_bytes());
+        req[18]
+    }
+
+    /// Answer a GetMultiVariables of `n` items with DInt values 1..=n, item 2 as an error.
+    fn answer_items(plc: &mut MockPlc, n: u8) {
+        let mut rest = Vec::new();
+        for i in (1..=n).filter(|&i| i != 2) {
+            rest.push(i);
+            PValue::DInt(i32::from(i)).serialize(&mut rest).unwrap();
+        }
+        rest.push(0);
+        if n >= 2 {
+            rest.push(2);
+            crate::wire::vlq::encode_u64(&mut rest, 0x8206_8d00_02bf_ffc3).unwrap();
+        }
+        rest.push(0); // end of errors
+        plc.send(&plc.reply(functioncode::GET_MULTI_VARIABLES, &rest));
+    }
+
+    /// Answer the last request with a rejection carrying `rv`.
+    fn reject_request(plc: &mut MockPlc, rv: u64) {
+        let mut body = plc.response(functioncode::GET_MULTI_VARIABLES, &[]);
+        body.pop(); // the return value 0 `response` wrote
+        crate::wire::vlq::encode_u64(&mut body, rv).unwrap();
+        body.extend_from_slice(&[0, 0, 0]);
+        plc.send(&body);
+    }
+
+    /// `read_var_values` halves a batch only when the PLC says it has too many items; any other
+    /// refusal of the whole request is an error, and item errors are `None`s without retries.
+    #[test]
+    fn read_var_values_splits_only_on_too_many_items() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            // Three items: refused as too many (PLCSIM's value), then read as 1 + 2.
+            assert_eq!(item_count(&plc.recv_request()), 3);
+            reject_request(&mut plc, 0xa027_a600_007b_fffc);
+            assert_eq!(item_count(&plc.recv_request()), 1);
+            answer_items(&mut plc, 1);
+            assert_eq!(item_count(&plc.recv_request()), 2);
+            answer_items(&mut plc, 2);
+            // Item errors only: one request, no retries.
+            assert_eq!(item_count(&plc.recv_request()), 3);
+            answer_items(&mut plc, 3);
+            // Another refusal of the whole request: an error, after one request.
+            assert_eq!(item_count(&plc.recv_request()), 3);
+            reject_request(&mut plc, 0x8104_1234_0000_ffc3);
+        });
+        conn.set_read_batch_size(3);
+        let vars = [var(1), var(2), var(3)];
+        let got = conn.read_var_values(&vars).unwrap();
+        assert_eq!(got, [Some(PValue::DInt(1)), Some(PValue::DInt(1)), None]);
+        let got = conn.read_var_values(&vars).unwrap();
+        assert_eq!(got, [Some(PValue::DInt(1)), None, Some(PValue::DInt(3))]);
+        let e = conn.read_var_values(&vars).unwrap_err();
+        assert!(e.to_string().contains("0x81041234"), "{e}");
+        assert!(!conn.is_poisoned());
+        plc.join().unwrap();
+    }
+
+    #[test]
+    fn the_credentials_are_wiped_after_use() {
+        let mut credentials = crate::legitimation::build_legitimation_payload("user", "secret");
+        wipe_blobs(&mut credentials);
+        let PValue::Struct { elements, .. } = &credentials else {
+            panic!("{credentials:?}")
+        };
+        for (_, v) in elements {
+            if let PValue::Blob { data, .. } = v {
+                assert!(data.iter().all(|&b| b == 0), "{v:?}");
+            }
+        }
+        assert_eq!(elements[0].1, PValue::UDInt(2), "non-blob members stay");
+    }
+
+    #[test]
+    fn too_many_items_matches_the_measured_return_values() {
+        for rv in [
+            0xa027_a600_007b_fffc, // PLCSIM
+            0xa027_a600_0054_fffc, // S7-1200 FW 4.2, 4.3
+            0xa027_a600_0070_fffc, // FW 4.4
+            0xa027_a600_0071_fffc, // FW 4.5, 4.6
+            0xa027_a600_0078_fffc, // FW 4.7
+        ] {
+            assert!(is_too_many_items(rv), "0x{rv:016x}");
+        }
+        assert!(!is_too_many_items(0x8206_8d00_02bf_ffc3));
+        assert!(!is_too_many_items(0));
+    }
+
+    /// A credit limit the one-byte credit tick can't count, or 0, is refused before anything is
+    /// sent; the largest one, 255, is topped up (wrapping, as the reference does).
+    #[test]
+    fn credit_limits_are_checked() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            plc.send(&notification(0xa, 254));
+            let req = plc.recv_request();
+            assert_eq!(&req[3..5], &functioncode::SET_VARIABLE.to_be_bytes());
+        });
+        for bad in [0, -2, 256, i16::MAX, i16::MIN] {
+            let e = conn.subscribe_with(&[], 100, 0, bad).unwrap_err();
+            assert!(e.to_string().contains("credit limit"), "{e}");
+            assert!(conn.subscribe_alarms_with(bad).is_err());
+        }
+        assert!(!conn.is_poisoned());
+        let a = conn.register_subscription(0xa, 255);
+        conn.next_notification(&a).unwrap();
+        assert_eq!(conn.credit_limits.get(&0xa), Some(&5));
         plc.join().unwrap();
     }
 
@@ -3014,7 +4247,7 @@ mod tests {
             plc.stream.write_all(&frame[20..]).unwrap();
             std::thread::sleep(Duration::from_millis(200));
         });
-        let a = Subscription { object_id: 0xa };
+        let a = conn.register_subscription(0xa, -1);
         let e = conn.next_notification(&a).unwrap_err();
         assert!(e.is_timeout(), "{e}");
         assert!(!conn.is_poisoned());
@@ -3048,15 +4281,15 @@ mod tests {
                 data: vec![1, 2, 3],
             };
             value.serialize(&mut rest).unwrap();
-            rest.extend_from_slice(&[0, 0, 0]); // end of values, end of errors, integrity id
-            plc.send(&plc.response(functioncode::GET_MULTI_VARIABLES, &rest));
+            rest.extend_from_slice(&[0, 0]); // end of values, end of errors
+            plc.send(&plc.reply(functioncode::GET_MULTI_VARIABLES, &rest));
 
             // The same read, refused as PLCSIM refuses an optimized block.
             plc.recv_request();
             let mut rest = vec![0, 1]; // no values; an error for item 1
             crate::wire::vlq::encode_u64(&mut rest, 0x8206_8d00_02bf_ffc3).unwrap();
-            rest.extend_from_slice(&[0, 0]);
-            plc.send(&plc.response(functioncode::GET_MULTI_VARIABLES, &rest));
+            rest.push(0); // end of errors
+            plc.send(&plc.reply(functioncode::GET_MULTI_VARIABLES, &rest));
         });
         assert_eq!(conn.read_area(Area::Memory, 10, 3).unwrap(), [1, 2, 3]);
         let e = conn.read_area(Area::Db(1), 0, 4).unwrap_err();
@@ -3076,7 +4309,7 @@ mod tests {
             assert!(has_address(&req, &ItemAddress::raw(Area::Db(5), 2, 2)));
             // Item 1's value: a Blob (flags 0, type 0x14, root id 0, length 2) of the bytes.
             assert!(req.windows(7).any(|w| w == [1, 0, 0x14, 0, 2, 0xab, 0xcd]));
-            plc.send(&plc.response(functioncode::SET_MULTI_VARIABLES, &[0, 0]));
+            plc.send(&plc.reply(functioncode::SET_MULTI_VARIABLES, &[0]));
         });
         conn.write_area(Area::Db(5), 2, &[0xab, 0xcd]).unwrap();
         plc.join().unwrap();
@@ -3167,6 +4400,90 @@ mod tests {
         plc.join().unwrap();
     }
 
+    /// Answer `refresh_caches_if_program_changed`'s data-block list: the program Explore listing
+    /// one data block `relid`, then the read of its type-info relid `ti`.
+    fn serve_block_list(plc: &mut MockPlc, relid: u32, ti: u32) {
+        let req = plc.recv_request();
+        assert_eq!(&req[14..18], &PLC_PROGRAM_RID.to_be_bytes());
+        let mut db = PObject::new(relid, DB_CLASS_RID, 0);
+        db.add_attribute(OBJECT_VARIABLE_TYPE_NAME, PValue::WString("DB".into()));
+        let mut program = PObject::new(PLC_PROGRAM_RID, 0, 0);
+        program.objects.push(db);
+        plc.send(&plc.explore_response(PLC_PROGRAM_RID, &[program]));
+        let req = plc.recv_request();
+        assert_eq!(item_count(&req), 1);
+        let mut rest = vec![1];
+        PValue::RID(ti).serialize(&mut rest).unwrap();
+        rest.extend_from_slice(&[0, 0]);
+        plc.send(&plc.reply(functioncode::GET_MULTI_VARIABLES, &rest));
+    }
+
+    /// Answer the Explore of type info `ti` for its modification time with `time`.
+    fn serve_modification_time(plc: &mut MockPlc, ti: u32, time: u64) {
+        let req = plc.recv_request();
+        assert_eq!(&req[3..5], &functioncode::EXPLORE.to_be_bytes());
+        assert_eq!(&req[14..18], &ti.to_be_bytes());
+        let mut obj = PObject::new(ti, 0, 0);
+        obj.add_attribute(STRUCT_MODIFICATION_TIME, PValue::ULInt(time));
+        plc.send(&plc.explore_response(ti, &[obj]));
+    }
+
+    /// Cached addresses are dropped when the data blocks change (here: renumbered) or a cached
+    /// block's type info has a new modification time, and kept otherwise.
+    #[test]
+    fn caches_are_dropped_when_the_program_changes() {
+        const DB1: u32 = 0x8a0e_0001;
+        const TI: u32 = 0x9200_0001;
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            serve_block_list(&mut plc, DB1, TI);
+            serve_modification_time(&mut plc, TI, 5); // unchanged
+            serve_block_list(&mut plc, DB1, TI);
+            serve_modification_time(&mut plc, TI, 6); // the layout changed
+            serve_block_list(&mut plc, 0x8a0e_0002, TI); // renumbered: no Explore needed
+        });
+        let cache = |conn: &mut Connection| {
+            conn.db_list = Some(Arc::from(vec![DataBlock {
+                name: "DB".into(),
+                relid: DB1,
+                number: 1,
+                ti_relid: TI,
+            }]));
+            let mut ti = PObject::new(TI, 0, 0);
+            ti.add_attribute(STRUCT_MODIFICATION_TIME, PValue::ULInt(5));
+            conn.type_info_cache.insert(TI, Arc::new(ti));
+            let addr = ItemAddress::raw(Area::Db(1), 0, 1);
+            conn.symbol_cache.insert("DB.x".into(), (addr, None));
+        };
+        assert!(
+            !conn.refresh_caches_if_program_changed().unwrap(),
+            "nothing cached"
+        );
+        cache(&mut conn);
+        assert!(!conn.refresh_caches_if_program_changed().unwrap());
+        assert!(conn.symbol_cache.contains_key("DB.x"), "kept");
+        assert!(conn.refresh_caches_if_program_changed().unwrap());
+        assert!(conn.symbol_cache.is_empty() && conn.db_list.is_none());
+        cache(&mut conn);
+        assert!(conn.refresh_caches_if_program_changed().unwrap());
+        assert!(conn.symbol_cache.is_empty());
+        plc.join().unwrap();
+    }
+
+    /// The dump shortens long attribute values by characters: cutting a non-ASCII `WString` by
+    /// bytes used to panic off a character boundary.
+    #[test]
+    fn explore_dump_shortens_non_ascii_values() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            plc.recv_request();
+            let mut obj = PObject::new(0x8a0e_0001, DB_CLASS_RID, 0);
+            obj.add_attribute(OBJECT_VARIABLE_TYPE_NAME, PValue::WString("é".repeat(100)));
+            plc.send(&plc.explore_response(0x8a0e_0001, &[obj]));
+        });
+        let dump = conn.explore_dump(0x8a0e_0001, 0, 0).unwrap();
+        assert!(dump.contains("ééé…"), "{dump}");
+        plc.join().unwrap();
+    }
+
     #[test]
     fn active_alarms_explores_the_alarm_subsystem() {
         let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
@@ -3206,12 +4523,14 @@ mod tests {
             let mut body = CPU_STATE_RUN[4..CPU_STATE_RUN.len() - 4].to_vec();
             plc.recv_request();
             body[7..9].copy_from_slice(&plc.seq.to_be_bytes());
+            crate::mock_plc::set_explore_integrity(&mut body, plc.response_integrity());
             plc.send(&body);
             // The same reply in STOP: the code is 4 there, the only change in this attribute.
             assert_eq!(body[0x47 - 4], 8);
             body[0x47 - 4] = 4;
             plc.recv_request();
             body[7..9].copy_from_slice(&plc.seq.to_be_bytes());
+            crate::mock_plc::set_explore_integrity(&mut body, plc.response_integrity());
             plc.send(&body);
         });
         assert_eq!(conn.cpu_state().unwrap(), CpuState::Run);
@@ -3262,13 +4581,465 @@ mod tests {
         plc.join().unwrap();
     }
 
+    /// The sequence number and the (one-octet) integrity id of a Get/SetMultiVariables request
+    /// body: the id is the VLQ before the 4-byte fill.
+    fn ids_of(req: &[u8]) -> (u16, u8) {
+        (u16::from_be_bytes([req[7], req[8]]), req[req.len() - 5])
+    }
+
+    /// A request that fails before it is sent — a value that doesn't serialize, or a legacy
+    /// request over 64 KiB — uses up no ids and leaves the connection usable.
+    #[test]
+    fn a_request_that_cannot_be_sent_uses_no_ids() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            // The limits read was sequence 3, get-class integrity id 1. Nothing else reached the
+            // PLC before this write, so it carries the next ids of each counter.
+            let req = plc.recv_request();
+            assert_eq!(&req[3..5], &functioncode::SET_MULTI_VARIABLES.to_be_bytes());
+            assert_eq!(ids_of(&req), (4, 1), "sequence 4, set-class integrity id 1");
+            plc.send(&plc.reply(functioncode::SET_MULTI_VARIABLES, &[0]));
+            let req = plc.recv_request();
+            assert_eq!(ids_of(&req), (5, 2), "sequence 5, get-class integrity id 2");
+            let mut rest = vec![1];
+            PValue::Blob {
+                root_id: 0,
+                data: vec![7],
+            }
+            .serialize(&mut rest)
+            .unwrap();
+            rest.extend_from_slice(&[0, 0]); // end of values, end of errors
+            plc.send(&plc.reply(functioncode::GET_MULTI_VARIABLES, &rest));
+        });
+        let bad_value = PValue::Array {
+            element_type: crate::value::datatype::tag::INT,
+            flags: 0,
+            items: vec![PValue::DInt(1)], // not an Int
+        };
+        let addr = ItemAddress::raw(Area::Memory, 0, 1);
+        assert!(conn
+            .write_variables(std::slice::from_ref(&addr), &[bad_value])
+            .is_err());
+        assert!(!conn.is_poisoned());
+        let e = conn
+            .write_area(Area::Memory, 0, &vec![0; 70_000])
+            .unwrap_err();
+        assert!(e.to_string().contains("64 KiB"), "{e}");
+        assert!(!conn.is_poisoned(), "nothing was sent: {e}");
+        conn.write_area(Area::Memory, 0, &[1]).unwrap();
+        assert_eq!(conn.read_area(Area::Memory, 0, 1).unwrap(), [7]);
+        plc.join().unwrap();
+    }
+
+    /// Answer a one-byte `read_area` with `byte`.
+    fn answer_read(plc: &mut MockPlc, byte: u8) {
+        let req = plc.recv_request();
+        assert_eq!(&req[3..5], &functioncode::GET_MULTI_VARIABLES.to_be_bytes());
+        let mut rest = vec![1];
+        PValue::Blob {
+            root_id: 0,
+            data: vec![byte],
+        }
+        .serialize(&mut rest)
+        .unwrap();
+        rest.extend_from_slice(&[0, 0]); // end of values, end of errors
+        plc.send(&plc.reply(functioncode::GET_MULTI_VARIABLES, &rest));
+    }
+
+    /// A mock PLC that takes one request and hangs up without answering.
+    fn hang_up_after_one_request(mut plc: MockPlc) {
+        plc.recv_request();
+    }
+
+    #[test]
+    fn a_subscription_of_an_earlier_session_fails_after_reconnect() {
+        let (mut conn, first) = mock_connection(Duration::from_secs(5), |_| {});
+        let (addr, second) = crate::mock_plc::mock_listener(|mut plc| {
+            // The stale subscription's delete sends nothing: the next request is this read.
+            answer_read(&mut plc, 7);
+        });
+        conn.reconnect_target = ReconnectTarget::Mock {
+            addrs: vec![addr],
+            timeout: Duration::from_secs(5),
+        };
+        let sub = conn.register_subscription(0xa, 10);
+        let old = conn.generation();
+        assert_eq!(sub.generation(), old);
+        first.join().unwrap();
+
+        conn.reconnect().unwrap();
+        assert_ne!(conn.generation(), old);
+        let e = conn.next_notification(&sub).unwrap_err();
+        assert!(matches!(e, Error::Closed(_)), "{e}");
+        assert!(e.to_string().contains("lost by reconnect"), "{e}");
+        assert!(!e.is_timeout());
+        conn.delete_subscription(&sub).unwrap();
+        assert_eq!(conn.read_area(Area::Memory, 0, 1).unwrap(), [7]);
+        second.join().unwrap();
+    }
+
+    /// A reconnect would lose the session's subscriptions or legitimation, so a read doesn't
+    /// reconnect by itself then; without them, it does.
+    #[test]
+    fn auto_reconnect_refuses_to_drop_subscriptions_or_legitimation() {
+        for (subscribed, legitimated) in [(true, false), (false, true)] {
+            let (mut conn, plc) =
+                mock_connection(Duration::from_secs(5), hang_up_after_one_request);
+            let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            silent.set_nonblocking(true).unwrap();
+            conn.reconnect_target = ReconnectTarget::Mock {
+                addrs: vec![silent.local_addr().unwrap()],
+                timeout: Duration::from_secs(5),
+            };
+            conn.set_auto_reconnect(true);
+            if subscribed {
+                conn.register_subscription(0xa, -1);
+            }
+            conn.legitimated = legitimated;
+            let generation = conn.generation();
+            let e = conn.read_area(Area::Memory, 0, 1).unwrap_err();
+            assert!(e.is_connection_lost(), "{e}");
+            assert!(conn.is_poisoned());
+            assert_eq!(conn.generation(), generation, "no reconnect");
+            assert!(silent.accept().is_err(), "no connection attempt");
+            plc.join().unwrap();
+        }
+
+        let (mut conn, first) = mock_connection(Duration::from_secs(5), hang_up_after_one_request);
+        let (addr, second) = crate::mock_plc::mock_listener(|mut plc| answer_read(&mut plc, 9));
+        conn.reconnect_target = ReconnectTarget::Mock {
+            addrs: vec![addr],
+            timeout: Duration::from_secs(5),
+        };
+        conn.set_auto_reconnect(true);
+        let generation = conn.generation();
+        assert_eq!(conn.read_area(Area::Memory, 0, 1).unwrap(), [9]);
+        assert_ne!(conn.generation(), generation);
+        first.join().unwrap();
+        second.join().unwrap();
+    }
+
+    /// A reconnect that times out leaves the connection poisoned, so it reports `Closed`, not a
+    /// retryable timeout — explicitly and from an automatic reconnect alike.
+    #[test]
+    fn a_failed_reconnect_reports_closed_not_a_timeout() {
+        // Accepts the TCP connection but never confirms COTP.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = silent.local_addr().unwrap();
+        let holder = std::thread::spawn(move || {
+            let held: Vec<_> = (0..2).map(|_| silent.accept().unwrap()).collect();
+            std::thread::sleep(Duration::from_millis(800));
+            drop(held);
+        });
+        let timeout = Duration::from_millis(200);
+
+        let (mut conn, plc) = mock_connection(timeout, |_| {});
+        conn.reconnect_target = ReconnectTarget::Mock {
+            addrs: vec![addr],
+            timeout,
+        };
+        plc.join().unwrap();
+        let e = conn.reconnect().unwrap_err();
+        assert!(matches!(e, Error::Closed(_)), "{e}");
+        assert!(!e.is_timeout());
+        assert!(conn.is_poisoned());
+
+        let (mut conn, plc) = mock_connection(timeout, hang_up_after_one_request);
+        conn.reconnect_target = ReconnectTarget::Mock {
+            addrs: vec![addr],
+            timeout,
+        };
+        conn.set_auto_reconnect(true);
+        let e = conn.read_area(Area::Memory, 0, 1).unwrap_err();
+        assert!(matches!(e, Error::Closed(_)), "{e}");
+        assert!(!e.is_timeout());
+        assert!(conn.is_poisoned());
+        plc.join().unwrap();
+        holder.join().unwrap();
+    }
+
+    #[test]
+    fn a_timeout_reported_by_a_poisoning_failure_is_closed() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |_| {});
+        let timeout = Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        let e = conn.poison(timeout);
+        assert!(matches!(e, Error::Closed(_)), "{e}");
+        assert!(conn.is_poisoned());
+        let other = conn.poison(Error::integrity("bad digest"));
+        assert!(matches!(other, Error::Integrity(_)), "{other}");
+        plc.join().unwrap();
+    }
+
     #[test]
     fn scan_telegram_waits_for_the_trailer() {
         let t = [0x72, 2, 0, 2, 9, 9, 0x72, 2, 0, 1, 8, 0x72, 2, 0, 0];
         for cut in 0..t.len() {
             assert_eq!(scan_telegram(&t[..cut]).unwrap(), None, "cut {cut}");
         }
-        assert_eq!(scan_telegram(&t).unwrap(), Some((2, t.len(), 3)));
+        assert_eq!(
+            scan_telegram(&t).unwrap(),
+            Some(Scanned::Telegram {
+                version: 2,
+                end: t.len(),
+                body_len: 3
+            })
+        );
         assert!(scan_telegram(&[0x55, 2, 0, 0]).is_err());
+    }
+
+    /// A GetMultiVariables response body (after the header) with one Blob value.
+    fn blob_item(data: Vec<u8>) -> Vec<u8> {
+        let mut rest = vec![1];
+        PValue::Blob { root_id: 0, data }
+            .serialize(&mut rest)
+            .unwrap();
+        rest.extend_from_slice(&[0, 0, 0]);
+        rest
+    }
+
+    /// A keep-alive SystemEvent telegram: `72 fe 00 10` and four zero `u32`s.
+    const KEEPALIVE: [u8; 20] = [
+        0x72, 0xfe, 0, 16, 0, 0, 0, 0, 0, 0, 2, 0xee, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+
+    /// Over TLS a response may arrive as one ISO packet carrying more than rustls' 16 KiB of
+    /// plaintext; it used to fail with "received plaintext buffer full".
+    #[test]
+    fn tls_takes_a_large_response_in_one_packet() {
+        use crate::mock_tls::{mock_tls_connection, send_in_one_packet};
+        let (mut conn, plc) = mock_tls_connection("1;6ES7 MOCK;V0.0", TIMEOUT, |mut plc| {
+            plc.recv_request();
+            let body = plc.response(
+                functioncode::GET_MULTI_VARIABLES,
+                &blob_item(vec![0x5a; 40_000]),
+            );
+            send_in_one_packet(
+                &mut plc,
+                &pdu::frame_single_pdu(protocol_version::V2, &body),
+            );
+        });
+        let data = conn.read_area(Area::Memory, 0, 40_000).unwrap();
+        assert_eq!(data, vec![0x5a; 40_000]);
+        plc.join().unwrap();
+    }
+
+    /// A SystemEvent between the chunks of a TLS response is skipped, and the response
+    /// reassembled from the chunks around it; a fatal one ends the connection.
+    #[test]
+    fn tls_cuts_a_system_event_out_of_a_response() {
+        use crate::mock_tls::mock_tls_connection;
+        let (mut conn, plc) = mock_tls_connection("1;6ES7 MOCK;V0.0", TIMEOUT, |mut plc| {
+            plc.recv_request();
+            let body = plc.response(functioncode::GET_MULTI_VARIABLES, &blob_item(vec![1, 2, 3]));
+            plc.send_chunked(&body, 8, &KEEPALIVE);
+            plc.recv_request();
+            let body = plc.response(functioncode::GET_MULTI_VARIABLES, &blob_item(vec![4]));
+            // A data struct (`00 00 00 17`, struct id 40300, no members): fatal.
+            let mut fatal = vec![0x72, 0xfe, 0, 28];
+            fatal.extend_from_slice(&[0; 16]);
+            fatal.extend_from_slice(&[0, 0, 0, 0x17, 0, 0, 0x9d, 0x6c, 0, 0, 0, 0]);
+            plc.send_chunked(&body, 8, &fatal);
+        });
+        assert_eq!(conn.read_area(Area::Memory, 0, 3).unwrap(), [1, 2, 3]);
+        let e = conn.read_area(Area::Memory, 0, 1).unwrap_err();
+        assert!(matches!(e, Error::Closed(_)), "{e}");
+        assert!(e.to_string().contains("SystemEvent"), "{e}");
+        plc.join().unwrap();
+    }
+
+    /// Serve a legitimation on the mock TLS PLC: hand out `challenge`, then return the attribute
+    /// the answer was written to and the value written.
+    fn serve_legitimation(
+        plc: &mut crate::mock_tls::MockTlsPlc,
+        challenge: &[u8],
+    ) -> (u32, PValue) {
+        let req = plc.recv_request();
+        assert_eq!(&req[3..5], &functioncode::GET_VAR_SUBSTREAMED.to_be_bytes());
+        let mut rest = vec![0];
+        PValue::USIntArray(challenge.to_vec())
+            .serialize(&mut rest)
+            .unwrap();
+        rest.push(0);
+        plc.send(&plc.response(functioncode::GET_VAR_SUBSTREAMED, &rest));
+        let req = plc.recv_request();
+        assert_eq!(&req[3..5], &functioncode::SET_VARIABLE.to_be_bytes());
+        // Header (14 bytes), InObjectId, `1`, then the attribute address and the value.
+        let mut cur = std::io::Cursor::new(&req[19..]);
+        let address = crate::wire::vlq::decode_u32(&mut cur).unwrap();
+        let value = PValue::deserialize(&mut cur).unwrap();
+        (address, value)
+    }
+
+    /// The legacy scheme, chosen for an S7-1200 FW V4.5 as the reference chooses it, answers
+    /// with `sha1(password) XOR challenge` to `ServerSessionResponse`.
+    #[test]
+    fn legitimate_legacy_scheme() {
+        use crate::mock_tls::mock_tls_connection;
+        let challenge: Vec<u8> = (100u8..120).collect();
+        let (mut conn, plc) =
+            mock_tls_connection("1;6ES7 214-1AG40-0XB0 ;V4.5", TIMEOUT, move |mut plc| {
+                let (address, value) = serve_legitimation(&mut plc, &challenge);
+                assert_eq!(address, ids::SERVER_SESSION_RESPONSE);
+                let hash = crypto::sha1(b"secret");
+                let expected: Vec<u8> = hash.iter().zip(&challenge).map(|(h, c)| h ^ c).collect();
+                assert_eq!(value, PValue::USIntArray(expected));
+                plc.send(&plc.response(functioncode::SET_VARIABLE, &[0]));
+            });
+        conn.legitimate("", "secret").unwrap();
+        assert!(conn.legitimated);
+        plc.join().unwrap();
+    }
+
+    /// The new scheme, chosen for an S7-1500 FW V3.1: the credentials payload, AES-256-CBC with
+    /// `sha256(exported secret)` and the challenge's first 16 bytes as IV, to `Legitimate`; a
+    /// second legitimation on the session hashes the key again, as the reference does. A
+    /// rejection is an error.
+    #[test]
+    fn legitimate_new_scheme_rolls_the_key() {
+        use crate::legitimation::build_legitimation_payload;
+        use crate::mock_tls::mock_tls_connection;
+        let (mut conn, plc) =
+            mock_tls_connection("1;6ES7 511-1AK02-0AB0;V3.1", TIMEOUT, |mut plc| {
+                let mut key = crypto::sha256(&plc.oms_secret());
+                for (user, password, rv) in [("", "pw", 0u8), ("admin", "pw2", 0), ("", "x", 1)] {
+                    let challenge = [0x11; 20];
+                    let (address, value) = serve_legitimation(&mut plc, &challenge);
+                    assert_eq!(address, ids::LEGITIMATE);
+                    let PValue::Blob { data, .. } = value else {
+                        panic!("{value:?}")
+                    };
+                    let plain =
+                        crypto::decrypt_aes256_cbc_pkcs7(&key, &challenge[..16], &data).unwrap();
+                    let mut expected = Vec::new();
+                    build_legitimation_payload(user, password)
+                        .serialize(&mut expected)
+                        .unwrap();
+                    assert_eq!(plain, expected, "{user:?}");
+                    key = crypto::sha256(&key);
+                    let mut body = plc.response(functioncode::SET_VARIABLE, &[0]);
+                    if rv != 0 {
+                        // Access denied: a negative error code in the low 16 bits.
+                        body.truncate(body.len() - 2);
+                        crate::wire::vlq::encode_u64(&mut body, 0x8104_0000_0000_ffd2).unwrap();
+                        body.push(0);
+                    }
+                    plc.send(&body);
+                }
+            });
+        conn.legitimate("", "pw").unwrap();
+        conn.legitimate("admin", "pw2").unwrap();
+        let e = conn.legitimate("", "x").unwrap_err();
+        assert!(e.to_string().contains("access denied"), "{e}");
+        assert!(!conn.is_poisoned());
+        plc.join().unwrap();
+    }
+
+    /// On a legacy (non-TLS) connection legitimation fails before anything is sent: the answer
+    /// would give `sha1(password)` away.
+    #[test]
+    fn legitimate_requires_tls() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            // The next request is this read, not a challenge fetch.
+            answer_read(&mut plc, 3);
+        });
+        for scheme in [
+            crate::legitimation::LegitimationScheme::Legacy,
+            crate::legitimation::LegitimationScheme::New,
+        ] {
+            let e = conn.legitimate_with(scheme, "", "pw").unwrap_err();
+            assert!(e.to_string().contains("requires a TLS connection"), "{e}");
+        }
+        assert!(conn.legitimate("", "pw").is_err());
+        assert!(!conn.is_poisoned());
+        assert_eq!(conn.read_area(Area::Memory, 0, 1).unwrap(), [3]);
+        plc.join().unwrap();
+    }
+
+    /// A PLC that ends the TLS session (close_notify) while a notification poll waits makes the
+    /// poll fail as a lost connection at once, instead of timing out again and again.
+    #[test]
+    fn tls_close_notify_ends_a_notification_poll() {
+        use crate::mock_tls::mock_tls_connection;
+        let (mut conn, plc) = mock_tls_connection("1;6ES7 MOCK;V0.0", TIMEOUT, |mut plc| {
+            plc.close_notify();
+            std::thread::sleep(Duration::from_millis(1500)); // the TCP connection stays open
+        });
+        let started = std::time::Instant::now();
+        let e = conn.next_any_notification().unwrap_err();
+        assert!(matches!(e, Error::Closed(_)), "{e}");
+        assert!(!e.is_timeout());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(conn.is_poisoned());
+        plc.join().unwrap();
+    }
+
+    /// A short notification-poll timeout doesn't shorten the request timeout, and the other way
+    /// round.
+    #[test]
+    fn requests_and_notification_polls_have_their_own_timeouts() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |mut plc| {
+            let req = plc.recv_request();
+            std::thread::sleep(Duration::from_millis(500)); // longer than the poll timeout
+            assert_eq!(item_count(&req), 1);
+            let mut rest = blob_item(vec![9]);
+            rest.truncate(rest.len() - 1);
+            plc.send(&plc.reply(functioncode::GET_MULTI_VARIABLES, &rest));
+        });
+        assert!(conn.set_timeouts(Duration::ZERO, TIMEOUT).is_err());
+        conn.set_timeouts(Duration::from_secs(5), Duration::from_millis(150))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let e = conn.next_any_notification().unwrap_err();
+        assert!(e.is_timeout(), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(conn.read_area(Area::Memory, 0, 1).unwrap(), [9]);
+        plc.join().unwrap();
+    }
+
+    /// The PLC closing the TCP connection is a lost connection, also for a notification poll.
+    #[test]
+    fn a_closed_socket_ends_a_notification_poll() {
+        let (mut conn, plc) = mock_connection(Duration::from_secs(5), |_| {});
+        plc.join().unwrap();
+        let e = conn.next_any_notification().unwrap_err();
+        assert!(matches!(e, Error::Closed(_)), "{e}");
+        assert!(e.is_connection_lost());
+        assert!(conn.is_poisoned());
+    }
+
+    /// A SystemEvent between two chunks of a telegram is reported on its own, so the caller can
+    /// cut it out; it used to be joined to the telegram's body.
+    #[test]
+    fn scan_telegram_reports_a_system_event_between_chunks() {
+        let event = [0x72, 0xfe, 0, 2, 0xaa, 0xbb];
+        let t = [
+            &[0x72, 2, 0, 2, 9, 9][..],
+            &event,
+            &[0x72, 2, 0, 1, 8, 0x72, 2, 0, 0],
+        ]
+        .concat();
+        // Until the event is complete, more bytes are needed.
+        for cut in 0..10 {
+            assert_eq!(scan_telegram(&t[..cut]).unwrap(), None, "cut {cut}");
+        }
+        assert_eq!(
+            scan_telegram(&t).unwrap(),
+            Some(Scanned::SystemEvent { start: 6, end: 12 })
+        );
+        // A SystemEvent first is one too.
+        assert_eq!(
+            scan_telegram(&event).unwrap(),
+            Some(Scanned::SystemEvent { start: 0, end: 6 })
+        );
+    }
+
+    #[test]
+    fn scan_telegram_requires_one_version_per_telegram() {
+        let mixed = [0x72, 2, 0, 1, 9, 0x72, 3, 0, 1, 8, 0x72, 2, 0, 0];
+        assert!(matches!(scan_telegram(&mixed), Err(Error::Framing(_))));
+        let mixed_trailer = [0x72, 2, 0, 1, 9, 0x72, 3, 0, 0];
+        assert!(matches!(
+            scan_telegram(&mixed_trailer),
+            Err(Error::Framing(_))
+        ));
     }
 }

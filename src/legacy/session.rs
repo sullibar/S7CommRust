@@ -127,7 +127,7 @@ pub(crate) fn handshake(
         &derive_key_id(&session_key),
         &blob,
         session_id,
-    );
+    )?;
     // The real-PLC (S71500) session-setup values 0x3b-0x3e (PLCSIM Advanced requires these; the
     // captured PlcSim values trigger an internal firmware error -258).
     patch_after(&mut frame, &[0x82, 0x3b, 0x00, 0x04], &[0x84, 0x00]);
@@ -183,7 +183,7 @@ pub(crate) fn build_auth_request(
     symkey_id: &[u8; 8],
     blob: &[u8],
     session_id: u32,
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let mut frame = template.to_vec();
     // Back to front, so each patch leaves the earlier offsets valid.
     frame[blob_off..blob_off + blob.len()].copy_from_slice(blob);
@@ -194,16 +194,20 @@ pub(crate) fn build_auth_request(
     // The session id appears twice: the request header and the SetMultiVariables object id.
     frame[0x14..0x18].copy_from_slice(&session_id.to_be_bytes());
     frame[0x19..0x1d].copy_from_slice(&session_id.to_be_bytes());
-    set_auth_request_lengths(&mut frame);
-    frame
+    set_auth_request_lengths(&mut frame)?;
+    Ok(frame)
 }
 
 /// Set an auth request's TPKT length (whole frame) and PDU data length (7-byte TPKT/COTP,
 /// `72 02 <len>` header and `72 02 00 00` trailer excluded) after values were spliced in.
-pub(crate) fn set_auth_request_lengths(frame: &mut [u8]) {
-    let tpkt_len = u16::try_from(frame.len()).expect("auth request fits a TPKT");
+pub(crate) fn set_auth_request_lengths(frame: &mut [u8]) -> Result<()> {
+    let tpkt_len = u16::try_from(frame.len())
+        .ok()
+        .filter(|&len| len >= 15)
+        .ok_or_else(|| Error::protocol("legacy auth request doesn't fit one TPKT frame"))?;
     frame[2..4].copy_from_slice(&tpkt_len.to_be_bytes());
     frame[9..11].copy_from_slice(&(tpkt_len - 15).to_be_bytes());
+    Ok(())
 }
 
 /// Length in octets of the S7p `UInt64` VLQ at the start of `b` (1–9; see [`decode_vlq_u64`]).
@@ -214,13 +218,25 @@ fn vlq_u64_len(b: &[u8]) -> usize {
         .map_or(9, |i| i + 1)
 }
 
+/// The length field of the one V3 chunk that would carry the V2 framed PDU `v2_framed` (marker,
+/// digest and data), or an error if it doesn't fit: a legacy request travels as a single chunk,
+/// so its data must stay under 64 KiB. Checked before a request is given its ids, so a request
+/// that can't be sent doesn't use them up.
+pub(crate) fn v3_chunk_len(v2_framed: &[u8]) -> Result<u16> {
+    let data_len = v2_framed
+        .len()
+        .checked_sub(8)
+        .ok_or_else(|| Error::protocol("legacy request shorter than its framing"))?;
+    u16::try_from(1 + 32 + data_len)
+        .map_err(|_| Error::protocol("legacy request too large for one V3 chunk (64 KiB)"))
+}
+
 /// Wrap a normal (V2) framed PDU as a legacy ProtocolVersion-`0x03` PDU carrying the HMAC
 /// digest over its data part: `72 03 <1+32+len> 20 <digest> <data> 72 03 00 00`.
 pub fn frame_v3(session_key: &[u8; 24], v2_framed: &[u8]) -> Result<Vec<u8>> {
+    let chunk_len = v3_chunk_len(v2_framed)?;
     let data = &v2_framed[4..v2_framed.len() - 4];
     let digest = packet_digest(session_key, data)?;
-    let chunk_len = u16::try_from(1 + 32 + data.len())
-        .map_err(|_| Error::protocol("legacy request too large for one V3 chunk (64 KiB)"))?;
     let mut out = vec![0x72, 0x03];
     out.extend_from_slice(&chunk_len.to_be_bytes());
     out.push(0x20);
@@ -330,6 +346,15 @@ fn accumulate_chunks(
         i += 4;
         if len == 0 {
             log::trace!("legacy: trailer ({}-byte telegram)", payload.len());
+            // The trailer ends the TSDU in every capture and field log. Anything after it
+            // would be another telegram packed into the same TSDU; dropping it, as this used
+            // to, lost that telegram silently.
+            if i != payload.len() {
+                return Err(Error::framing(format!(
+                    "{} bytes after the trailer of a legacy telegram",
+                    payload.len() - i
+                )));
+            }
             return Ok(true); // trailer => PDU complete
         }
         if i + len > payload.len() {
@@ -357,6 +382,12 @@ fn accumulate_chunks(
             payload.len()
         );
         partial.body.extend_from_slice(fragment);
+    }
+    if i != payload.len() {
+        return Err(Error::framing(format!(
+            "{} bytes at the end of a legacy telegram, too short for a chunk header",
+            payload.len() - i
+        )));
     }
     Ok(false) // no trailer in this telegram => more telegrams follow
 }
@@ -425,7 +456,8 @@ mod tests {
                 &symkey_id,
                 &blob,
                 0x7000_0f8f,
-            );
+            )
+            .unwrap();
             let shrink = 9 - len;
             assert_eq!(frame.len(), AUTH_SETMULTI_TEMPLATE.len() - shrink);
             assert_eq!(
@@ -548,5 +580,41 @@ mod tests {
     fn oversized_v3_request_is_rejected() {
         let framed = crate::wire::pdu::frame_single_pdu(0x02, &vec![0u8; 70_000]);
         assert!(frame_v3(&[7u8; 24], &framed).is_err());
+        assert!(v3_chunk_len(&framed).is_err());
+        assert!(
+            frame_v3(&[7u8; 24], &[0x72, 0x02]).is_err(),
+            "shorter than its framing"
+        );
+    }
+
+    /// Bytes after a telegram's trailer — another telegram packed into the same TSDU — used to be
+    /// dropped without a word; so were 1–3 bytes too short for a chunk header.
+    #[test]
+    fn bytes_after_the_trailer_are_a_framing_error() {
+        let key = [7; 24];
+        let mut telegram = chunk(&key, b"abc");
+        telegram.extend_from_slice(&[0x72, 0x03, 0x00, 0x00]);
+        let mut packed = telegram.clone();
+        packed.extend_from_slice(&chunk(&key, b"next"));
+        let e = accumulate_chunks(&packed, &key, &mut PartialResponse::default()).unwrap_err();
+        assert!(matches!(e, Error::Framing(_)), "{e}");
+        let mut short = chunk(&key, b"abc");
+        short.extend_from_slice(&[0x72, 0x03]);
+        let e = accumulate_chunks(&short, &key, &mut PartialResponse::default()).unwrap_err();
+        assert!(matches!(e, Error::Framing(_)), "{e}");
+        // The telegram alone is fine.
+        assert!(accumulate_chunks(&telegram, &key, &mut PartialResponse::default()).unwrap());
+    }
+
+    /// The auth request's lengths are computed, not assumed to fit: one past a TPKT frame is an
+    /// error instead of a panic.
+    #[test]
+    fn auth_request_lengths_that_do_not_fit_are_an_error() {
+        assert!(set_auth_request_lengths(&mut vec![0; 70_000]).is_err());
+        assert!(set_auth_request_lengths(&mut [0; 14]).is_err());
+        let mut frame = vec![0; 100];
+        set_auth_request_lengths(&mut frame).unwrap();
+        assert_eq!(&frame[2..4], &[0, 100]);
+        assert_eq!(&frame[9..11], &[0, 85]);
     }
 }

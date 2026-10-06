@@ -56,7 +56,10 @@
 //!   carries id 1 and works on FW 4.2 to 4.7 (first s7tool logs, probe run). In the
 //!   traced flow (session activation + legitimation), an activation with id 1 is rejected and the
 //!   first data request needs one id skipped (trace run). The full rule is unknown, so
-//!   the mock accepts any id and only records it ([`Logged::integrity_id`]).
+//!   the mock accepts any id and only records it ([`Logged::integrity_id`]). What a response
+//!   carries is known: the request's integrity id plus its sequence number, in every PLCSIM
+//!   capture and every response in the first s7tool logs (FW 4.2 to 4.7); the mock answers so
+//!   ([`MockPlc::response_integrity`]).
 //! * **When keep-alives are sent.** FW 4.2 sent one about every 5 s during the traced session,
 //!   including three between the chunks of one response. None appeared in any of this crate's
 //!   s7tool sessions, on FW 4.2 to 4.7 (the first logs and 16 probe-run sessions), so something
@@ -593,6 +596,49 @@ pub(crate) struct MockPlc {
     /// Corrupt this chunk (0-based) of the next response to this function: a test knob, not PLC
     /// behaviour.
     corrupt: Option<(u16, usize)>,
+    /// Integrity id of the last request received, if it carried one.
+    request_integrity: Option<u32>,
+}
+
+/// The integrity id of a request body: the VLQ before the fill that ends it (five zero bytes
+/// after an Explore, four after the others). Read backwards — the VLQ's last octet is the one
+/// without the continuation bit, and the byte before it (a terminator or the last attribute id)
+/// has none either.
+fn request_integrity_id(body: &[u8]) -> Option<u32> {
+    let function = u16::from_be_bytes([*body.get(3)?, *body.get(4)?]);
+    let fill = if function == functioncode::EXPLORE {
+        5
+    } else {
+        4
+    };
+    let last = body.len().checked_sub(fill + 1)?;
+    let mut first = last;
+    while first > 0 && body[first - 1] & 0x80 != 0 {
+        first -= 1;
+    }
+    let mut cur = std::io::Cursor::new(&body[first..=last]);
+    vlq::decode_u32(&mut cur).ok()
+}
+
+/// The integrity id `body`'s Explore response carries: after the 10-byte header, the return
+/// value and a `u32`.
+fn explore_integrity_range(body: &[u8]) -> std::ops::Range<usize> {
+    let vlq_end = |mut i: usize| {
+        while body[i] & 0x80 != 0 {
+            i += 1;
+        }
+        i + 1
+    };
+    let start = vlq_end(10) + 4;
+    start..vlq_end(start)
+}
+
+/// Put `id` in an Explore response body (such as a replayed capture) as its integrity id.
+pub(crate) fn set_explore_integrity(body: &mut Vec<u8>, id: u32) {
+    let range = explore_integrity_range(body);
+    let mut new = Vec::new();
+    vlq::encode_u32(&mut new, id).unwrap();
+    body.splice(range, new);
 }
 
 impl MockPlc {
@@ -615,6 +661,7 @@ impl MockPlc {
             chunks_since_keepalive: 0,
             keepalives: 0,
             corrupt: None,
+            request_integrity: None,
         }
     }
 
@@ -639,7 +686,26 @@ impl MockPlc {
         }
         let body = data.to_vec();
         self.seq = u16::from_be_bytes([body[7], body[8]]);
+        self.request_integrity = request_integrity_id(&body);
         Ok(Request { body, dt_frames })
+    }
+
+    /// The integrity id a response to the last request carries: the request's integrity id plus
+    /// its sequence number, as every response in the PLCSIM captures and the S7-1200 logs does.
+    pub(crate) fn response_integrity(&self) -> u32 {
+        let id = self
+            .request_integrity
+            .expect("mock PLC: the last request carried no integrity id");
+        id.wrapping_add(u32::from(self.seq))
+    }
+
+    /// [`MockPlc::response`] followed by the response's integrity id
+    /// ([`MockPlc::response_integrity`]): a successful Get/SetMultiVariables, GetVarSubstreamed
+    /// or SetVariable response whose `rest` ends where the id goes.
+    pub(crate) fn reply(&self, function: u16, rest: &[u8]) -> Vec<u8> {
+        let mut body = self.response(function, rest);
+        vlq::encode_u32(&mut body, self.response_integrity()).unwrap();
+        body
     }
 
     /// The next TSDU (COTP DT frames up to the end-of-TSDU bit) and how many frames it took, or
@@ -687,7 +753,7 @@ impl MockPlc {
     /// An Explore response body listing `objects`, answering the last request.
     pub(crate) fn explore_response(&self, explore_id: u32, objects: &[PObject]) -> Vec<u8> {
         let mut rest = explore_id.to_be_bytes().to_vec();
-        rest.push(0); // integrity id
+        vlq::encode_u32(&mut rest, self.response_integrity()).unwrap();
         for o in objects {
             o.serialize(&mut rest).unwrap();
         }
@@ -774,8 +840,8 @@ impl MockPlc {
             rest.push(item);
             PValue::DInt(max).serialize(&mut rest).unwrap();
         }
-        rest.extend_from_slice(&[0, 0, 0]); // end of values, end of errors, integrity id
-        let body = self.response(functioncode::GET_MULTI_VARIABLES, &rest);
+        rest.extend_from_slice(&[0, 0]); // end of values, end of errors
+        let body = self.reply(functioncode::GET_MULTI_VARIABLES, &rest);
         self.send(&body);
     }
 }
@@ -814,6 +880,22 @@ pub(crate) fn mock_connection(
     let tcp = IsoTcp::connect(addr, timeout).unwrap();
     let conn = Connection::legacy_after_handshake(tcp, mock_session(), addr, timeout).unwrap();
     (conn, plc)
+}
+
+/// A scripted mock PLC waiting on a port of its own for one client — a `Connection::reconnect`
+/// to it — which it serves like [`mock_connection`]'s: it answers the limits read, then runs
+/// `script`.
+pub(crate) fn mock_listener(
+    script: impl FnOnce(MockPlc) + Send + 'static,
+) -> (std::net::SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let plc = std::thread::spawn(move || {
+        let mut plc = MockPlc::accept(&listener, SCRIPTED);
+        plc.answer_limits(100);
+        script(plc);
+    });
+    (addr, plc)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1180,7 +1262,8 @@ impl Plc {
                         vlq::encode_u64(&mut body, *code).unwrap();
                     }
                 }
-                body.extend_from_slice(&[0, 0]); // end of errors, integrity id
+                body.push(0); // end of errors
+                vlq::encode_u32(&mut body, id.wrapping_add(u32::from(seq))).unwrap();
                 Outcome::Respond(body)
             }
             functioncode::SET_MULTI_VARIABLES => {
@@ -1211,7 +1294,8 @@ impl Plc {
                         vlq::encode_u64(&mut body, code).unwrap();
                     }
                 }
-                body.extend_from_slice(&[0, 0]); // end of errors, integrity id
+                body.push(0); // end of errors
+                vlq::encode_u32(&mut body, id.wrapping_add(u32::from(seq))).unwrap();
                 Outcome::Respond(body)
             }
             functioncode::EXPLORE => {
@@ -1235,6 +1319,10 @@ impl Plc {
                 });
                 let mut body = capture[4..capture.len() - 4].to_vec();
                 body[7..9].copy_from_slice(&seq.to_be_bytes());
+                let id = log
+                    .integrity_id
+                    .expect("an Explore carries an integrity id");
+                set_explore_integrity(&mut body, id.wrapping_add(u32::from(seq)));
                 Outcome::Respond(body)
             }
             functioncode::GET_VAR_SUBSTREAMED => {
@@ -1254,7 +1342,7 @@ impl Plc {
                 let mut body = response_header(functioncode::GET_VAR_SUBSTREAMED, seq, 0);
                 body.push(0);
                 body.extend_from_slice(&wire_value(&PValue::UDInt(level)));
-                body.push(0); // integrity id
+                vlq::encode_u32(&mut body, id.wrapping_add(u32::from(seq))).unwrap();
                 Outcome::Respond(body)
             }
             functioncode::DELETE_OBJECT => {
