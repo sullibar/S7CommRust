@@ -72,7 +72,18 @@ All notable changes to this project are documented here. The format is based on
   no symbol CRC (as in the reference driver), so the PLC doesn't notice a stale one: after a
   download that renumbers a block or changes its members, a cached address could read or write
   another variable. `clear_caches`, `resolve_symbol`, `write_tag` and `VarInfo` now say so.
-  The check is opt-in and not yet tried against a PLC.
+  The check is opt-in. On PLCSIM it notices a block downloaded while the CPU stays in RUN;
+  changing an existing block's members needs a download that stops the CPU, which ends every
+  session anyway.
+- s7tool `--targets <file>`: runs the same steps (default `report`, then `probe`) against every
+  PLC listed in a text file, one after the other — one PLC per line, `<ip>[:port]`, an optional
+  label and an optional transport (`--auto` when none). Each step runs in a session of its own
+  with its own session log, and `summary.txt` names the PLCs by label only, so the run's folder
+  can be sent on as it is. A step that got no connection is tried once more, then the PLC's
+  remaining steps are skipped.
+- s7tool `--timeout <s>` (default 10): how long to wait for the PLC to connect and to answer, for
+  a slow CPU — an S7-1214C in a field run answered each request in about half a second and left
+  some long answers unfinished for more than 10 s.
 - `s7commplus::set_log_redaction`: keeps the PLC's project data out of the driver's log records
   (telegram dumps stop after the PDU header; symbol and data-block names are left out). s7tool
   turns it on for its session log, which no longer carries tag and block names, values, alarm
@@ -169,6 +180,8 @@ All notable changes to this project are documented here. The format is based on
 
 ### Fixed
 
+- s7tool's `browse` (and `report`) stops at a lost connection instead of listing every remaining
+  data block as "interface withheld by PLC, likely know-how protected".
 - s7tool's session log no longer leaks a multi-line text (the comment XML `xidents` prints, an
   alarm text over several lines): the log writer goes line by line, and a placeholder's markers
   ended on the first line, so the following lines went out as they were. A line break in such a
