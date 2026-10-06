@@ -751,6 +751,9 @@ fn browse(conn: &mut Connection, target: Option<&str>) -> Result<()> {
         );
         match conn.browse_datablock(db.relid, db.ti_relid, &db.name) {
             Ok(vars) => print_values(conn, &vars, Some(&db.name)),
+            // A lost connection fails every block after it: say so once instead of calling each
+            // remaining block know-how protected.
+            Err(e) if e.is_connection_lost() || conn.is_poisoned() => return Err(e),
             // A DB whose interface the PLC withholds (TComSize=0, no VartypeList) is the signature
             // of a know-how-protected FB — not recoverable without the block's know-how password.
             Err(e) => {
@@ -774,7 +777,8 @@ fn browse(conn: &mut Connection, target: Option<&str>) -> Result<()> {
         }
         let vars = match conn.browse_controller_area(area_rid, ti_relid) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(e) if e.is_connection_lost() || conn.is_poisoned() => return Err(e),
+            Err(_) => continue, // an area the PLC doesn't describe (empty)
         };
         if vars.is_empty() && target.is_none() {
             continue; // skip empty areas in a full dump

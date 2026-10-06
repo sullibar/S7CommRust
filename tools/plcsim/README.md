@@ -10,8 +10,13 @@ Everything here is Windows-only, needs both products installed, and the user mus
 A PLCSIM Advanced instance named `S7CommRust` at **169.254.130.10/16** on the "Siemens PLCSIM
 Virtual Ethernet Adapter" (network mode `TCPIPSingleAdapter`). The host side of the adapter has an
 APIPA address in the same /16, so no host configuration is needed. An instance belongs to the
-process that registered it and disappears when that process exits, so register it from a
-long-running PowerShell.
+process that registered it and disappears when that process exits (and on a reboot), so register
+it from a long-running PowerShell — `plcsim-host.ps1` does that, then download a project:
+
+```powershell
+Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-File','tools\plcsim\plcsim-host.ps1'
+.\tia-download.ps1 -ProjectPath "$env:TEMP\s7plcsim\S7Legacy\S7Legacy.ap21"
+```
 
 The PLCSIM API can also switch the CPU between RUN and STOP:
 
