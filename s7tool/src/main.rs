@@ -755,10 +755,11 @@ fn browse(conn: &mut Connection, target: Option<&str>) -> Result<()> {
             // remaining block know-how protected.
             Err(e) if e.is_connection_lost() || conn.is_poisoned() => return Err(e),
             // A DB whose interface the PLC withholds (TComSize=0, no VartypeList) is the signature
-            // of a know-how-protected FB — not recoverable without the block's know-how password.
+            // of a know-how-protected FB — not recoverable without the block's know-how password —
+            // or, on an F-CPU, of a safety block (seen on an S7-1507SF, issue #25).
             Err(e) => {
                 out!(
-                    "  (skipped — interface withheld by PLC, likely know-how protected: {})",
+                    "  (skipped — interface withheld by PLC: {})",
                     privacy::error(e)
                 )
             }

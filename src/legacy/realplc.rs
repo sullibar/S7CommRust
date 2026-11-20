@@ -202,10 +202,18 @@ pub(crate) fn real_plc_handshake(
         scan_fingerprints(&resp)
     );
     let (family, fingerprint) = detect_real_plc(&resp).ok_or_else(|| {
+        let seen = scan_fingerprints(&resp);
+        // An S7-1507S software controller (FW V21.9) shows a `02:` fingerprint (issue #25);
+        // its firmware speaks TLS, which is the way in.
+        let hint = if seen.iter().any(|f| f.starts_with("02:")) {
+            " A 02: fingerprint is a key family the legacy protocol here doesn't know, seen on \
+             software controllers (S7-1507S); connect with TLS (Connection::connect) instead."
+        } else {
+            ""
+        };
         Error::protocol(format!(
             "real-PLC: no 00:/01: fingerprint (not a legacy S7-1200/1500?); \
-             fingerprints seen = {:?}",
-            scan_fingerprints(&resp)
+             fingerprints seen = {seen:?}.{hint}"
         ))
     })?;
     let public_key: &[u8] = match public_key {
