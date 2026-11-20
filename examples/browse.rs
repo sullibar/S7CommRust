@@ -39,8 +39,14 @@ fn run() -> s7commplus::Result<()> {
             "DB \"{}\" (DB{}, relid 0x{:08x}):",
             db.name, db.number, db.relid
         );
-        let ti = db.ti_relid;
-        walk(&mut conn, &db.name, ti, 1)?;
+        match walk(&mut conn, &db.name, db.ti_relid, 1) {
+            Ok(()) => {}
+            // A lost connection fails every block after it: stop.
+            Err(e) if e.is_connection_lost() || conn.is_poisoned() => return Err(e),
+            // The PLC withholds the interface of some blocks (know-how protected, or safety
+            // blocks on an F-CPU): skip them and go on with the next.
+            Err(e) => println!("  (skipped: {e})"),
+        }
         println!();
     }
 

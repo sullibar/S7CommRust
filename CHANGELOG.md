@@ -15,7 +15,11 @@ All notable changes to this project are documented here. The format is based on
   ([#25](https://github.com/sullibar/S7CommRust/issues/25)). The flagged value is logged as a
   warning. Return values in the CreateObject and session-setup errors are now broken into their
   fields (`describe_return_value`), and `connect_real_plc` points a PLC with a `02:` fingerprint
-  to the TLS connection.
+  to the TLS connection. Confirmed on the reporter's S7-1507SF: `s7tool report` passes all 7
+  steps.
+- `examples/browse.rs` skips a data block whose interface the PLC withholds instead of stopping,
+  as `s7tool` does. The withheld-interface message also names safety blocks on an F-CPU, which
+  an S7-1507SF withholds too.
 
 ### Changed
 

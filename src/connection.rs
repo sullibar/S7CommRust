@@ -1887,7 +1887,8 @@ impl Connection {
         }
         Err(Error::protocol(format!(
             "type info for relid {ti_relid} carries no member list \
-             (PLC withheld the interface — likely a know-how-protected block)"
+             (PLC withheld the interface — likely a know-how-protected block, or a safety \
+             block on an F-CPU)"
         )))
     }
 
@@ -2051,8 +2052,8 @@ impl Connection {
     /// Enumerate every readable leaf variable in the whole PLC program (all data blocks plus the
     /// M/Q/I areas) as a flat [`VarInfo`] list, descending into nested structs/FBs and expanding
     /// arrays (including arrays of structs) to their elements. Bulk-prefetches the type container
-    /// first. Blocks whose interface the PLC withholds (know-how protected) contribute nothing. A lost
-    /// connection is an error rather than a partial list.
+    /// first. Blocks whose interface the PLC withholds (know-how protected, or safety blocks on an
+    /// F-CPU) contribute nothing. A lost connection is an error rather than a partial list.
     pub fn browse_vars(&mut self) -> Result<Vec<VarInfo>> {
         self.browse_limit_hit = false;
         let dbs = self.data_blocks()?;
@@ -2085,9 +2086,9 @@ impl Connection {
         Ok(out)
     }
 
-    /// Browsing skips a part the PLC won't describe (a know-how-protected block, an empty area)
-    /// and goes on — unless the connection is gone, when continuing would only produce a partial
-    /// list that looks complete.
+    /// Browsing skips a part the PLC won't describe (a know-how-protected or safety block, an
+    /// empty area) and goes on — unless the connection is gone, when continuing would only
+    /// produce a partial list that looks complete.
     fn skip_unless_lost(&self, e: Error, what: &str) -> Result<()> {
         if self.poisoned || self.browse_limit_hit {
             return Err(e);

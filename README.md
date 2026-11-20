@@ -25,11 +25,12 @@ It supports both protocol versions:
 | S7-1212C           | 6ES7 212-1AE40 | V4.7     | legacy `--real-plc` | ✅ |
 | S7-1215C           | 6ES7 215-1AG40 | V4.5     | TLS                 | ✅ |
 | S7-1214            | 6ES7 214-1AE30 | V2.2     | —                   | ❌ firmware too old |
+| S7-1507SF (software controller) | 6ES7 672-7FC01 | V21.9 | TLS        | ✅ |
 | PLCSIM Advanced    | —              | V2.9     | TLS                 | ✅ |
 | PLCSIM Advanced    | —              | V2.8     | legacy `--legacy`   | ✅ |
 
-**No physical S7-1500 has been tested yet.** If you have one, a test log would help a lot
-(see [Testing on your PLC](#testing-on-your-plc)).
+**No hardware S7-1500 CPU has been tested yet** (the S7-1507SF is a software controller). If
+you have one, a test log would help a lot (see [Testing on your PLC](#testing-on-your-plc)).
 
 ## Features
 
