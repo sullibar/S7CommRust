@@ -104,6 +104,21 @@ impl CreateObjectResponse {
         self.object_ids.get(1).copied()
     }
 
+    /// Whether the PLC created the session: the return value signals success, or the response
+    /// carries a session anyway — a session id and a `ServerSessionVersion` — and the error code
+    /// in the return value's low 16 bits isn't negative.
+    ///
+    /// The second case is for software controllers: an S7-1507S on FW V21.9 answers with
+    /// `0x4000800000000011` (error extension and server error bits set, error code +17) and a
+    /// usable session ([#25](https://github.com/sullibar/S7CommRust/issues/25)). The reference
+    /// driver doesn't look at this return value at all; it takes the ids and carries on.
+    pub fn session_created(&self) -> bool {
+        self.header.is_ok()
+            || ((self.header.return_value as i16) >= 0
+                && self.session_id().is_some()
+                && self.server_session_version().is_some())
+    }
+
     /// The `ServerSessionVersion` (attribute 306) value from the response object, which the
     /// session-setup step must echo back to the PLC.
     pub fn server_session_version(&self) -> Option<&PValue> {
@@ -224,5 +239,58 @@ mod tests {
         assert!(resp.header.is_ok());
         assert_eq!(resp.session_id(), Some(0x0000_0123));
         assert_eq!(resp.session_id2(), Some(0x0000_0456));
+    }
+
+    /// A CreateObject response with `return_value`, `ids` and, if `with_version`, a session
+    /// object carrying a `ServerSessionVersion`.
+    fn response(return_value: u64, ids_: &[u32], with_version: bool) -> CreateObjectResponse {
+        let mut body = vec![opcode::RESPONSE, 0, 0];
+        body.extend_from_slice(&functioncode::CREATE_OBJECT.to_be_bytes());
+        body.extend_from_slice(&[0, 0, 0, 2, 0]); // reserved, sequence, transport flags
+        vlq::encode_u64(&mut body, return_value).unwrap();
+        body.push(ids_.len() as u8);
+        for &id in ids_ {
+            vlq::encode_u32(&mut body, id).unwrap();
+        }
+        if with_version {
+            let mut session = PObject::new(0x7000_0101, ids::CLASS_SERVER_SESSION, 0);
+            session.add_attribute(
+                ids::SERVER_SESSION_VERSION,
+                PValue::Struct {
+                    id: 314,
+                    elements: vec![(
+                        SERVER_SESSION_DESCRIPTION,
+                        PValue::WString("1;6ES7 672-7FC01-0YA0;V21.9".into()),
+                    )],
+                },
+            );
+            session.serialize(&mut body).unwrap();
+        }
+        body.extend_from_slice(&[0; 4]);
+        parse_create_object_response(&pdu::frame_single_pdu(protocol_version::V1, &body)).unwrap()
+    }
+
+    #[test]
+    fn a_flagged_answer_with_a_session_creates_the_session() {
+        // Issue #25: S7-1507S FW V21.9 sets the error extension and server error bits, error
+        // code +17, and still sends the ids and the ServerSessionVersion.
+        let resp = response(0x4000_8000_0000_0011, &[0x7000_0101, 0x7000_0102], true);
+        assert!(!resp.header.is_ok());
+        assert!(resp.session_created());
+        assert_eq!(
+            resp.plc_description().as_deref(),
+            Some("1;6ES7 672-7FC01-0YA0;V21.9")
+        );
+    }
+
+    #[test]
+    fn a_rejection_does_not_create_the_session() {
+        assert!(response(0, &[0x7000_0101, 0x7000_0102], true).session_created());
+        // Flagged, and no ServerSessionVersion or no session id: nothing to carry on with.
+        assert!(!response(0x4000_8000_0000_0011, &[0x7000_0101], false).session_created());
+        assert!(!response(0x4000_8000_0000_0011, &[], true).session_created());
+        // A negative error code is a failure even with a session in the answer.
+        assert!(!response(0x4000_8000_0000_fffc, &[0x7000_0101], true).session_created());
+        assert!(!response(0x0000_0000_0000_fffc, &[0x7000_0101], true).session_created());
     }
 }

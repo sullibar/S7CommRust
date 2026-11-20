@@ -70,6 +70,32 @@ pub fn return_value_is_ok(return_value: u64) -> bool {
     return_value & RETURN_VALUE_ERROR_BIT == 0 && (return_value as i16) >= 0
 }
 
+/// A return value split into the fields Wireshark's S7CommPlus dissector shows, for logs and
+/// error messages: `0x4000800000000011` (an S7-1507S software controller's CreateObject answer)
+/// reads `0x4000800000000011 (error code 17, generic error code 64, server error, error
+/// extension)`. Only the fields that are set are listed.
+pub fn describe_return_value(return_value: u64) -> String {
+    let mut fields = vec![format!("error code {}", return_value as i16)];
+    let field = |mask: u64, shift: u32| (return_value & mask) >> shift;
+    for (name, value) in [
+        ("OMS line", field(0x0000_0000_ffff_0000, 16)),
+        ("error source", field(0x0000_00ff_0000_0000, 32)),
+        ("generic error code", field(0x0000_fe00_0000_0000, 41)),
+        ("debug info", field(0x3fff_0000_0000_0000, 48)),
+    ] {
+        if value != 0 {
+            fields.push(format!("{name} {value}"));
+        }
+    }
+    if return_value & 0x0000_8000_0000_0000 != 0 {
+        fields.push("server error".into());
+    }
+    if return_value & RETURN_VALUE_ERROR_BIT != 0 {
+        fields.push("error extension".into());
+    }
+    format!("0x{return_value:016x} ({})", fields.join(", "))
+}
+
 /// The leading header of a response body (header fields + the common body prefix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponseHeader {
@@ -170,5 +196,24 @@ mod tests {
         assert!(!return_value_is_ok(RETURN_VALUE_ERROR_BIT));
         // The PLC's answer to a GetMultiVariables over its item limit: error bit clear, code -4.
         assert!(!return_value_is_ok(0xa027_a600_007b_fffc));
+    }
+
+    #[test]
+    fn return_value_description_lists_the_fields_that_are_set() {
+        assert_eq!(
+            describe_return_value(0),
+            "0x0000000000000000 (error code 0)"
+        );
+        // S7-1507S FW V21.9's CreateObject answer (issue #25).
+        assert_eq!(
+            describe_return_value(0x4000_8000_0000_0011),
+            "0x4000800000000011 (error code 17, generic error code 64, server error, \
+             error extension)"
+        );
+        assert_eq!(
+            describe_return_value(0xa027_a600_007b_fffc),
+            "0xa027a600007bfffc (error code -4, OMS line 123, generic error code 83, \
+             debug info 8231, server error)"
+        );
     }
 }

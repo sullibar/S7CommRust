@@ -223,8 +223,9 @@ impl MockTlsPlc {
             .unwrap()
     }
 
-    /// Answer the session setup: CreateObject, its SetMultiVariables and the limits read.
-    fn serve_session_setup(&mut self, description: &str) {
+    /// Answer the session setup: CreateObject (with `create_return_value` as its return value),
+    /// its SetMultiVariables and the limits read.
+    fn serve_session_setup(&mut self, description: &str, create_return_value: u64) {
         let req = self.recv_request();
         assert_eq!(&req[3..5], &functioncode::CREATE_OBJECT.to_be_bytes());
         let mut session = PObject::new(SESSION_ID, ids::CLASS_SERVER_SESSION, 0);
@@ -240,7 +241,13 @@ impl MockTlsPlc {
         vlq::encode_u32(&mut rest, SESSION_ID + 1).unwrap();
         session.serialize(&mut rest).unwrap();
         rest.extend_from_slice(&[0; 4]);
-        let body = self.response(functioncode::CREATE_OBJECT, &rest);
+        let mut body = vec![pdu::opcode::RESPONSE, 0, 0];
+        body.extend_from_slice(&functioncode::CREATE_OBJECT.to_be_bytes());
+        body.extend_from_slice(&[0, 0]);
+        body.extend_from_slice(&self.seq.to_be_bytes());
+        body.push(0); // transport flags
+        vlq::encode_u64(&mut body, create_return_value).unwrap();
+        body.extend_from_slice(&rest);
         self.send_plain(&pdu::frame_single_pdu(protocol_version::V1, &body));
 
         let req = self.recv_request();
@@ -282,12 +289,23 @@ pub(crate) fn mock_tls_connection(
     timeout: Duration,
     script: impl FnOnce(MockTlsPlc) + Send + 'static,
 ) -> (Connection, JoinHandle<()>) {
+    mock_tls_connection_with_create_return(description, 0, timeout, script)
+}
+
+/// Like [`mock_tls_connection`], but the mock answers CreateObject with `create_return_value`
+/// (still with a session), as some PLCs do.
+pub(crate) fn mock_tls_connection_with_create_return(
+    description: &str,
+    create_return_value: u64,
+    timeout: Duration,
+    script: impl FnOnce(MockTlsPlc) + Send + 'static,
+) -> (Connection, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     let description = description.to_string();
     let plc = std::thread::spawn(move || {
         let mut plc = MockTlsPlc::accept(&listener);
-        plc.serve_session_setup(&description);
+        plc.serve_session_setup(&description, create_return_value);
         script(plc);
     });
     let conn = Connection::connect(addr, timeout).unwrap();

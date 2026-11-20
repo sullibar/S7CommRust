@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- `Connection::connect` accepts a CreateObject answer whose return value is flagged but that
+  carries a session (session id and `ServerSessionVersion`, error code not negative), as the
+  reference driver does: an S7-1507S software controller on FW V21.9 answers
+  `0x4000800000000011` and was refused with "CreateObject rejected"
+  ([#25](https://github.com/sullibar/S7CommRust/issues/25)). The flagged value is logged as a
+  warning. Return values in the CreateObject and session-setup errors are now broken into their
+  fields (`describe_return_value`), and `connect_real_plc` points a PLC with a `02:` fingerprint
+  to the TLS connection.
+
 ### Changed
 
 - The legacy real-PLC (S7-1200/1500) authentication computes its seed with an x-only ECDH and

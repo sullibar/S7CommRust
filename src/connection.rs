@@ -1012,11 +1012,20 @@ impl Connection {
         })?;
         let resp_bytes = self.request_response(&req.framed)?;
         let resp = proto::parse_create_object_response(&resp_bytes)?;
-        if !resp.header.is_ok() {
+        if !resp.session_created() {
             return Err(Error::protocol(format!(
-                "CreateObject rejected: return_value=0x{:016x}",
-                resp.header.return_value
+                "CreateObject rejected: return_value={}",
+                proto::describe_return_value(resp.header.return_value)
             )));
+        }
+        if !resp.header.is_ok() {
+            // A software controller (S7-1507S FW V21.9) flags its answer this way but creates
+            // the session; see `CreateObjectResponse::session_created`.
+            log::warn!(
+                "CreateObject: the PLC flags its answer with return_value={} but created a \
+                 session; carrying on",
+                proto::describe_return_value(resp.header.return_value)
+            );
         }
         self.session_id = resp
             .session_id()
@@ -1036,8 +1045,8 @@ impl Connection {
         let resp = proto::parse_set_multi_response(&resp_bytes)?;
         if !resp.header.is_ok() {
             return Err(Error::protocol(format!(
-                "session setup (SetMultiVariables) rejected: return_value=0x{:016x}",
-                resp.header.return_value
+                "session setup (SetMultiVariables) rejected: return_value={}",
+                proto::describe_return_value(resp.header.return_value)
             )));
         }
         Ok(())
@@ -4884,6 +4893,34 @@ mod tests {
                 assert_eq!(value, PValue::USIntArray(expected));
                 plc.send(&plc.response(functioncode::SET_VARIABLE, &[0]));
             });
+        conn.legitimate("", "secret").unwrap();
+        assert!(conn.legitimated);
+        plc.join().unwrap();
+    }
+
+    /// An S7-1507S software controller on FW V21.9 answers CreateObject with the error extension
+    /// and server error bits set (`0x4000800000000011`) and a usable session (issue #25): the
+    /// connection carries on, as the reference driver does, and legitimates with the legacy
+    /// scheme the reference chooses for software controllers.
+    #[test]
+    fn software_controller_flagged_create_object_connects() {
+        use crate::mock_tls::{mock_tls_connection_with_create_return, SESSION_ID};
+        let challenge: Vec<u8> = (100u8..120).collect();
+        let (mut conn, plc) = mock_tls_connection_with_create_return(
+            "1;6ES7 672-7FC01-0YA0;V21.9",
+            0x4000_8000_0000_0011,
+            TIMEOUT,
+            move |mut plc| {
+                let (address, _) = serve_legitimation(&mut plc, &challenge);
+                assert_eq!(address, ids::SERVER_SESSION_RESPONSE);
+                plc.send(&plc.response(functioncode::SET_VARIABLE, &[0]));
+            },
+        );
+        assert_eq!(conn.session_id, SESSION_ID);
+        assert_eq!(
+            conn.plc_description.as_deref(),
+            Some("1;6ES7 672-7FC01-0YA0;V21.9")
+        );
         conn.legitimate("", "secret").unwrap();
         assert!(conn.legitimated);
         plc.join().unwrap();
