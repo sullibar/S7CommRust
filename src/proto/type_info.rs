@@ -57,11 +57,11 @@ impl OffsetInfo {
             Ok(())
         }
         fn read_mdim(cur: &mut Cursor<&[u8]>, oi: &mut OffsetInfo) -> Result<()> {
-            for d in 0..6 {
-                oi.mdim_lower_bounds[d] = p::decode_i32_le(cur)?;
+            for bound in &mut oi.mdim_lower_bounds {
+                *bound = p::decode_i32_le(cur)?;
             }
-            for d in 0..6 {
-                oi.mdim_element_count[d] = p::decode_u32_le(cur)?;
+            for count in &mut oi.mdim_element_count {
+                *count = p::decode_u32_le(cur)?;
             }
             Ok(())
         }
